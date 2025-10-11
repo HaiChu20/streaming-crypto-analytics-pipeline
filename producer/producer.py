@@ -1,21 +1,37 @@
 import websocket
 import json
-from kafka import KafkaProducer
+from confluent_kafka import Producer
 
-producer = KafkaProducer(
-    bootstrap_servers='localhost:9092',
-    value_serializer=lambda v: json.dumps(v).encode('utf-8')
-)
+conf = {
+    'bootstrap.servers': 'localhost:9092',
+    'acks': 'all',
+    'enable.idempotence': True,
+    'retries': 5,
+    'delivery.timeout.ms': 60000,
+    'linger.ms': 5,
+    'compression.type': 'snappy', 
+}
+
+producer = Producer(conf)
+
 
 # Kafka Topic
-TOPIC_NAME = 'BTC_analysis'
+TOPIC_NAME = 'CryptoCurrency_analysis'
 
 def on_message(ws, message):
     try:
         data = json.loads(message)
-        producer.send(TOPIC_NAME, value=data)
-        print("Sent to Kafka:", data)
-
+        
+        # Print the received message
+        print(f"\n[MESSAGE RECEIVED] {json.dumps(data, indent=2)}")
+        
+        # Produce message to Kafka
+        producer.produce(
+            topic=TOPIC_NAME,
+            value= json.dumps(data).encode('utf-8')
+        )
+        # Trigger sending of queued messages
+        producer.poll(0)
     except Exception as e:
         print("Error processing WebSocket message:", e)
 
@@ -37,6 +53,7 @@ def on_error(ws, error):
 
 def on_close(ws, *args):
     print("WebSocket closed")
+    producer.flush()  # Ensure all messages are delivered before exit
 
 if __name__ == "__main__":
     ws = websocket.WebSocketApp("wss://ws.okx.com:8443/ws/v5/public",

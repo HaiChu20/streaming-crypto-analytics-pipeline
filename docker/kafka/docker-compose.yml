@@ -1,4 +1,3 @@
-version: '3.8'
 services:
   # Kafka Broker 1 (Controller + Broker)
   kafka-broker-1:
