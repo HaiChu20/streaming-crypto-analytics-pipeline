@@ -100,36 +100,58 @@ real_time_stock/
 #### 1. Clone the Repository
 ```bash
 git clone https://github.com/HaiChu20/RealTime_StockMarket.git
-cd streaming-crypto-analytics-pipeline
+cd RealTime_StockMarket
 ```
 
-#### 2. Install Python Dependencies
+#### 2. Create Virtual Environment (Recommended)
 ```bash
-pip install confluent-kafka websocket-client python-okx python-snappy
+# Create virtual environment
+python -m venv venv
+
+# Activate virtual environment
+# On Windows:
+venv\Scripts\activate
+# On Linux/Mac:
+source venv/bin/activate
 ```
 
-#### 3. Start Kafka Cluster
+#### 3. Install Python Dependencies
+```bash
+pip install -r requirements.txt
+```
+
+This installs all required packages:
+- `confluent-kafka` - Kafka producer client
+- `websocket-client` - OKX WebSocket connection
+- `apache-flink` - Stream processing framework
+- `kafka-python` - Kafka integration
+- `numpy`, `pandas` - Data processing
+- `snowflake-connector-python` - Snowflake integration
+- `python-dotenv`, `pyyaml` - Configuration management
+
+#### 4. Start Kafka Cluster
 ```bash
 cd docker/kafka
 docker-compose up -d
 ```
 
-Verify Kafka is running:
+Wait ~30 seconds for all brokers to be healthy, then verify:
 - **Kafka UI**: http://localhost:8080
 - **Brokers**: localhost:9092, localhost:9093, localhost:9094
 
-#### 4. Start Flink Cluster
+#### 5. Start Flink Cluster
 ```bash
-cd docker/flink
+cd ../flink
 docker-compose up -d
 ```
 
 Verify Flink is running:
 - **Flink Dashboard**: http://localhost:8081
+- **1 JobManager + 3 TaskManagers** should be visible
 
-#### 5. Start Data Producer
+#### 6. Start Data Producer
 ```bash
-cd producer
+cd ../../producer
 python producer.py
 ```
 
