@@ -16,21 +16,35 @@ producer = Producer(conf)
 
 
 # Kafka Topic
-TOPIC_NAME = 'CryptoCurrency_analysis'
+TOPIC_NAME = 'real_time'
+
+# Explicit partition mapping to guarantee 1 coin = 1 partition
+PARTITION_MAP = {
+    'BTC-USDT': 0,
+    'ETH-USDT': 1,
+    'SOL-USDT': 2,
+    'XRP-USDT': 3,
+    'ADA-USDT': 4
+}
 
 def on_message(ws, message):
     try:
         data = json.loads(message)
         
-        # Print the received message
-        print(f"\n[MESSAGE RECEIVED] {json.dumps(data, indent=2)}")
+       # Print the received message
+        print(f"\n[MESSAGE RECEIVED] {json.dumps(data, indent=2)}") 
+
+        # Prepare Kafka message parameters
+        kafka_params = {'topic': TOPIC_NAME, 'value': json.dumps(data).encode('utf-8')}
         
-        # Produce message to Kafka
-        producer.produce(
-            topic=TOPIC_NAME,
-            value= json.dumps(data).encode('utf-8')
-        )
-        # Trigger sending of queued messages
+        # If ticker data, add key and partition
+        if 'data' in data:
+            ticker = data['data'][0].get('instId')
+            kafka_params['key'] = ticker.encode('utf-8')
+            kafka_params['partition'] = PARTITION_MAP.get(ticker)
+        
+        # Produce to Kafka
+        producer.produce(**kafka_params)
         producer.poll(0)
     except Exception as e:
         print("Error processing WebSocket message:", e)
@@ -40,10 +54,8 @@ def on_open(ws):
     subscribe_msg = {
         "op": "subscribe",
         "args": [
-            {
-                "channel": "tickers",
-                "instId": "BTC-USDT"
-            }
+            {"channel": "tickers", "instId": pair}
+            for pair in PARTITION_MAP.keys()
         ]
     }
     ws.send(json.dumps(subscribe_msg))

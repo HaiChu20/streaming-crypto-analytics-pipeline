@@ -28,18 +28,19 @@ services:
       KAFKA_MIN_IN_SYNC_REPLICAS: 2
       
       # Performance and Production Settings
-      KAFKA_NUM_PARTITIONS: 3
+      KAFKA_NUM_PARTITIONS: 5
       KAFKA_LOG_RETENTION_HOURS: 168
       KAFKA_LOG_RETENTION_BYTES: 1073741824
       KAFKA_LOG_SEGMENT_BYTES: 1073741824
       KAFKA_LOG_CLEANUP_POLICY: delete
       KAFKA_COMPRESSION_TYPE: snappy
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: 'true'
 
       # Storage Configuration
       KAFKA_LOG_DIRS: /var/lib/kafka/data
       
     volumes:
-      - ./kafka-data/broker-1:/var/lib/kafka/data
+      - ../../kafka-data/broker-1:/var/lib/kafka/data
     networks:
       - kafka-network
 
@@ -72,18 +73,19 @@ services:
       KAFKA_MIN_IN_SYNC_REPLICAS: 2
       
       # Performance and Production Settings
-      KAFKA_NUM_PARTITIONS: 3
+      KAFKA_NUM_PARTITIONS: 5
       KAFKA_LOG_RETENTION_HOURS: 168
       KAFKA_LOG_RETENTION_BYTES: 1073741824
       KAFKA_LOG_SEGMENT_BYTES: 1073741824
       KAFKA_LOG_CLEANUP_POLICY: delete
       KAFKA_COMPRESSION_TYPE: snappy
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: 'true'
       
       # Storage Configuration
       KAFKA_LOG_DIRS: /var/lib/kafka/data
       
     volumes:
-      - ./kafka-data/broker-2:/var/lib/kafka/data
+      - ../../kafka-data/broker-2:/var/lib/kafka/data
     networks:
       - kafka-network
 
@@ -116,18 +118,19 @@ services:
       KAFKA_MIN_IN_SYNC_REPLICAS: 2
       
       # Performance and Production Settings
-      KAFKA_NUM_PARTITIONS: 3
+      KAFKA_NUM_PARTITIONS: 5
       KAFKA_LOG_RETENTION_HOURS: 168
       KAFKA_LOG_RETENTION_BYTES: 1073741824
       KAFKA_LOG_SEGMENT_BYTES: 1073741824
       KAFKA_LOG_CLEANUP_POLICY: delete
       KAFKA_COMPRESSION_TYPE: snappy
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: 'true'
       
       # Storage Configuration
       KAFKA_LOG_DIRS: /var/lib/kafka/data
       
     volumes:
-      - ./kafka-data/broker-3:/var/lib/kafka/data
+      - ../../kafka-data/broker-3:/var/lib/kafka/data
     networks:
       - kafka-network
 
