@@ -1,0 +1,48 @@
+﻿services:
+  jobmanager:
+    image: flink:1.18.1
+    container_name: flink-jobmanager
+    ports:
+      - "8081:8081"
+    command: jobmanager
+    environment:
+      - "FLINK_PROPERTIES=jobmanager.rpc.address: jobmanager"
+    networks:
+      - kafka_kafka-network
+
+  taskmanager-1:
+    image: flink:1.18.1
+    container_name: flink-taskmanager-1
+    depends_on:
+      - jobmanager
+    command: taskmanager
+    environment:
+      - "FLINK_PROPERTIES=jobmanager.rpc.address: jobmanager"
+    networks:
+      - kafka_kafka-network
+
+  taskmanager-2:
+    image: flink:1.18.1
+    container_name: flink-taskmanager-2
+    depends_on:
+      - jobmanager
+    command: taskmanager
+    environment:
+      - "FLINK_PROPERTIES=jobmanager.rpc.address: jobmanager"
+    networks:
+      - kafka_kafka-network
+
+  taskmanager-3:
+    image: flink:1.18.1
+    container_name: flink-taskmanager-3
+    depends_on:
+      - jobmanager
+    command: taskmanager
+    environment:
+      - "FLINK_PROPERTIES=jobmanager.rpc.address: jobmanager"
+    networks:
+      - kafka_kafka-network
+
+networks:
+  kafka_kafka-network:
+    external: true
