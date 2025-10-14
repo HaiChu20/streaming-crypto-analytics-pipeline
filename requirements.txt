@@ -1,0 +1,21 @@
+# Real-Time Stock Market Pipeline - Python Dependencies
+
+# Kafka Producer
+confluent-kafka==2.3.0
+websocket-client==1.7.0
+
+# PyFlink for Stream Processing
+apache-flink==1.18.1
+kafka-python==2.0.2
+
+# Data Processing (compatible versions)
+numpy>=1.21.4,<1.25.0
+pandas>=2.0.0
+
+# Snowflake Connector (for future use)
+snowflake-connector-python>=3.0.0
+snowflake-sqlalchemy>=1.4.0
+
+# Utilities
+python-dotenv==1.0.0
+pyyaml==6.0.1
