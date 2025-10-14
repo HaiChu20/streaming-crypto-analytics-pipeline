@@ -43,7 +43,7 @@ def on_message(ws, message):
             kafka_params['key'] = ticker.encode('utf-8')
             kafka_params['partition'] = PARTITION_MAP.get(ticker)
         
-        # Produce to Kafka
+        # Produce to Kafka  
         producer.produce(**kafka_params)
         producer.poll(0)
     except Exception as e:

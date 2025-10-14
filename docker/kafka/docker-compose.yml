@@ -1,138 +1,77 @@
+# Common Kafka environment configuration (YAML anchor)
+x-kafka-common: &kafka-common
+  image: confluentinc/cp-kafka:7.5.0
+  networks:
+    - kafka-network
+  environment: &kafka-env-common
+    KAFKA_PROCESS_ROLES: broker,controller
+    KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka-broker-1:29093,2@kafka-broker-2:29093,3@kafka-broker-3:29093
+    CLUSTER_ID: MkU3OEVBNTcwNTJENDM2Qk
+    KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+    KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+    KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+    KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 3
+    KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 3
+    KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 2
+    KAFKA_DEFAULT_REPLICATION_FACTOR: 3
+    KAFKA_MIN_IN_SYNC_REPLICAS: 2
+    KAFKA_NUM_PARTITIONS: 5
+    KAFKA_LOG_RETENTION_HOURS: 168
+    KAFKA_LOG_RETENTION_BYTES: 1073741824
+    KAFKA_LOG_SEGMENT_BYTES: 1073741824
+    KAFKA_LOG_CLEANUP_POLICY: delete 
+    KAFKA_COMPRESSION_TYPE: snappy
+    KAFKA_AUTO_CREATE_TOPICS_ENABLE: 'true'
+    
+    # Auto Leader Rebalancing (prevents leader skew)
+    KAFKA_AUTO_LEADER_REBALANCE_ENABLE: 'true'
+    KAFKA_LEADER_IMBALANCE_CHECK_INTERVAL_SECONDS: 30 
+    KAFKA_LEADER_IMBALANCE_PER_BROKER_PERCENTAGE: 10
+    
+    KAFKA_LOG_DIRS: /var/lib/kafka/data
+
 services:
-  # Kafka Broker 1 (Controller + Broker)
   kafka-broker-1:
-    image: confluentinc/cp-kafka:7.5.0
+    <<: *kafka-common
     hostname: kafka-broker-1
     container_name: kafka-broker-1
     ports:
       - "9092:9092"
     environment:
-      # KRaft Configuration
+      <<: *kafka-env-common
       KAFKA_NODE_ID: 1
-      KAFKA_PROCESS_ROLES: broker,controller
-      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka-broker-1:29093,2@kafka-broker-2:29093,3@kafka-broker-3:29093
-      CLUSTER_ID: MkU3OEVBNTcwNTJENDM2Qk
-      
-      # Listener Configuration
       KAFKA_LISTENERS: PLAINTEXT://kafka-broker-1:29092,CONTROLLER://kafka-broker-1:29093,PLAINTEXT_HOST://0.0.0.0:9092
       KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka-broker-1:29092,PLAINTEXT_HOST://localhost:9092
-      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
-      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
-      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
-      
-      # Cluster and Replication Settings
-      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 3
-      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 3
-      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 2
-      KAFKA_DEFAULT_REPLICATION_FACTOR: 3
-      KAFKA_MIN_IN_SYNC_REPLICAS: 2
-      
-      # Performance and Production Settings
-      KAFKA_NUM_PARTITIONS: 5
-      KAFKA_LOG_RETENTION_HOURS: 168
-      KAFKA_LOG_RETENTION_BYTES: 1073741824
-      KAFKA_LOG_SEGMENT_BYTES: 1073741824
-      KAFKA_LOG_CLEANUP_POLICY: delete
-      KAFKA_COMPRESSION_TYPE: snappy
-      KAFKA_AUTO_CREATE_TOPICS_ENABLE: 'true'
-
-      # Storage Configuration
-      KAFKA_LOG_DIRS: /var/lib/kafka/data
-      
     volumes:
       - ../../kafka-data/broker-1:/var/lib/kafka/data
-    networks:
-      - kafka-network
 
-  # Kafka Broker 2 (Controller + Broker)
   kafka-broker-2:
-    image: confluentinc/cp-kafka:7.5.0
+    <<: *kafka-common
     hostname: kafka-broker-2
     container_name: kafka-broker-2
     ports:
       - "9093:9093"
     environment:
-      # KRaft Configuration
+      <<: *kafka-env-common
       KAFKA_NODE_ID: 2
-      KAFKA_PROCESS_ROLES: broker,controller
-      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka-broker-1:29093,2@kafka-broker-2:29093,3@kafka-broker-3:29093
-      CLUSTER_ID: MkU3OEVBNTcwNTJENDM2Qk
-      
-      # Listener Configuration
       KAFKA_LISTENERS: PLAINTEXT://kafka-broker-2:29092,CONTROLLER://kafka-broker-2:29093,PLAINTEXT_HOST://0.0.0.0:9093
       KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka-broker-2:29092,PLAINTEXT_HOST://localhost:9093
-      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
-      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
-      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
-      
-      # Cluster and Replication Settings
-      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 3
-      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 3
-      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 2
-      KAFKA_DEFAULT_REPLICATION_FACTOR: 3
-      KAFKA_MIN_IN_SYNC_REPLICAS: 2
-      
-      # Performance and Production Settings
-      KAFKA_NUM_PARTITIONS: 5
-      KAFKA_LOG_RETENTION_HOURS: 168
-      KAFKA_LOG_RETENTION_BYTES: 1073741824
-      KAFKA_LOG_SEGMENT_BYTES: 1073741824
-      KAFKA_LOG_CLEANUP_POLICY: delete
-      KAFKA_COMPRESSION_TYPE: snappy
-      KAFKA_AUTO_CREATE_TOPICS_ENABLE: 'true'
-      
-      # Storage Configuration
-      KAFKA_LOG_DIRS: /var/lib/kafka/data
-      
     volumes:
       - ../../kafka-data/broker-2:/var/lib/kafka/data
-    networks:
-      - kafka-network
 
-  # Kafka Broker 3 (Controller + Broker)
   kafka-broker-3:
-    image: confluentinc/cp-kafka:7.5.0
+    <<: *kafka-common
     hostname: kafka-broker-3
     container_name: kafka-broker-3
     ports:
       - "9094:9094"
     environment:
-      # KRaft Configuration
+      <<: *kafka-env-common
       KAFKA_NODE_ID: 3
-      KAFKA_PROCESS_ROLES: broker,controller
-      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka-broker-1:29093,2@kafka-broker-2:29093,3@kafka-broker-3:29093
-      CLUSTER_ID: MkU3OEVBNTcwNTJENDM2Qk
-      
-      # Listener Configuration
       KAFKA_LISTENERS: PLAINTEXT://kafka-broker-3:29092,CONTROLLER://kafka-broker-3:29093,PLAINTEXT_HOST://0.0.0.0:9094
       KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka-broker-3:29092,PLAINTEXT_HOST://localhost:9094
-      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
-      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
-      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
-      
-      # Cluster and Replication Settings
-      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 3
-      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 3
-      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 2
-      KAFKA_DEFAULT_REPLICATION_FACTOR: 3
-      KAFKA_MIN_IN_SYNC_REPLICAS: 2
-      
-      # Performance and Production Settings
-      KAFKA_NUM_PARTITIONS: 5
-      KAFKA_LOG_RETENTION_HOURS: 168
-      KAFKA_LOG_RETENTION_BYTES: 1073741824
-      KAFKA_LOG_SEGMENT_BYTES: 1073741824
-      KAFKA_LOG_CLEANUP_POLICY: delete
-      KAFKA_COMPRESSION_TYPE: snappy
-      KAFKA_AUTO_CREATE_TOPICS_ENABLE: 'true'
-      
-      # Storage Configuration
-      KAFKA_LOG_DIRS: /var/lib/kafka/data
-      
     volumes:
       - ../../kafka-data/broker-3:/var/lib/kafka/data
-    networks:
-      - kafka-network
 
   # Kafka UI for Cluster Management
   kafka-ui:
@@ -144,10 +83,6 @@ services:
       KAFKA_CLUSTERS_0_NAME: local-cluster
       KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka-broker-1:29092,kafka-broker-2:29092,kafka-broker-3:29092
       KAFKA_CLUSTERS_0_METRICS_PORT: 9997
-    depends_on:
-      - kafka-broker-1
-      - kafka-broker-2
-      - kafka-broker-3
     networks:
       - kafka-network
 
