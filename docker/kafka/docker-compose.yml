@@ -41,7 +41,7 @@ services:
       <<: *kafka-env-common
       KAFKA_NODE_ID: 1
       KAFKA_LISTENERS: PLAINTEXT://kafka-broker-1:29092,CONTROLLER://kafka-broker-1:29093,PLAINTEXT_HOST://0.0.0.0:9092
-      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka-broker-1:29092
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka-broker-1:29092, PLAINTEXT_HOST://localhost:9092
     volumes:
       - ../../kafka-data/broker-1:/var/lib/kafka/data
 
@@ -55,7 +55,7 @@ services:
       <<: *kafka-env-common
       KAFKA_NODE_ID: 2
       KAFKA_LISTENERS: PLAINTEXT://kafka-broker-2:29092,CONTROLLER://kafka-broker-2:29093,PLAINTEXT_HOST://0.0.0.0:9093
-      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka-broker-2:29092
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka-broker-2:29092, PLAINTEXT_HOST://localhost:9093
     volumes:
       - ../../kafka-data/broker-2:/var/lib/kafka/data
 
@@ -69,7 +69,7 @@ services:
       <<: *kafka-env-common
       KAFKA_NODE_ID: 3
       KAFKA_LISTENERS: PLAINTEXT://kafka-broker-3:29092,CONTROLLER://kafka-broker-3:29093,PLAINTEXT_HOST://0.0.0.0:9094
-      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka-broker-3:29092
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka-broker-3:29092, PLAINTEXT_HOST://localhost:9094
     volumes:
       - ../../kafka-data/broker-3:/var/lib/kafka/data
 

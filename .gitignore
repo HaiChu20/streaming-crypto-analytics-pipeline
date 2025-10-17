@@ -1,3 +1,4 @@
 *.code-workspace
 kafka-data/
 .venv/ 
+.env
