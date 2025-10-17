@@ -1,6 +1,7 @@
 ﻿services:
   jobmanager:
-    image: flink:1.18.1
+    build:
+      dockerfile: ./Dockerfile
     container_name: flink-jobmanager
     ports:
       - "8081:8081"
@@ -11,35 +12,47 @@
       - kafka_kafka-network
 
   taskmanager-1:
-    image: flink:1.18.1
+    build:
+      dockerfile: ./Dockerfile
     container_name: flink-taskmanager-1
     depends_on:
       - jobmanager
     command: taskmanager
     environment:
-      - "FLINK_PROPERTIES=jobmanager.rpc.address: jobmanager"
+      - |
+        FLINK_PROPERTIES=
+          jobmanager.rpc.address: jobmanager
+          taskmanager.numberOfTaskSlots: 2
     networks:
       - kafka_kafka-network
 
   taskmanager-2:
-    image: flink:1.18.1
+    build:
+      dockerfile: ./Dockerfile
     container_name: flink-taskmanager-2
     depends_on:
       - jobmanager
     command: taskmanager
     environment:
-      - "FLINK_PROPERTIES=jobmanager.rpc.address: jobmanager"
+      - |
+        FLINK_PROPERTIES=
+          jobmanager.rpc.address: jobmanager
+          taskmanager.numberOfTaskSlots: 2
     networks:
       - kafka_kafka-network
 
   taskmanager-3:
-    image: flink:1.18.1
+    build:
+      dockerfile: ./Dockerfile
     container_name: flink-taskmanager-3
     depends_on:
       - jobmanager
     command: taskmanager
     environment:
-      - "FLINK_PROPERTIES=jobmanager.rpc.address: jobmanager"
+      - |
+        FLINK_PROPERTIES=
+          jobmanager.rpc.address: jobmanager
+          taskmanager.numberOfTaskSlots: 2
     networks:
       - kafka_kafka-network
 

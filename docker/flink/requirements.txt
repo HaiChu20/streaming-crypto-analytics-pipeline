@@ -1,0 +1,19 @@
+# Flink Docker Container Requirements
+# These dependencies are installed in the Flink Job/Task Manager containers
+# Used for PyFlink stream processing jobs
+
+# PyFlink for Stream Processing
+apache-flink==1.18.1
+
+# Kafka Integration
+kafka-python==2.0.2
+
+# Snowflake Connector for data sink
+snowflake-connector-python>=3.0.0
+
+# Data Processing
+numpy>=1.21.4,<1.25.0
+pandas>=2.0.0
+
+# Utilities
+python-dotenv==1.0.0
