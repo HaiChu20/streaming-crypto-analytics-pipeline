@@ -77,3 +77,21 @@ scripts/           create_topics.py, probe_feeds.py, check_raw.py, pipeline.sh
 docker/kafka/      single KRaft broker + kafka-ui
 tests/             unit tests + fixtures (live captures, Kraken checksum examples)
 ```
+
+## Dashboard (phase 4)
+
+With Kafka running on `crypto-net`:
+
+```bash
+# Optional before first start: export GRAFANA_ADMIN_PASSWORD='your-local-password'
+docker compose --env-file /dev/null -f docker/dashboard/docker-compose.yml up -d
+```
+
+Open [Grafana](http://127.0.0.1:3000/d/crypto-market): `admin` /
+`local-dashboard-admin` by default; anonymous access is off.
+[ClickHouse HTTP](http://127.0.0.1:8123/ping) is also loopback-only.
+ClickHouse consumes `features.1s.v1` and, in phase 6, `predictions.v1` via
+`kafka:29092`; missing topics are retried without creation. The BTC/ETH dashboard
+refreshes every 5s and uses `FINAL` to collapse duplicate identities. Data persists
+in named volumes with a 30-day TTL. See [dashboard operations](docker/dashboard/README.md)
+for pinned versions, accounts, ingestion behavior, memory caps, and verification.

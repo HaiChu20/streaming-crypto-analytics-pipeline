@@ -1,0 +1,677 @@
+{
+  "uid": "crypto-market",
+  "title": "Crypto market \u2014 BTC / ETH",
+  "tags": [
+    "crypto",
+    "phase-4"
+  ],
+  "timezone": "utc",
+  "schemaVersion": 40,
+  "version": 1,
+  "editable": false,
+  "refresh": "5s",
+  "time": {
+    "from": "now-15m",
+    "to": "now"
+  },
+  "timepicker": {
+    "refresh_intervals": [
+      "5s",
+      "10s",
+      "30s",
+      "1m"
+    ]
+  },
+  "templating": {
+    "list": [
+      {
+        "name": "asset",
+        "label": "Asset",
+        "type": "custom",
+        "query": "BTC,ETH",
+        "current": {
+          "selected": true,
+          "text": "BTC",
+          "value": "BTC"
+        },
+        "options": [
+          {
+            "selected": true,
+            "text": "BTC",
+            "value": "BTC"
+          },
+          {
+            "selected": false,
+            "text": "ETH",
+            "value": "ETH"
+          }
+        ],
+        "multi": false,
+        "includeAll": false
+      }
+    ]
+  },
+  "panels": [
+    {
+      "id": 1,
+      "title": "Mid per exchange / market",
+      "type": "timeseries",
+      "description": "",
+      "datasource": {
+        "type": "grafana-clickhouse-datasource",
+        "uid": "crypto-clickhouse"
+      },
+      "gridPos": {
+        "h": 9,
+        "w": 12,
+        "x": 0,
+        "y": 0
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "grafana-clickhouse-datasource",
+            "uid": "crypto-clickhouse"
+          },
+          "editorType": "sql",
+          "queryType": "timeseries",
+          "rawSql": "SELECT ts AS time, concat(exchange, '.', market, '.', symbol, ' / ', engine_version) AS metric, mid AS value\nFROM crypto.features FINAL\nWHERE $__timeFilter(ts) AND if(${asset:sqlstring} = 'BTC', match(symbol, 'BTC|XBT'), position(symbol, 'ETH') > 0) AND exchange != 'cross'\nORDER BY time",
+          "format": 0,
+          "pluginVersion": "4.22.1"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "currencyUSD",
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "fillOpacity": 0,
+            "spanNulls": false
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      }
+    },
+    {
+      "id": 2,
+      "title": "Spread (bps)",
+      "type": "timeseries",
+      "description": "",
+      "datasource": {
+        "type": "grafana-clickhouse-datasource",
+        "uid": "crypto-clickhouse"
+      },
+      "gridPos": {
+        "h": 9,
+        "w": 12,
+        "x": 12,
+        "y": 0
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "grafana-clickhouse-datasource",
+            "uid": "crypto-clickhouse"
+          },
+          "editorType": "sql",
+          "queryType": "timeseries",
+          "rawSql": "SELECT ts AS time, concat(exchange, '.', market, '.', symbol, ' / ', engine_version) AS metric, spread_bps AS value\nFROM crypto.features FINAL\nWHERE $__timeFilter(ts) AND if(${asset:sqlstring} = 'BTC', match(symbol, 'BTC|XBT'), position(symbol, 'ETH') > 0) AND exchange != 'cross'\nORDER BY time",
+          "format": 0,
+          "pluginVersion": "4.22.1"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "fillOpacity": 0,
+            "spanNulls": false
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      }
+    },
+    {
+      "id": 3,
+      "title": "Top-10 depth (base asset)",
+      "type": "timeseries",
+      "description": "",
+      "datasource": {
+        "type": "grafana-clickhouse-datasource",
+        "uid": "crypto-clickhouse"
+      },
+      "gridPos": {
+        "h": 9,
+        "w": 12,
+        "x": 0,
+        "y": 9
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "grafana-clickhouse-datasource",
+            "uid": "crypto-clickhouse"
+          },
+          "editorType": "sql",
+          "queryType": "timeseries",
+          "rawSql": "SELECT ts AS time, concat(concat(exchange, '.', market, '.', symbol, ' / ', engine_version), ' / ', item.1) AS metric, item.2 AS value\nFROM crypto.features FINAL\nARRAY JOIN [('bid', bid_depth10), ('ask', ask_depth10)] AS item\nWHERE $__timeFilter(ts) AND if(${asset:sqlstring} = 'BTC', match(symbol, 'BTC|XBT'), position(symbol, 'ETH') > 0) AND exchange != 'cross'\nORDER BY time",
+          "format": 0,
+          "pluginVersion": "4.22.1"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "fillOpacity": 0,
+            "spanNulls": false
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      }
+    },
+    {
+      "id": 4,
+      "title": "Top-10 imbalance",
+      "type": "timeseries",
+      "description": "",
+      "datasource": {
+        "type": "grafana-clickhouse-datasource",
+        "uid": "crypto-clickhouse"
+      },
+      "gridPos": {
+        "h": 9,
+        "w": 12,
+        "x": 12,
+        "y": 9
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "grafana-clickhouse-datasource",
+            "uid": "crypto-clickhouse"
+          },
+          "editorType": "sql",
+          "queryType": "timeseries",
+          "rawSql": "SELECT ts AS time, concat(exchange, '.', market, '.', symbol, ' / ', engine_version) AS metric, imbalance10 AS value\nFROM crypto.features FINAL\nWHERE $__timeFilter(ts) AND if(${asset:sqlstring} = 'BTC', match(symbol, 'BTC|XBT'), position(symbol, 'ETH') > 0) AND exchange != 'cross'\nORDER BY time",
+          "format": 0,
+          "pluginVersion": "4.22.1"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "fillOpacity": 0,
+            "spanNulls": false
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      }
+    },
+    {
+      "id": 5,
+      "title": "Perp / spot basis (bps)",
+      "type": "timeseries",
+      "description": "",
+      "datasource": {
+        "type": "grafana-clickhouse-datasource",
+        "uid": "crypto-clickhouse"
+      },
+      "gridPos": {
+        "h": 9,
+        "w": 12,
+        "x": 0,
+        "y": 18
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "grafana-clickhouse-datasource",
+            "uid": "crypto-clickhouse"
+          },
+          "editorType": "sql",
+          "queryType": "timeseries",
+          "rawSql": "SELECT ts AS time, concat(concat(exchange, '.', market, '.', symbol, ' / ', engine_version), ' / ', item.1) AS metric, item.2 AS value\nFROM crypto.features FINAL\nARRAY JOIN [('binance', basis_bps_binance), ('okx', basis_bps_okx), ('kraken', basis_bps_kraken)] AS item\nWHERE $__timeFilter(ts) AND symbol = ${asset:sqlstring} AND exchange = 'cross'\nORDER BY time",
+          "format": 0,
+          "pluginVersion": "4.22.1"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "fillOpacity": 0,
+            "spanNulls": false
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      }
+    },
+    {
+      "id": 6,
+      "title": "Spot deviation vs Binance (bps)",
+      "type": "timeseries",
+      "description": "",
+      "datasource": {
+        "type": "grafana-clickhouse-datasource",
+        "uid": "crypto-clickhouse"
+      },
+      "gridPos": {
+        "h": 9,
+        "w": 12,
+        "x": 12,
+        "y": 18
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "grafana-clickhouse-datasource",
+            "uid": "crypto-clickhouse"
+          },
+          "editorType": "sql",
+          "queryType": "timeseries",
+          "rawSql": "SELECT ts AS time, concat(concat(exchange, '.', market, '.', symbol, ' / ', engine_version), ' / ', item.1) AS metric, item.2 AS value\nFROM crypto.features FINAL\nARRAY JOIN [('okx', spot_dev_bps_okx), ('kraken', spot_dev_bps_kraken)] AS item\nWHERE $__timeFilter(ts) AND symbol = ${asset:sqlstring} AND exchange = 'cross'\nORDER BY time",
+          "format": 0,
+          "pluginVersion": "4.22.1"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "fillOpacity": 0,
+            "spanNulls": false
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      }
+    },
+    {
+      "id": 7,
+      "title": "Funding rate",
+      "type": "timeseries",
+      "description": "",
+      "datasource": {
+        "type": "grafana-clickhouse-datasource",
+        "uid": "crypto-clickhouse"
+      },
+      "gridPos": {
+        "h": 9,
+        "w": 12,
+        "x": 0,
+        "y": 27
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "grafana-clickhouse-datasource",
+            "uid": "crypto-clickhouse"
+          },
+          "editorType": "sql",
+          "queryType": "timeseries",
+          "rawSql": "SELECT ts AS time, concat(exchange, '.', market, '.', symbol, ' / ', engine_version) AS metric, funding_rate AS value\nFROM crypto.features FINAL\nWHERE $__timeFilter(ts) AND if(${asset:sqlstring} = 'BTC', match(symbol, 'BTC|XBT'), position(symbol, 'ETH') > 0) AND exchange != 'cross'\nORDER BY time",
+          "format": 0,
+          "pluginVersion": "4.22.1"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "fillOpacity": 0,
+            "spanNulls": false
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      }
+    },
+    {
+      "id": 8,
+      "title": "Open interest",
+      "type": "timeseries",
+      "description": "",
+      "datasource": {
+        "type": "grafana-clickhouse-datasource",
+        "uid": "crypto-clickhouse"
+      },
+      "gridPos": {
+        "h": 9,
+        "w": 12,
+        "x": 12,
+        "y": 27
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "grafana-clickhouse-datasource",
+            "uid": "crypto-clickhouse"
+          },
+          "editorType": "sql",
+          "queryType": "timeseries",
+          "rawSql": "SELECT ts AS time, concat(exchange, '.', market, '.', symbol, ' / ', engine_version) AS metric, open_interest AS value\nFROM crypto.features FINAL\nWHERE $__timeFilter(ts) AND if(${asset:sqlstring} = 'BTC', match(symbol, 'BTC|XBT'), position(symbol, 'ETH') > 0) AND exchange != 'cross'\nORDER BY time",
+          "format": 0,
+          "pluginVersion": "4.22.1"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "fillOpacity": 0,
+            "spanNulls": false
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      }
+    },
+    {
+      "id": 9,
+      "title": "Taker flow (base asset / second)",
+      "type": "timeseries",
+      "description": "",
+      "datasource": {
+        "type": "grafana-clickhouse-datasource",
+        "uid": "crypto-clickhouse"
+      },
+      "gridPos": {
+        "h": 9,
+        "w": 12,
+        "x": 0,
+        "y": 36
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "grafana-clickhouse-datasource",
+            "uid": "crypto-clickhouse"
+          },
+          "editorType": "sql",
+          "queryType": "timeseries",
+          "rawSql": "SELECT ts AS time, concat(concat(exchange, '.', market, '.', symbol, ' / ', engine_version), ' / ', item.1) AS metric, item.2 AS value\nFROM crypto.features FINAL\nARRAY JOIN [('buy', taker_buy_base), ('sell', taker_sell_base)] AS item\nWHERE $__timeFilter(ts) AND if(${asset:sqlstring} = 'BTC', match(symbol, 'BTC|XBT'), position(symbol, 'ETH') > 0) AND exchange != 'cross'\nORDER BY time",
+          "format": 0,
+          "pluginVersion": "4.22.1"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "fillOpacity": 0,
+            "spanNulls": false
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      }
+    },
+    {
+      "id": 10,
+      "title": "Liquidations (base asset / second)",
+      "type": "timeseries",
+      "description": "",
+      "datasource": {
+        "type": "grafana-clickhouse-datasource",
+        "uid": "crypto-clickhouse"
+      },
+      "gridPos": {
+        "h": 9,
+        "w": 12,
+        "x": 12,
+        "y": 36
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "grafana-clickhouse-datasource",
+            "uid": "crypto-clickhouse"
+          },
+          "editorType": "sql",
+          "queryType": "timeseries",
+          "rawSql": "SELECT ts AS time, concat(concat(exchange, '.', market, '.', symbol, ' / ', engine_version), ' / ', item.1) AS metric, item.2 AS value\nFROM crypto.features FINAL\nARRAY JOIN [('liquidated', liq_base_1s)] AS item\nWHERE $__timeFilter(ts) AND if(${asset:sqlstring} = 'BTC', match(symbol, 'BTC|XBT'), position(symbol, 'ETH') > 0) AND exchange != 'cross'\nORDER BY time",
+          "format": 0,
+          "pluginVersion": "4.22.1"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "fillOpacity": 0,
+            "spanNulls": false
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      }
+    },
+    {
+      "id": 11,
+      "title": "Data freshness & book validity",
+      "type": "table",
+      "description": "Freshness = server now \u2212 latest tick in the selected range; book_valid_share and invalid_book_ticks summarize that range. Invalid books are the engine drop/resync signal; warmup is the latest tick flag.",
+      "datasource": {
+        "type": "grafana-clickhouse-datasource",
+        "uid": "crypto-clickhouse"
+      },
+      "gridPos": {
+        "h": 9,
+        "w": 12,
+        "x": 0,
+        "y": 45
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "grafana-clickhouse-datasource",
+            "uid": "crypto-clickhouse"
+          },
+          "editorType": "sql",
+          "queryType": "table",
+          "rawSql": "SELECT exchange, market, symbol, engine_version,\n    max(ts) AS last_tick,\n    dateDiff('millisecond', max(ts), now64(3)) / 1000.0 AS freshness_s,\n    avg(toUInt8(book_valid)) AS book_valid_share,\n    argMax(tuple(book_age_ms), tick_ns).1 AS book_age_ms,\n    countIf(NOT book_valid) AS invalid_book_ticks,\n    argMax(warmup, tick_ns) AS warmup\nFROM crypto.features FINAL\nWHERE $__timeFilter(ts) AND if(${asset:sqlstring} = 'BTC', match(symbol, 'BTC|XBT'), position(symbol, 'ETH') > 0) AND exchange != 'cross'\nGROUP BY exchange, market, symbol, engine_version\nORDER BY freshness_s DESC",
+          "format": 1,
+          "pluginVersion": "4.22.1"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "fillOpacity": 0,
+            "spanNulls": false
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "showHeader": true
+      }
+    },
+    {
+      "id": 12,
+      "title": "Predicted vs realized return (%)",
+      "type": "timeseries",
+      "description": "Empty until phase 6. Returns are 100 \u00d7 (mid(t+h)/mid(t) \u2212 1), aligned to prediction time. Realized values stay NULL until a valid future tick exists. Latest available feature engine version supplies each target price.",
+      "datasource": {
+        "type": "grafana-clickhouse-datasource",
+        "uid": "crypto-clickhouse"
+      },
+      "gridPos": {
+        "h": 9,
+        "w": 12,
+        "x": 12,
+        "y": 45
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "grafana-clickhouse-datasource",
+            "uid": "crypto-clickhouse"
+          },
+          "editorType": "sql",
+          "queryType": "timeseries",
+          "rawSql": "WITH prices AS (\n    SELECT concat(exchange, '.', market, '.', ${asset:sqlstring}) AS target,\n        tick_ns, argMax(mid, tuple(available_ns, engine_version)) AS reference_mid\n    FROM crypto.features FINAL\n    WHERE ts >= $__fromTime AND ts <= $__toTime + INTERVAL 30 MINUTE\n        AND if(${asset:sqlstring} = 'BTC', match(symbol, 'BTC|XBT'), position(symbol, 'ETH') > 0) AND exchange != 'cross' AND mid IS NOT NULL AND book_valid\n    GROUP BY target, tick_ns\n)\nSELECT p.ts AS time,\n    concat(p.target, ' / ', toString(p.horizon_s), 's / ', p.model_version, ' / ', item.1) AS metric,\n    item.2 AS value\nFROM crypto.predictions AS p FINAL\nLEFT JOIN prices AS start ON start.target = p.target AND start.tick_ns = p.tick_ns\nLEFT JOIN prices AS finish ON finish.target = p.target\n    AND finish.tick_ns = p.tick_ns + toInt64(p.horizon_s) * 1000000000\nARRAY JOIN [\n    ('predicted', toNullable(p.pred_return_pct)),\n    ('realized', 100.0 * (finish.reference_mid / nullIf(start.reference_mid, 0) - 1.0))\n] AS item\nWHERE $__timeFilter(p.ts) AND endsWith(p.target, concat('.', ${asset:sqlstring}))\nORDER BY time\nSETTINGS join_use_nulls = 1",
+          "format": 0,
+          "pluginVersion": "4.22.1"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "fillOpacity": 0,
+            "spanNulls": false
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      }
+    }
+  ],
+  "annotations": {
+    "list": []
+  }
+}

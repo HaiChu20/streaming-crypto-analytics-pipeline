@@ -1,0 +1,75 @@
+name: crypto-dashboard
+
+services:
+  clickhouse:
+    image: clickhouse/clickhouse-server:26.8.15.10
+    restart: unless-stopped
+    mem_limit: 3g
+    environment:
+      # Local development only; Grafana uses the separate read-only dashboard user.
+      CLICKHOUSE_SKIP_USER_SETUP: "1"
+      TZ: UTC
+    ports:
+      - "127.0.0.1:8123:8123"
+    volumes:
+      - clickhouse-data:/var/lib/clickhouse
+      - ./clickhouse/init:/docker-entrypoint-initdb.d:ro
+      - ./clickhouse/config.d/dashboard.xml:/etc/clickhouse-server/config.d/dashboard.xml:ro
+      - ./clickhouse/users.d/dashboard.xml:/etc/clickhouse-server/users.d/dashboard.xml:ro
+    networks: [crypto-net]
+    healthcheck:
+      test: ["CMD", "clickhouse-client", "--query", "SELECT 1 FROM crypto.features FINAL LIMIT 0"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 30s
+    ulimits:
+      nofile:
+        soft: 262144
+        hard: 262144
+
+  grafana:
+    image: grafana/grafana:13.2.3
+    restart: unless-stopped
+    mem_limit: 768m
+    depends_on:
+      clickhouse:
+        condition: service_healthy
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:-local-dashboard-admin}
+      GF_AUTH_ANONYMOUS_ENABLED: "false"
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_ANALYTICS_REPORTING_ENABLED: "false"
+      GF_ANALYTICS_CHECK_FOR_UPDATES: "false"
+      GF_ANALYTICS_CHECK_FOR_PLUGIN_UPDATES: "false"
+      GF_PLUGINS_PREINSTALL_SYNC: "grafana-clickhouse-datasource@4.22.1"
+      GF_PLUGINS_PREINSTALL_AUTO_UPDATE: "false"
+      # Grafana 13 otherwise downloads these unrelated default plugins on startup.
+      GF_PLUGINS_DISABLE_PLUGINS: >-
+        grafana-lokiexplore-app,grafana-pyroscope-app,grafana-exploretraces-app,
+        grafana-metricsdrilldown-app,elasticsearch,prometheus,tempo,zipkin,
+        opentsdb,stackdriver,mssql,jaeger,loki,mysql,influxdb,grafana-advisor-app,
+        grafana-postgresql-datasource,grafana-pyroscope-datasource,grafana-pathfinder-app
+    ports:
+      - "127.0.0.1:3000:3000"
+    volumes:
+      - grafana-data:/var/lib/grafana
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ../../dashboards:/var/lib/grafana/dashboards:ro
+    networks: [crypto-net]
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1:3000/api/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 18
+      start_period: 60s
+
+volumes:
+  clickhouse-data:
+  grafana-data:
+
+networks:
+  crypto-net:
+    external: true
+    name: crypto-net

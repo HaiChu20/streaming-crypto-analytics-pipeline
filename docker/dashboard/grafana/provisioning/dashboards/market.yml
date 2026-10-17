@@ -1,0 +1,11 @@
+apiVersion: 1
+providers:
+  - name: crypto-market
+    orgId: 1
+    folder: Crypto
+    type: file
+    disableDeletion: true
+    editable: false
+    updateIntervalSeconds: 10
+    options:
+      path: /var/lib/grafana/dashboards

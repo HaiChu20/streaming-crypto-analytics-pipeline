@@ -1,0 +1,20 @@
+<clickhouse>
+    <profiles>
+        <dashboard>
+            <!-- readonly=2 permits the datasource to set query timeouts, but no writes. -->
+            <readonly>2</readonly>
+            <max_memory_usage>536870912</max_memory_usage>
+            <max_execution_time>20</max_execution_time>
+            <max_threads>4</max_threads>
+        </dashboard>
+    </profiles>
+    <users>
+        <dashboard>
+            <password>dashboard-local</password>
+            <networks><ip>::/0</ip></networks>
+            <profile>dashboard</profile>
+            <quota>default</quota>
+            <allow_databases><database>crypto</database></allow_databases>
+        </dashboard>
+    </users>
+</clickhouse>
