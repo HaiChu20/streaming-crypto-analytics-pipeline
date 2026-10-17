@@ -1,0 +1,5 @@
+[toolchain]
+# Installed stable is rustc 1.99.1 (58cf8f9c3 2026-10-13); version alias is not installed.
+channel = "stable"
+profile = "minimal"
+components = ["clippy", "rustfmt"]

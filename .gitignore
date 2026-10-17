@@ -15,3 +15,6 @@ infra/terraform/.terraform/
 *.tfstate
 *.tfstate.*
 *.tfplan
+
+# Rust engine build artifacts
+engine/target/

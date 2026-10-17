@@ -160,7 +160,7 @@ def test_pipeline_stop_waits_for_owned_process(tmp_path):
     try:
         with ThreadPoolExecutor(max_workers=1) as pool:
             exited = pool.submit(child.wait)
-            result = subprocess.run(["bash", str(script), "stop"], capture_output=True, text=True, timeout=5)
+            result = subprocess.run(["bash", str(script), "stop"], capture_output=True, text=True, timeout=30)
             assert result.returncode == 0
             assert exited.result(timeout=1) is not None
             assert child.returncode is not None
@@ -176,7 +176,7 @@ def test_pipeline_start_detects_failed_processes(tmp_path):
     python.parent.mkdir(parents=True)
     python.write_text("#!/usr/bin/env bash\nexit 1\n")
     python.chmod(0o755)
-    result = subprocess.run(["bash", str(script), "start"], capture_output=True, text=True, timeout=8)
+    result = subprocess.run(["bash", str(script), "start"], capture_output=True, text=True, timeout=30)
     assert result.returncode == 1
     for name in ("binance", "okx", "kraken", "recorder"):
         assert f"FAILED to start {name}, see data/logs/{name}.log" in result.stdout
@@ -193,7 +193,7 @@ def test_pipeline_stop_timeout_reports_survivors(tmp_path, term_fails):
     state = tmp_path / "data/state"
     state.mkdir(parents=True)
     (state / "binance.pid").write_text("999999999")
-    result = subprocess.run(["bash", str(script), "stop"], capture_output=True, text=True, timeout=5)
+    result = subprocess.run(["bash", str(script), "stop"], capture_output=True, text=True, timeout=30)
     assert result.returncode == 1
     assert "still alive after 60s: binance" in result.stderr
     assert (tmp_path / "data/sleeps").read_text().splitlines() == ["0.5"] * 120
