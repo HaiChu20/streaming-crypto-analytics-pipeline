@@ -1,0 +1,80 @@
+# What we collect (plan.md §4). Topic = raw.<exchange>.<market>.<feed>.v1
+# Partition = asset via `partitions` (explicit, no hashing): one (topic, partition) = one stream.
+
+topic_version: v1
+partitions: {BTC: 0, ETH: 1}
+
+kafka:
+  # Per-partition safety cap; tune after phase 1 volume measurement.
+  retention_hours: 72
+  retention_bytes_per_partition: 2147483648   # 2 GiB
+  # Producer memory ceiling during a Kafka outage (plan.md §5.3). Normally near-empty.
+  producer_buffer_kbytes: 1048576             # 1 GiB
+
+rotation:
+  # Make-before-break replacement just after 00:00 UTC, staggered per exchange (seconds).
+  stagger_s: {binance: 2, okx: 4, kraken: 6}
+  ready_timeout_s: 30
+  # Replace before Binance's 24h connection limit.
+  max_age_h: {binance: 23}
+
+exchanges:
+  binance:
+    spot:
+      symbols: {BTC: BTCUSDT, ETH: ETHUSDT}
+      connections:
+        spot:
+          url: wss://stream.binance.com:9443/stream
+          feeds: {l1: bookTicker, l2: depth@100ms, trades: trade}
+      rest: https://api.binance.com
+      snapshot_limit: 5000
+    perp:
+      symbols: {BTC: BTCUSDT, ETH: ETHUSDT}
+      connections:
+        perp_public:
+          url: wss://fstream.binance.com/public/stream
+          feeds: {l1: bookTicker, l2: depth@100ms, trades: trade}
+        perp_market:
+          url: wss://fstream.binance.com/market/stream
+          feeds: {trades_agg: aggTrade, mark: markPrice@1s, liquidations: forceOrder}
+      rest: https://fapi.binance.com
+      snapshot_limit: 1000
+
+  okx:
+    spot:
+      symbols: {BTC: BTC-USDT, ETH: ETH-USDT}
+      connections:
+        public:
+          url: wss://ws.okx.com:8443/ws/v5/public
+          feeds: {l1: bbo-tbt, l2: books}
+        business:
+          url: wss://ws.okx.com:8443/ws/v5/business
+          feeds: {trades: trades-all}
+    perp:
+      symbols: {BTC: BTC-USDT-SWAP, ETH: ETH-USDT-SWAP}
+      connections:
+        public:
+          url: wss://ws.okx.com:8443/ws/v5/public
+          feeds: {l1: bbo-tbt, l2: books, trades_agg: trades}
+        business:
+          url: wss://ws.okx.com:8443/ws/v5/business
+          feeds: {trades: trades-all}
+
+  kraken:
+    spot:
+      symbols: {BTC: BTC/USD, ETH: ETH/USD}
+      connections:
+        spot:
+          url: wss://ws.kraken.com/v2
+          feeds: {l2: book, trades: trade}
+        l3:
+          url: wss://ws-l3.kraken.com/v2
+          feeds: {l3: level3}
+          auth: true
+      depth: {l2: 100, l3: 100}
+    perp:
+      symbols: {BTC: PF_XBTUSD, ETH: PF_ETHUSD}
+      connections:
+        futures:
+          url: wss://futures.kraken.com/ws/v1
+          feeds: {l2: book, trades: trade, ticker: ticker}

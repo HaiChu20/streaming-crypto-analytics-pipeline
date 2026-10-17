@@ -1,3 +1,11 @@
 *.code-workspace
+.venv/
+__pycache__/
+.pytest_cache/
+
+# Secrets (Kraken API key) — never commit
+.env
+
+# Local market data, collector state, and old Kafka bind-mount data
+data/
 kafka-data/
-.venv/ 
