@@ -669,6 +669,113 @@
           "mode": "multi"
         }
       }
+    },
+    {
+      "id": 13,
+      "title": "Live predicted vs realized return (%)",
+      "type": "timeseries",
+      "description": "Versioned Binance references from research/targets.yaml. Exact endpoints; FINAL deduplicates. Hit rate excludes flat realized returns.",
+      "datasource": {
+        "type": "grafana-clickhouse-datasource",
+        "uid": "crypto-clickhouse"
+      },
+      "gridPos": {
+        "h": 9,
+        "w": 12,
+        "x": 0,
+        "y": 54
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "grafana-clickhouse-datasource",
+            "uid": "crypto-clickhouse"
+          },
+          "editorType": "sql",
+          "queryType": "timeseries",
+          "rawSql": "WITH prices AS (\n    SELECT multiIf(\n            exchange = 'binance' AND market = 'spot' AND symbol = 'BTCUSDT', 'BTC_spot',\n            exchange = 'binance' AND market = 'perp' AND symbol = 'BTCUSDT', 'BTC_perp',\n            exchange = 'binance' AND market = 'spot' AND symbol = 'ETHUSDT', 'ETH_spot',\n            exchange = 'binance' AND market = 'perp' AND symbol = 'ETHUSDT', 'ETH_perp', '') AS target,\n        tick_ns,\n        argMax(mid_e9, tuple(available_ns, engine_version)) AS reference_mid,\n        argMax(warmup, tuple(available_ns, engine_version)) AS reference_warmup\n    FROM crypto.features FINAL\n    WHERE ts >= $__fromTime AND ts <= $__toTime + INTERVAL 30 MINUTE\n        AND book_valid AND mid_e9 > 0\n    GROUP BY target, tick_ns\n    HAVING target != ''\n)\nSELECT p.ts AS time,\n    concat(p.target, ' / ', toString(p.horizon_s), 's / ', p.model_version, ' / ', item.1) AS metric,\n    item.2 AS value\nFROM crypto.predictions AS p FINAL\nLEFT JOIN prices AS start ON start.target = p.target AND start.tick_ns = p.tick_ns\nLEFT JOIN prices AS finish ON finish.target = p.target\n    AND finish.tick_ns = p.tick_ns + toInt64(p.horizon_s) * 1000000000\nARRAY JOIN [('predicted', toNullable(p.pred_return_pct)), ('realized', if(start.reference_warmup = 0, 100.0 * (finish.reference_mid / nullIf(start.reference_mid, 0) - 1.0), NULL))] AS item\nWHERE $__timeFilter(p.ts) AND startsWith(p.target, concat(${asset:sqlstring}, '_'))\nORDER BY time\nSETTINGS join_use_nulls = 1",
+          "format": 0,
+          "pluginVersion": "4.22.1"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percent",
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "fillOpacity": 0,
+            "spanNulls": false
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      }
+    },
+    {
+      "id": 14,
+      "title": "Live directional hit rate (%)",
+      "type": "stat",
+      "description": "Versioned Binance references from research/targets.yaml. Exact endpoints; FINAL deduplicates. Hit rate excludes flat realized returns.",
+      "datasource": {
+        "type": "grafana-clickhouse-datasource",
+        "uid": "crypto-clickhouse"
+      },
+      "gridPos": {
+        "h": 9,
+        "w": 12,
+        "x": 12,
+        "y": 54
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "grafana-clickhouse-datasource",
+            "uid": "crypto-clickhouse"
+          },
+          "editorType": "sql",
+          "queryType": "timeseries",
+          "rawSql": "WITH prices AS (\n    SELECT multiIf(\n            exchange = 'binance' AND market = 'spot' AND symbol = 'BTCUSDT', 'BTC_spot',\n            exchange = 'binance' AND market = 'perp' AND symbol = 'BTCUSDT', 'BTC_perp',\n            exchange = 'binance' AND market = 'spot' AND symbol = 'ETHUSDT', 'ETH_spot',\n            exchange = 'binance' AND market = 'perp' AND symbol = 'ETHUSDT', 'ETH_perp', '') AS target,\n        tick_ns,\n        argMax(mid_e9, tuple(available_ns, engine_version)) AS reference_mid,\n        argMax(warmup, tuple(available_ns, engine_version)) AS reference_warmup\n    FROM crypto.features FINAL\n    WHERE ts >= $__fromTime AND ts <= $__toTime + INTERVAL 30 MINUTE\n        AND book_valid AND mid_e9 > 0\n    GROUP BY target, tick_ns\n    HAVING target != ''\n)\nSELECT max(p.ts) AS time,\n    concat(p.target, ' / ', toString(p.horizon_s), 's / ', p.model_version) AS metric,\n    100.0 * avg(toFloat64(p.direction = sign(finish.reference_mid - start.reference_mid))) AS value\nFROM crypto.predictions AS p FINAL\nLEFT JOIN prices AS start ON start.target = p.target AND start.tick_ns = p.tick_ns\nLEFT JOIN prices AS finish ON finish.target = p.target\n    AND finish.tick_ns = p.tick_ns + toInt64(p.horizon_s) * 1000000000\nWHERE $__timeFilter(p.ts) AND startsWith(p.target, concat(${asset:sqlstring}, '_'))\n    AND start.reference_warmup = 0 AND start.reference_mid > 0 AND finish.reference_mid > 0\n    AND finish.reference_mid != start.reference_mid\nGROUP BY p.target, p.horizon_s, p.model_version\nORDER BY metric\nSETTINGS join_use_nulls = 1",
+          "format": 0,
+          "pluginVersion": "4.22.1"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percent",
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "fillOpacity": 0,
+            "spanNulls": false
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "auto",
+        "colorMode": "value",
+        "graphMode": "none"
+      }
     }
   ],
   "annotations": {

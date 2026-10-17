@@ -9,10 +9,15 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 PY=.venv/bin/python
 NAMES=(binance okx kraken recorder)
+# Resolve .env through the same loader as collectors; print only the enable flag.
+if [[ -n "${INFERENCE_MODEL_VERSION:-}" ]] || [[ "$("$PY" -c 'from collectors.common import config; import os; print("enabled" if os.environ.get("INFERENCE_MODEL_VERSION") else "")')" == enabled ]]; then
+  NAMES+=(inference)
+fi
 mkdir -p data/logs data/state
 
 cmd_for() {
   case "$1" in
+    inference) echo "$PY -m inference.service" ;;
     recorder) echo "$PY -m archiver.record_raw" ;;
     *) echo "$PY -m collectors $1" ;;
   esac

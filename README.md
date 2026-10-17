@@ -95,3 +95,29 @@ ClickHouse consumes `features.1s.v1` and, in phase 6, `predictions.v1` via
 refreshes every 5s and uses `FINAL` to collapse duplicate identities. Data persists
 in named volumes with a 30-day TTL. See [dashboard operations](docker/dashboard/README.md)
 for pinned versions, accounts, ingestion behavior, memory caps, and verification.
+
+## Live inference
+
+Set `INFERENCE_MODELS_ROOT=data` and `INFERENCE_MODEL_VERSION=<version>` in `.env`
+to enable inference with `scripts/pipeline.sh start`; an empty version disables it.
+The root contains `models/<target>/<horizon_s>/<version>/` from `research.train`.
+`status` and `stop` include inference when enabled. Models load locally by default.
+
+```bash
+PYTHON_DOTENV_DISABLED=1 uv run python -m inference.service --models-root data --version baseline-v1
+# Optional filters: --target BTC_spot --horizon-s 900
+# Explicit opt-in S3 download: --download (requires S3_BUCKET)
+```
+
+Inference starts at the latest `features.1s.v1` offsets in its own consumer group,
+uses completed ticks at the model stride, and emits keyed `predictions.v1` rows:
+model version, target, horizon, tick/production timestamps, percent return and
+direction (-1/0/+1). Missing momentum endpoints remain NaN; missing, invalid or
+warming reference books skip prediction. Stats every 60s include skips, malformed
+rows, wall-clock latency and per-tick build/predict compute latency. Shutdown
+flushes the producer and leaves the final incomplete tick unpredicted.
+
+Grafana compares predictions with exact `mid_e9` endpoints on the versioned
+Binance reference and shows directional hit rate for matured, non-flat outcomes
+in the visible range. Roughly nine-hour models verify plumbing only; several
+weeks are needed for meaningful evaluation.

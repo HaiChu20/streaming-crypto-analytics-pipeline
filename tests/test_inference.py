@@ -1,0 +1,317 @@
+"""Online/offline vector parity, anomaly isolation and native-model inference."""
+import json
+from pathlib import Path
+import re
+import subprocess
+from types import SimpleNamespace
+
+import numpy as np
+import polars as pl
+import pytest
+
+from inference.service import Model, SCHEMA, Service, load_models, vector_for
+from research.dataset import build_matrix
+from research.labels import NS, load_spec
+from research.train import fit_models
+
+
+def row(second, **updates):
+    result = dict.fromkeys(SCHEMA)
+    result.update(exchange="binance", market="spot", symbol="BTCUSDT", engine_version="test",
+                  replay_mode="as_live", tick_ns=second * NS, available_ns=second * NS + 250_000_000,
+                  book_valid=True, warmup=False, mid_e9=100_000_000_005 + second * 100,
+                  spread_bps=2., ret_60s=0.01)
+    result.update(updates)
+    return result
+
+
+def metadata(features=None):
+    return dict(target="BTC_spot", horizon_s=900, version="test", stride_s=10,
+                label_spec=load_spec(), features=features or ["binance_spot_spread_bps"],
+                engine_version=["test"], replay_modes=["as_live"], classifier_class_order=[-1, 0, 1])
+
+
+class Producer:
+    def __init__(self):
+        self.messages = []
+
+    def produce(self, topic, **kwargs):
+        self.messages.append((topic, kwargs))
+
+
+def service():
+    reg = SimpleNamespace(predict=lambda x, **kw: np.array([.2]))
+    clf = SimpleNamespace(predict=lambda x, **kw: np.array([[.1, .2, .7]]))
+    return Service([Model(metadata(), reg, clf)], Producer())
+
+
+def feed(svc, *rows):
+    for r in rows:
+        svc.ingest(json.dumps(r))
+
+
+def test_parity_full_multinstrument_frame_and_online_ticks():
+    rows = []
+    for t in [0, 10, 899, 900, 910, 1800, 1810]:
+        rows.append(row(t, warmup=t == 0, ret_60s=None if t == 910 else .01))
+        rows.append(row(t, market="perp", spread_bps=3.))
+        if t != 910:
+            rows.append(row(t, exchange="okx", symbol="BTC-USDT", spread_bps=4.))
+        rows.append(row(t, exchange="cross", market="cross", symbol="BTC", basis_bps_binance=1.5))
+        rows.append(row(t, symbol="ETHUSDT", spread_bps=999.))
+    frame = pl.DataFrame(rows, schema=SCHEMA)
+    matrix, features = build_matrix(frame, "BTC_spot")
+    # Deliberately use metadata order and include a producible but absent instrument.
+    features = list(reversed(features)) + ["kraken_spot_spread_bps"]
+    meta = metadata(features)
+    captured = {}
+    svc = service()
+    svc.models[0].metadata = meta
+    svc.models[0].regressor = SimpleNamespace(predict=lambda x, **kw: (captured.update({svc.tick: x.copy()}) or np.array([.2])))
+    feed(svc, *rows, row(1811))
+    for tick in matrix["tick_ns"]:
+        current = [r for r in rows if r["tick_ns"] == tick]
+        history = [r for r in rows if tick - 901 * NS <= r["tick_ns"] < tick
+                   and r["exchange"] == "binance" and r["market"] == "spot" and r["symbol"] == "BTCUSDT"]
+        actual = vector_for(current, history, meta)
+        expected = matrix.filter(pl.col("tick_ns") == tick).with_columns(
+            pl.lit(None).alias("kraken_spot_spread_bps")).select(features).to_numpy().astype(float)
+        np.testing.assert_array_equal(actual, expected)
+        np.testing.assert_array_equal(captured[tick], expected)
+    assert np.isnan(captured[910 * NS][0, features.index("okx_spot_spread_bps")])
+    assert np.isfinite(captured[900 * NS][0, features.index("momentum_return_900s")])
+    assert all(r["exchange"] == "binance" and r["market"] == "spot" for r in svc.history)
+    assert min(r["tick_ns"] for r in svc.history) >= (1810 - 901) * NS
+
+
+def test_completion_stride_skips_and_schema():
+    svc = service()
+    feed(svc, row(0), row(1))
+    assert svc.counts["ticks"] == 1 and len(svc.producer.messages) == 1
+    feed(svc, row(10, warmup=True), row(20, book_valid=False), row(30, mid_e9=None),
+         row(40, market="perp"), row(50), row(51))
+    assert svc.skipped == dict(stride=1, warm_reference=1, invalid_reference=2, missing_reference=1)
+    assert svc.counts["predictions"] == 2
+    topic, message = svc.producer.messages[-1]
+    payload = json.loads(message["value"])
+    sql = Path("docker/dashboard/clickhouse/init/001-crypto.sql").read_text()
+    schema = re.search(r"CREATE TABLE IF NOT EXISTS crypto.predictions_kafka\s*\((.*?)\)\s*ENGINE", sql, re.S)[1]
+    expected = {line.strip().split()[0] for line in schema.strip().splitlines()}
+    assert set(payload) == expected
+    assert topic == "predictions.v1" and message["key"] == "BTC_spot" and message["partition"] == 0
+    assert type(payload["pred_return_pct"]) is float and payload["direction"] == 1
+    assert all(type(payload[k]) is int for k in ("horizon_s", "tick_ns", "available_ns", "direction"))
+    assert all(type(payload[k]) is str for k in ("model_version", "target"))
+    assert payload["available_ns"] >= row(50)["available_ns"]
+
+
+@pytest.mark.parametrize("payload", [b"broken", b"null", b"[]", b"{}", b"\xff",
+    json.dumps(row(0, surprise=1)), json.dumps(row(0, spread_bps=float("nan"))),
+    json.dumps(row(0, mid_e9="bad")), json.dumps(row(0, tick_ns=1)),
+    json.dumps(row(0, available_ns=-1)), json.dumps(row(0, warmup=None)),
+    json.dumps(row(0, tick_ns=2**100))])
+def test_malformed_does_not_stop_stream(payload):
+    svc = service()
+    svc.ingest(payload)
+    feed(svc, row(10), row(11))
+    assert svc.counts["malformed"] == 1
+    assert svc.counts["predictions"] == 1
+
+
+def test_duplicates_late_rows_inference_errors_and_future_availability(caplog):
+    svc = service()
+    feed(svc, row(10), row(10), row(0), row(11))
+    assert svc.counts["malformed"] == 2 and svc.counts["predictions"] == 1
+    svc.models[0].regressor = SimpleNamespace(predict=lambda *a, **kw: np.array([np.nan]))
+    feed(svc, row(20), row(21))
+    assert svc.skipped["inference_error"] == 1
+    svc.models[0].regressor = SimpleNamespace(predict=lambda *a, **kw: np.array([.1]))
+    feed(svc, row(30, available_ns=2**62), row(31), row(40), row(41))
+    assert svc.skipped["future_available"] == 1 and svc.counts["predictions"] == 2
+    svc.models[0].metadata["replay_modes"] = ["ideal"]
+    feed(svc, row(50), row(51), row(60), row(61))
+    assert sum("differs from live" in m for m in caplog.messages) == 1
+
+
+def test_load_and_predict_tiny_native_models(tmp_path):
+    meta = metadata()
+    x = np.arange(120).reshape(-1, 1).astype(float)
+    y = np.sin(x[:, 0])
+    reg, clf, _ = fit_models(x, y, np.sign(y).astype(int), meta["features"], 3)
+    path = tmp_path / "models/BTC_spot/900/test"
+    path.mkdir(parents=True)
+    reg.save_model(str(path / "regressor.txt"))
+    clf.save_model(str(path / "classifier.txt"))
+    (path / "metadata.json").write_text(json.dumps(meta))
+    models = load_models(tmp_path, "test", ["BTC_spot"], [900])
+    svc = Service(models, Producer())
+    feed(svc, row(10), row(11))
+    assert svc.counts["predictions"] == 1
+    expected = float(reg.predict([[2.]], num_threads=2)[0])
+    assert json.loads(svc.producer.messages[0][1]["value"])["pred_return_pct"] == expected
+    meta["features"] = ["impossible"]
+    (path / "metadata.json").write_text(json.dumps(meta))
+    with pytest.raises(ValueError, match="cannot produce"):
+        load_models(tmp_path, "test")
+
+
+def test_pipeline_lifecycle_in_isolated_directory(tmp_path):
+    # Fake runtime commands; never launch collectors, touch the live tree, or signal a PID.
+    import os
+    script = tmp_path / "scripts/pipeline.sh"
+    script.parent.mkdir()
+    script.write_text(Path("scripts/pipeline.sh").read_text())
+    runtime = tmp_path / ".venv/bin/python"
+    runtime.parent.mkdir(parents=True)
+    runtime.write_text('#!/bin/bash\nexit 0\n')
+    runtime.chmod(0o755)
+    env = {**os.environ, "PYTHON_DOTENV_DISABLED": "1", "INFERENCE_MODEL_VERSION": ""}
+    result = subprocess.run(["bash", str(script), "status"], env=env, capture_output=True, text=True, check=True)
+    assert "inference" not in result.stdout
+    env["INFERENCE_MODEL_VERSION"] = "test"
+    result = subprocess.run(["bash", str(script), "status"], env=env, capture_output=True, text=True, check=True)
+    assert "inference: stopped" in result.stdout
+    # Limit the isolated start to inference and replace sleep/caffeinate with no-ops.
+    script.write_text(script.read_text().replace('NAMES=(binance okx kraken recorder)', 'NAMES=()')
+                      .replace('nohup caffeinate -s -w "$(cat data/state/recorder.pid)" >/dev/null 2>&1 &', ':'))
+    result = subprocess.run(["bash", str(script), "start"], env=env, capture_output=True, text=True)
+    assert "started inference" in result.stdout and result.returncode == 1
+    assert "FAILED to start inference" in result.stdout
+    result = subprocess.run(["bash", str(script), "stop"], env=env, capture_output=True, text=True, check=True)
+    assert not result.stdout
+
+
+def test_main_anomaly_recovery_latest_group_and_signal_flush(monkeypatch):
+    import inference.service as module
+    configurations, handlers, closed, flushed = [], {}, [], []
+    messages = iter([b"invalid", json.dumps(row(10)), json.dumps(row(11))])
+    producer = Producer()
+    producer.poll = lambda timeout: None
+    producer.flush = lambda timeout: flushed.append(timeout) or 0
+
+    class Consumer:
+        def __init__(self, config):
+            configurations.append(config)
+
+        def subscribe(self, topics):
+            assert topics == ["features.1s.v1"]
+
+        def poll(self, timeout):
+            try:
+                payload = next(messages)
+                return SimpleNamespace(error=lambda: None, value=lambda: payload)
+            except StopIteration:
+                handlers[module.signal.SIGINT](None, None)
+                return None
+
+        def close(self):
+            closed.append(True)
+
+    monkeypatch.setattr(module, "Consumer", Consumer)
+    monkeypatch.setattr(module, "Producer", lambda cfg: producer)
+    monkeypatch.setattr(module, "load_models", lambda *args: service().models)
+    monkeypatch.setattr(module.signal, "signal", lambda sig, handler: handlers.update({sig: handler}))
+    module.main(["--version", "test"])
+    assert len(producer.messages) == 1 and closed and flushed == [10]
+    assert configurations[0]["auto.offset.reset"] == "latest"
+    assert configurations[0]["group.id"].startswith("inference-")
+    assert module.signal.SIGTERM in handlers
+
+
+def test_dashboard_preserves_panels_and_fixes_versioned_references():
+    from research.labels import reference_for
+    panels = json.loads(Path("dashboards/market.json").read_text())["panels"]
+    assert len({p["id"] for p in panels}) == len(panels)
+    for panel in panels[-2:]:
+        sql = panel["targets"][0]["rawSql"]
+        assert "crypto.features FINAL" in sql and "crypto.predictions AS p FINAL" in sql
+        assert "argMax(mid_e9" in sql and "finish.tick_ns = p.tick_ns +" in sql
+        for target in ("BTC_spot", "BTC_perp", "ETH_spot", "ETH_perp"):
+            ref = reference_for(target)
+            assert f"market = '{ref['market']}' AND symbol = '{ref['symbol']}', '{target}'" in sql
+    assert "avg(toFloat64(p.direction = sign(" in panels[-1]["targets"][0]["rawSql"]
+    assert "finish.reference_mid != start.reference_mid" in panels[-1]["targets"][0]["rawSql"]
+
+
+def test_live_schema_matches_rust_row_fields():
+    rust = Path("engine/core/src/row.rs").read_text()
+    assert set(re.findall(r"pub (\w+):", rust)) == set(SCHEMA) - {"replay_mode"}
+
+
+def test_explicit_download_filters_artifacts_and_preserves_existing(tmp_path, monkeypatch):
+    import boto3
+    from inference.service import download_models
+    keys = ["models/BTC_spot/900/test/" + name for name in
+            ("metadata.json", "regressor.txt", "classifier.txt", "training_rows.parquet")]
+    keys += ["models/BTC_spot/1800/test/metadata.json", "models/ETH_spot/900/test/metadata.json",
+             "models/BTC_spot/900/other/metadata.json", "models/../../test/metadata.json"]
+    calls = []
+    paginator = SimpleNamespace(paginate=lambda **kw: [{"Contents": [{"Key": k} for k in keys]}])
+
+    def download(bucket, key, output):
+        calls.append((bucket, key))
+        output.write(b"fixture")
+
+    client = SimpleNamespace(get_paginator=lambda name: paginator, download_fileobj=download)
+    monkeypatch.setenv("S3_BUCKET", "fixture-bucket")
+    monkeypatch.setattr(boto3, "client", lambda name: client)
+    download_models(tmp_path, "test", ["BTC_spot"], [900])
+    assert {key for _, key in calls} == set(keys[:3])
+    with pytest.raises(FileExistsError):
+        download_models(tmp_path, "test", ["BTC_spot"], [900])
+
+
+def test_matrices_shared_across_horizons_reindexed_per_model_and_reset_per_tick(monkeypatch):
+    import inference.service as module
+    original = module.build_matrix
+    builds, vectors = [], []
+
+    def build(rows, target, stride, spec):
+        builds.append((target, stride, spec['version']))
+        return original(rows, target, stride, spec)
+
+    def predict(x, **kwargs):
+        assert kwargs == {'num_threads': 1}
+        vectors.append(x.copy())
+        return np.array([.2])
+
+    def classify(x, **kwargs):
+        assert kwargs == {'num_threads': 1}
+        return np.array([[.1, .2, .7]])
+
+    monkeypatch.setattr(module, 'build_matrix', build)
+    first = metadata(['binance_spot_spread_bps', 'binance_spot_ret_60s'])
+    second = {**first, 'horizon_s': 1800,
+              'features': ['binance_spot_ret_60s', 'kraken_spot_spread_bps', 'binance_spot_spread_bps']}
+    models = [Model(meta, SimpleNamespace(predict=predict), SimpleNamespace(predict=classify))
+              for meta in (first, second)]
+    svc = Service(models, Producer())
+    feed(svc, row(10), row(11), row(20, spread_bps=3.), row(21))
+    assert builds == [('BTC_spot', 10, 'v1')] * 2
+    assert svc.counts['predictions'] == 4
+    np.testing.assert_array_equal(vectors[0], [[2., .01]])
+    np.testing.assert_array_equal(vectors[1], [[.01, np.nan, 2.]])
+    np.testing.assert_array_equal(vectors[2], [[3., .01]])
+    np.testing.assert_array_equal(vectors[3], [[.01, np.nan, 3.]])
+
+
+@pytest.mark.parametrize('change', [{'target': 'BTC_perp'}, {'stride_s': 20},
+                                   {'label_spec': {**load_spec(), 'version': 'v2'}}])
+def test_matrix_cache_separates_target_stride_and_spec_version(monkeypatch, change):
+    import inference.service as module
+    original = module.build_matrix
+    builds = []
+
+    def build(*args):
+        builds.append((args[1], args[2], args[3]['version']))
+        return original(*args)
+
+    monkeypatch.setattr(module, 'build_matrix', build)
+    svc = service()
+    other = service().models[0]
+    other.metadata.update(change)
+    svc.models.append(other)
+    svc.references.append(module.reference_for(other.metadata['target'], other.metadata['label_spec']))
+    feed(svc, row(20), row(20, market='perp'), row(21))
+    assert len(builds) == 2 and builds[0] != builds[1]
+    assert svc.counts['predictions'] == 2

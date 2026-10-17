@@ -101,7 +101,7 @@ def main():
         rows.append(dict(exchange='binance', market='spot', symbol='BTCUSDT',
                          tick_ns=(end_s-offset)*10**9, available_ns=(end_s-offset)*10**9+250000000,
                          engine_version='synthetic-test', book_valid=True, warmup=False,
-                         book_age_ms=10.0, mid=100.0+i, spread_bps=1.5,
+                         book_age_ms=10.0, mid=100.0+i, mid_e9=(100+i)*10**9, spread_bps=1.5,
                          bid_depth10=4.0, ask_depth10=3.0, imbalance10=1/7,
                          taker_buy_base=0.2, taker_sell_base=0.1, liq_base_1s=0.0))
     rows += [{**rows[-1], 'market': 'perp', 'funding_rate': 0.0001, 'open_interest': 50.0},
@@ -133,12 +133,12 @@ def main():
         assert fixture_counts[('BTC', 'Perp / spot basis (bps)')] >= 1
 
         # Query-only prediction fixture: never writes synthetic predictions.
-        target = {**dashboard['dashboard']['panels'][-1]['targets'][0]}
+        target = {**next(p for p in dashboard['dashboard']['panels'] if p['title'] == 'Live predicted vs realized return (%)')['targets'][0]}
         prediction_tick = rows[1]['tick_ns']
-        replacement = ("FROM (SELECT 'binance.spot.BTC' AS target, toUInt16(900) AS horizon_s, "
+        replacement = ("FROM (SELECT 'BTC_spot' AS target, toUInt16(900) AS horizon_s, "
                        f"toInt64({prediction_tick}) AS tick_ns, "
                        "fromUnixTimestamp64Nano(tick_ns) AS ts, 'synthetic-model' AS model_version, "
-                       "toFloat64(2.0) AS pred_return_pct) AS p")
+                       "toFloat64(2.0) AS pred_return_pct, toInt8(1) AS direction) AS p")
         target['rawSql'] = target['rawSql'].replace('FROM crypto.predictions AS p FINAL', replacement)
         target['rawSql'] = target['rawSql'].replace('${asset:sqlstring}', "'BTC'")
         response = query_grafana(target, start_ms, end_ms)
@@ -149,6 +149,15 @@ def main():
         assert any(abs(v-expected_return) < 1e-8 for v in values), values
         assert any(abs(v-2.0) < 1e-8 for v in values), values
         print(f'Prediction join query fixture: predicted=2%; realized={expected_return:.9f}%.', flush=True)
+        target = {**next(p for p in dashboard['dashboard']['panels'] if p['title'] == 'Live directional hit rate (%)')['targets'][0]}
+        target['rawSql'] = target['rawSql'].replace('FROM crypto.predictions AS p FINAL', replacement)
+        target['rawSql'] = target['rawSql'].replace('${asset:sqlstring}', "'BTC'")
+        response = query_grafana(target, start_ms, end_ms)
+        values = [v for r in response['results'].values() for frame in r.get('frames', [])
+                  for field, column in zip(frame['schema']['fields'], frame['data']['values'])
+                  if field['type'] == 'number' for v in column if v is not None]
+        assert any(abs(v-100.0) < 1e-8 for v in values), values
+        print('Directional hit rate query fixture: 100%.', flush=True)
     finally:
         sql("ALTER TABLE crypto.features DELETE WHERE engine_version='synthetic-test' SETTINGS mutations_sync=2")
         remaining = int(sql("SELECT count() FROM crypto.features FINAL WHERE engine_version='synthetic-test'"))
