@@ -1,0 +1,11 @@
+[package]
+name = "engine-live"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.99"
+
+[dependencies]
+engine_core = { path = "../core" }
+engine-replay = { path = "../replay" }
+serde_json = { version = "1", features = ["arbitrary_precision"] }
+rdkafka = { version = "0.38", features = ["cmake-build", "zstd"] }

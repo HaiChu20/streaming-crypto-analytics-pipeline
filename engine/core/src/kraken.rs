@@ -2,6 +2,7 @@ use crate::{
     Book, Error, Fixed, Result, Side,
     fixed::{decimal, kraken_fmt},
 };
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{BTreeMap, HashMap};
 
@@ -19,14 +20,14 @@ pub(crate) fn l2_checksum(book: &Book) -> u32 {
     crc32fast::hash(text.as_bytes())
 }
 
-#[derive(Debug, Default)]
+#[derive(Serialize, Deserialize, Debug, Default)]
 struct Queue {
     price_text: String,
     orders: Vec<(String, String)>,
 }
 
 /// Individual orders in insertion/queue order, truncated by price-level depth.
-#[derive(Debug)]
+#[derive(Serialize, Deserialize, Debug)]
 pub struct L3Book {
     depth: usize,
     sides: [BTreeMap<i64, Queue>; 2],

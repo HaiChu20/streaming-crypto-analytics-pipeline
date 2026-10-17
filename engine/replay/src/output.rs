@@ -21,13 +21,16 @@ pub struct Writer {
 }
 impl Writer {
     pub fn new(target: &Path) -> Result<Self> {
+        Self::new_mode(target, "ideal")
+    }
+    pub fn new_mode(target: &Path, mode: &str) -> Result<Self> {
         fs::create_dir_all(target.parent().unwrap())?;
         let temp = target.with_extension(format!("parquet.{}.tmp", std::process::id()));
         let file = File::options().write(true).create_new(true).open(&temp)?;
         let props = WriterProperties::builder()
             .set_compression(Compression::ZSTD(Default::default()))
             .set_key_value_metadata(Some(vec![
-                KeyValue::new("mode".into(), "ideal".to_string()),
+                KeyValue::new("mode".into(), mode.to_string()),
                 KeyValue::new("warmup_s".into(), "300".to_string()),
                 KeyValue::new("engine_version".into(), ENGINE_VERSION.to_string()),
             ]))

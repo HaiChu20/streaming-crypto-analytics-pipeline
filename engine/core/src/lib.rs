@@ -7,13 +7,14 @@ mod fixed;
 pub mod kraken;
 mod okx;
 pub mod row;
+pub mod session;
 
 pub const SECOND: i64 = 1_000_000_000;
-pub const ENGINE_VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), "-ideal-v1");
+pub const ENGINE_VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), "-features-v2");
 
 pub use book::{Book, Side};
 pub use fixed::{Fixed, Mid};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -35,7 +36,7 @@ impl From<serde_json::Error> for Error {
     }
 }
 
-#[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum Kind {
     Snapshot,
@@ -45,7 +46,7 @@ pub enum Kind {
 }
 
 /// Archived recorder line, or an envelope without Kafka coordinates.
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct Record {
     pub exchange: String,
     pub market: String,
@@ -71,7 +72,7 @@ impl Record {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub enum BreakReason {
     MissingSnapshot,
     SequenceGap { expected: i64, received: i64 },
@@ -93,7 +94,7 @@ impl Outcome {
         Self::Break(BreakReason::SequenceGap { expected, received })
     }
 }
-#[derive(Debug, Default, Clone, Copy)]
+#[derive(Serialize, Deserialize, Debug, Default, Clone, Copy)]
 pub struct Counters {
     pub updates_applied: u64,
     pub breaks: u64,
@@ -101,7 +102,7 @@ pub struct Counters {
     pub okx_checksum_absent: u64,
 }
 
-#[derive(Debug, Default)]
+#[derive(Serialize, Deserialize, Debug, Default)]
 struct Connection {
     book: Book,
     sync: binance::Sync,
@@ -215,7 +216,7 @@ impl Connection {
 }
 
 /// One (exchange, market, feed, symbol) stream, including overlapping connections.
-#[derive(Debug)]
+#[derive(Serialize, Deserialize, Debug)]
 pub struct StreamBook {
     exchange: String,
     market: String,
@@ -284,6 +285,15 @@ impl StreamBook {
     fn retire(&mut self, id: &str) {
         self.connections.remove(id);
         self.retired.insert(id.to_owned());
+    }
+    pub fn invalidate_malformed(&mut self, id: &str) -> bool {
+        if self.retired.contains(id) {
+            return false;
+        }
+        self.retire(id);
+        self.counters.breaks += 1;
+        self.last_break = Some(BreakReason::Malformed("invalid exchange frame".into()));
+        true
     }
     pub fn counters(&self) -> Counters {
         self.counters

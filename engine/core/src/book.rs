@@ -1,21 +1,22 @@
 use crate::{Fixed, Mid, Result, fixed::decimal};
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::BTreeMap;
 
-#[derive(Debug, Clone)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 pub(crate) struct Level {
     pub size: i64,
     pub price_text: String,
     pub size_text: String,
 }
 
-#[derive(Debug, Default, Clone)]
+#[derive(Serialize, Deserialize, Debug, Default, Clone)]
 pub struct Book {
     pub(crate) bids: BTreeMap<i64, Level>,
     pub(crate) asks: BTreeMap<i64, Level>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Side {
     Bid,
     Ask,

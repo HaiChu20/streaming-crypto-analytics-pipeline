@@ -6,6 +6,7 @@ One partition per asset (BTC -> 0, ETH -> 1), replication 1, 72h retention plus 
 Never delete and recreate a topic: archived offsets refer to it (plan.md §6).
 """
 
+import argparse
 import sys
 from pathlib import Path
 
@@ -17,10 +18,15 @@ from collectors.common.config import all_streams, kafka_bootstrap, load_config  
 
 
 def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--engine-only", action="store_true", help="create/check only feature, cutoff and prediction output topics")
+    args = parser.parse_args()
     cfg = load_config()
     kcfg = cfg["kafka"]
     partitions = len(cfg["partitions"])
     topics = sorted({s.topic for s in all_streams(cfg)})
+    desired = {} if args.engine_only else {t: partitions for t in topics}
+    desired.update({"features.1s.v1": 1, "engine.cutoffs.v1": 1, "predictions.v1": 1})
     admin = AdminClient({"bootstrap.servers": kafka_bootstrap()})
     existing = admin.list_topics(timeout=10).topics
 
@@ -30,16 +36,16 @@ def main() -> None:
         "cleanup.policy": "delete",
         "max.message.bytes": "8388608",
     }
-    new = [NewTopic(t, num_partitions=partitions, replication_factor=1, config=settings) for t in topics if t not in existing]
+    new = [NewTopic(t, num_partitions=count, replication_factor=1, config=settings) for t, count in desired.items() if t not in existing]
     for topic, future in admin.create_topics(new).items() if new else []:
         future.result()
         print(f"created  {topic}")
-    for topic in topics:
+    for topic, expected in desired.items():
         if topic in existing:
             count = len(existing[topic].partitions)
-            status = "ok" if count == partitions else f"WRONG partition count {count} (expected {partitions})"
+            status = "ok" if count == expected else f"WRONG partition count {count} (expected {expected})"
             print(f"exists   {topic}: {status}")
-    print(f"{len(topics)} raw topics, {partitions} partitions each")
+    print(f"{len(desired)} topics checked (derived outputs: 1 partition each)")
 
 
 if __name__ == "__main__":

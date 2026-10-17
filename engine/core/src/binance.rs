@@ -1,7 +1,8 @@
 use crate::{Book, Outcome, Result, integer};
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-#[derive(Debug, Default)]
+#[derive(Serialize, Deserialize, Debug, Default)]
 pub(crate) struct Sync {
     pending: Vec<Value>,
     last: Option<i64>,

@@ -156,6 +156,92 @@ impl Merge {
 
 pub use engine_core::features::asset;
 
+/// Recover a bad archived envelope without losing its Kafka offset. The recorder
+/// always appends the coordinates at the end, even if the source bytes were bad.
+/// Missing recv_ns is eligible immediately, so this offset cannot block its queue.
+pub fn recover_archived(line: &str, coordinates: Option<(&str, i32, i64)>) -> Result<Record> {
+    if let Ok(record) = Record::parse(line) {
+        return Ok(record);
+    }
+    let outer: serde_json::Value = serde_json::from_str(line).unwrap_or_default();
+    let (topic, partition, offset) = if let Some((topic, partition, offset)) = coordinates {
+        (topic.to_owned(), partition, offset)
+    } else {
+        let start = line
+            .rfind(",\"topic\":")
+            .ok_or_else(|| error("malformed archive lacks Kafka coordinates"))?;
+        let tail: serde_json::Value = serde_json::from_str(&format!("{{{}", &line[start + 1..]))?;
+        (
+            tail["topic"]
+                .as_str()
+                .ok_or_else(|| error("bad archived topic"))?
+                .to_owned(),
+            tail["partition"]
+                .as_i64()
+                .ok_or_else(|| error("bad archived partition"))? as i32,
+            tail["offset"]
+                .as_i64()
+                .ok_or_else(|| error("bad archived offset"))?,
+        )
+    };
+    let parts = topic.split('.').collect::<Vec<_>>();
+    if parts.len() != 5 || parts[0] != "raw" {
+        return Err(error(
+            "malformed archive topic is not raw.<exchange>.<market>.<feed>.v1",
+        ));
+    }
+    let (exchange, market, feed) = (parts[1], parts[2], parts[3]);
+    let asset = match partition {
+        0 => "BTC",
+        1 => "ETH",
+        _ => return Err(error("unknown asset partition")),
+    };
+    let symbol = match (exchange, market, asset) {
+        ("binance", _, "BTC") => "BTCUSDT",
+        ("binance", _, _) => "ETHUSDT",
+        ("okx", "spot", "BTC") => "BTC-USDT",
+        ("okx", "spot", _) => "ETH-USDT",
+        ("okx", "perp", "BTC") => "BTC-USDT-SWAP",
+        ("okx", "perp", _) => "ETH-USDT-SWAP",
+        ("kraken", "spot", "BTC") => "BTC/USD",
+        ("kraken", "spot", _) => "ETH/USD",
+        ("kraken", "perp", "BTC") => "PF_XBTUSD",
+        ("kraken", "perp", _) => "PF_ETHUSD",
+        _ => return Err(error("unknown raw stream in malformed archive")),
+    };
+    Ok(Record {
+        exchange: exchange.into(),
+        market: market.into(),
+        feed: feed.into(),
+        symbol: symbol.into(),
+        kind: engine_core::Kind::Control,
+        event: Some("drop".into()),
+        reason: Some("malformed_envelope".into()),
+        conn: outer["conn"].as_str().unwrap_or("__unknown__").into(),
+        seq: outer["seq"].as_u64().unwrap_or(0),
+        recv_ns: outer["recv_ns"]
+            .as_i64()
+            .map(i128::from)
+            .or_else(|| outer["recv_ns"].as_u64().map(i128::from))
+            .or_else(|| {
+                line.split_once("\"recv_ns\":").and_then(|(_, tail)| {
+                    let digits = tail
+                        .trim_start()
+                        .chars()
+                        .take_while(|c| c.is_ascii_digit() || *c == '-')
+                        .collect::<String>();
+                    digits.parse::<i128>().ok()
+                })
+            })
+            .unwrap_or(i128::MIN),
+        payload: String::new(),
+        detail: None,
+        topic: Some(topic),
+        partition: Some(partition),
+        offset: Some(offset),
+    })
+}
+
 pub fn discover(root: &Path, date: &str, allow_open: bool) -> Result<Vec<PathBuf>> {
     let base = root.join("raw").join(format!("date={date}"));
     let mut files = Vec::new();

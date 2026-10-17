@@ -1,5 +1,6 @@
 use crate::{ENGINE_VERSION, Result, SECOND, row::Row};
 use crate::{Fixed, Kind, Outcome, Record, Side, StreamBook};
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
 
@@ -42,7 +43,7 @@ fn scale(q: i128, factor: i64) -> f64 {
     q as f64 / UNIT as f64 * factor as f64 / UNIT as f64
 }
 
-#[derive(Default)]
+#[derive(Default, Serialize, Deserialize)]
 struct Gate {
     active: Option<String>,
     retired: BTreeSet<String>,
@@ -102,17 +103,19 @@ impl Gate {
         }
     }
 }
-#[derive(Default)]
+#[derive(Default, Serialize, Deserialize)]
 struct Bucket {
     count: i64,
     volume: i128,
     buy: i128,
     sell: i128,
+    unscaled_trades: bool,
+    malformed_trades: bool,
     liq_count: i64,
     liq: i128,
     l3: [i64; 3],
 }
-#[derive(Default)]
+#[derive(Default, Serialize, Deserialize)]
 struct Instrument {
     l2: Option<StreamBook>,
     l3: Option<StreamBook>,
@@ -120,12 +123,14 @@ struct Instrument {
     seen: BTreeSet<String>,
     ids: HashSet<String>,
     fifo: VecDeque<String>,
+    #[serde(default)]
+    uncertain_trades: bool,
     buckets: BTreeMap<i64, Bucket>,
     history: VecDeque<Option<i64>>,
     returns: VecDeque<Option<f64>>,
     first_mid: Option<i64>,
-    last_recv: BTreeMap<&'static str, i128>,
-    extras_source: Option<&'static str>,
+    last_recv: BTreeMap<String, i128>,
+    extras_source: Option<String>,
     funding: Option<f64>,
     mark: Option<f64>,
     oi: Option<f64>,
@@ -167,7 +172,7 @@ impl Instrument {
                 _ => None,
             };
             if let Some(feed) = feed {
-                self.last_recv.insert(feed, r.recv_ns);
+                self.last_recv.insert(feed.into(), r.recv_ns);
             }
         }
         if r.kind == Kind::Control {
@@ -281,11 +286,13 @@ impl Instrument {
                     if !self.remember(id) || r.kind == Kind::Snapshot {
                         continue;
                     }
-                    let factor =
-                        factor.ok_or_else(|| error("OKX swap trade missing start ctVal"))?;
-                    let volume = i128::from(qty) * i128::from(factor);
                     let bucket = self.buckets.entry(window_tick(r.recv_ns)?).or_default();
                     bucket.count += 1;
+                    let Some(factor) = factor else {
+                        bucket.unscaled_trades = true;
+                        continue;
+                    };
+                    let volume = i128::from(qty) * i128::from(factor);
                     bucket.volume = bucket
                         .volume
                         .checked_add(volume)
@@ -304,13 +311,13 @@ impl Instrument {
                 }
             }
             "mark" => {
-                self.extras_source = Some("mark");
+                self.extras_source = Some("mark".into());
                 let data = &payload["data"];
                 self.funding = number(&data["r"]);
                 self.mark = number(&data["p"]);
             }
             "ticker" => {
-                self.extras_source = Some("ticker");
+                self.extras_source = Some("ticker".into());
                 self.funding = number(&payload["funding_rate"]);
                 self.mark = number(&payload["markPrice"]);
                 self.oi = number(&payload["openInterest"]);
@@ -360,13 +367,14 @@ impl Instrument {
             };
             if let Some(factor) = factor
                 && bid < ask
+                && let Some(mid_e9) = book.mid().and_then(|mid| i64::try_from(mid.0).ok())
             {
                 row.book_valid = true;
                 row.best_bid = Some(bid.0 as f64 / UNIT as f64);
                 row.best_ask = Some(ask.0 as f64 / UNIT as f64);
                 let mid = book.mid().unwrap();
                 row.mid = Some(mid.0 as f64 / 1_000_000_000.0);
-                row.mid_e9 = Some(i64::try_from(mid.0).map_err(|_| error("mid_e9 overflows i64"))?);
+                row.mid_e9 = Some(mid_e9);
                 let total = i128::from(bq.0) + i128::from(aq.0);
                 if total > 0 {
                     row.microprice = Some(
@@ -443,10 +451,24 @@ impl Instrument {
         let bucket = self.buckets.remove(&tick).unwrap_or_default();
         self.buckets.retain(|t, _| *t > tick);
         if self.seen.contains("trades") {
-            row.trade_count = Some(bucket.count);
-            row.volume_base = Some(bucket.volume as f64 / 10_000_000_000_000_000.0);
-            row.taker_buy_base = Some(bucket.buy as f64 / 10_000_000_000_000_000.0);
-            row.taker_sell_base = Some(bucket.sell as f64 / 10_000_000_000_000_000.0);
+            if !bucket.malformed_trades && !self.uncertain_trades {
+                row.trade_count = Some(bucket.count);
+            }
+            let calibrated = !self.uncertain_trades
+                && !bucket.malformed_trades
+                && !bucket.unscaled_trades
+                && (key.0 != "okx"
+                    || key.1 != "perp"
+                    || self
+                        .gates
+                        .get("trades")
+                        .and_then(|gate| gate.active.as_ref().and_then(|id| gate.factors.get(id)))
+                        .is_some());
+            if calibrated {
+                row.volume_base = Some(bucket.volume as f64 / 10_000_000_000_000_000.0);
+                row.taker_buy_base = Some(bucket.buy as f64 / 10_000_000_000_000_000.0);
+                row.taker_sell_base = Some(bucket.sell as f64 / 10_000_000_000_000_000.0);
+            }
         }
         if self.seen.contains("liquidations") {
             row.liq_count_1s = Some(bucket.liq_count);
@@ -459,6 +481,7 @@ impl Instrument {
         }
         if fresh(
             self.extras_source
+                .as_deref()
                 .and_then(|source| self.last_recv.get(source))
                 .copied(),
             tick,
@@ -484,20 +507,110 @@ fn window_tick(ns: i128) -> Result<i64> {
     Ok(ns.div_euclid(SECOND) * SECOND + if ns.rem_euclid(SECOND) > 0 { SECOND } else { 0 })
 }
 
-#[derive(Default)]
+#[derive(Default, Serialize, Deserialize)]
 pub struct Engine {
+    #[serde(with = "instrument_entries")]
     instruments: BTreeMap<Key, Instrument>,
     pub records: u64,
     pub book_breaks: u64,
     pub book_break_reasons: BTreeMap<String, u64>,
+    pub data_anomalies: BTreeMap<String, u64>,
 }
 impl Engine {
+    /// Active L2 source and validity for reporting overlap handovers.
+    pub fn book_sources(&self) -> BTreeMap<(String, String, String), (String, bool)> {
+        self.instruments
+            .iter()
+            .filter_map(|(key, state)| {
+                let book = state.l2.as_ref()?;
+                Some((
+                    key.clone(),
+                    (book.active_connection()?.to_owned(), book.valid()),
+                ))
+            })
+            .collect()
+    }
     pub fn consume(&mut self, r: &Record) -> Result<()> {
         let key = (r.exchange.clone(), r.market.clone(), r.symbol.clone());
+        if r.kind == Kind::Control
+            && r.event.as_deref() == Some("drop")
+            && r.reason.as_deref() == Some("malformed_envelope")
+        {
+            let state = self.instruments.entry(key).or_default();
+            state.seen.insert(r.feed.clone());
+            if matches!(r.feed.as_str(), "l2" | "l3") {
+                let book = if r.feed == "l2" {
+                    &mut state.l2
+                } else {
+                    &mut state.l3
+                };
+                if let Some(book) = book {
+                    let conn = if r.conn == "__unknown__" {
+                        book.active_connection().unwrap_or(&r.conn).to_owned()
+                    } else {
+                        r.conn.clone()
+                    };
+                    if book.invalidate_malformed(&conn) {
+                        self.book_breaks += 1;
+                        *self
+                            .book_break_reasons
+                            .entry("malformed".into())
+                            .or_default() += 1;
+                    }
+                    state.gates.entry(r.feed.clone()).or_default().end(&conn);
+                }
+            } else if r.feed == "trades" {
+                if let Ok(tick) = window_tick(r.recv_ns) {
+                    state.buckets.entry(tick).or_default().malformed_trades = true;
+                } else {
+                    state.uncertain_trades = true;
+                }
+            } else if matches!(r.feed.as_str(), "mark" | "ticker") {
+                state.mark = None;
+                state.funding = None;
+                state.oi = None;
+            }
+            *self
+                .data_anomalies
+                .entry(format!(
+                    "{}/{}/{}/{}: malformed_envelope",
+                    r.exchange, r.market, r.symbol, r.feed
+                ))
+                .or_default() += 1;
+            self.records += 1;
+            return Ok(());
+        }
         let state = self.instruments.entry(key).or_default();
         let before = state.l2.as_ref().map_or(0, |b| b.counters().breaks)
             + state.l3.as_ref().map_or(0, |b| b.counters().breaks);
-        state.consume(r)?;
+        if let Err(error) = state.consume(r) {
+            let stream = if r.feed == "l2" {
+                &mut state.l2
+            } else {
+                &mut state.l3
+            };
+            if matches!(r.feed.as_str(), "l2" | "l3") {
+                if let Some(stream) = stream {
+                    stream.invalidate_malformed(&r.conn);
+                }
+                state.gates.entry(r.feed.clone()).or_default().end(&r.conn);
+            } else if r.feed == "trades" {
+                if let Ok(tick) = window_tick(r.recv_ns) {
+                    state.buckets.entry(tick).or_default().malformed_trades = true;
+                }
+            } else if r.feed == "mark" || r.feed == "ticker" {
+                state.mark = None;
+                state.funding = None;
+                state.oi = None;
+            }
+            *self
+                .data_anomalies
+                .entry(format!(
+                    "{}/{}/{}/{}: {}",
+                    r.exchange, r.market, r.symbol, r.feed, error
+                ))
+                .or_default() += 1;
+        }
         let after = state.l2.as_ref().map_or(0, |b| b.counters().breaks)
             + state.l3.as_ref().map_or(0, |b| b.counters().breaks);
         self.book_breaks += after - before;
@@ -518,6 +631,28 @@ impl Engine {
         Ok(())
     }
     pub fn tick(&mut self, tick: i64) -> Result<Vec<Row>> {
+        for (key, state) in &mut self.instruments {
+            if let Some(book) = &mut state.l2
+                && book.valid()
+                && book
+                    .book()
+                    .and_then(crate::Book::mid)
+                    .is_some_and(|mid| i64::try_from(mid.0).is_err())
+            {
+                let conn = book.active_connection().unwrap().to_owned();
+                if book.invalidate_malformed(&conn) {
+                    self.book_breaks += 1;
+                    *self
+                        .book_break_reasons
+                        .entry("malformed".into())
+                        .or_default() += 1;
+                    *self
+                        .data_anomalies
+                        .entry(format!("{}/{}/{}: mid_e9 overflow", key.0, key.1, key.2))
+                        .or_default() += 1;
+                }
+            }
+        }
         let mut rows = self
             .instruments
             .iter_mut()
@@ -590,5 +725,23 @@ mod tests {
         assert_eq!(state.fifo.len(), 50_000);
         assert!(!state.remember("50000".into()));
         assert!(state.remember("0".into()));
+    }
+}
+
+// JSON object keys cannot be tuples. Store the sorted instrument map as entries.
+mod instrument_entries {
+    use super::*;
+    pub fn serialize<S: serde::Serializer>(
+        map: &BTreeMap<Key, Instrument>,
+        s: S,
+    ) -> std::result::Result<S::Ok, S::Error> {
+        map.iter().collect::<Vec<_>>().serialize(s)
+    }
+    pub fn deserialize<'de, D: serde::Deserializer<'de>>(
+        d: D,
+    ) -> std::result::Result<BTreeMap<Key, Instrument>, D::Error> {
+        Ok(Vec::<(Key, Instrument)>::deserialize(d)?
+            .into_iter()
+            .collect())
     }
 }

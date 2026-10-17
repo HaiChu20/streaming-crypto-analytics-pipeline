@@ -16,6 +16,9 @@ fn run() -> Result<()> {
     let mut date = None;
     let mut out = None;
     let mut allow_open = false;
+    let mut mode = "ideal".to_string();
+    let mut from_state = None;
+    let mut json_out = None;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -34,6 +37,23 @@ fn run() -> Result<()> {
                 ))
             }
             "--allow-open" => allow_open = true,
+            "--mode" => {
+                mode = args
+                    .next()
+                    .ok_or_else(|| error("--mode requires ideal or as_live"))?
+            }
+            "--from-state" => {
+                from_state = Some(PathBuf::from(
+                    args.next()
+                        .ok_or_else(|| error("--from-state requires path"))?,
+                ))
+            }
+            "--json-out" => {
+                json_out = Some(PathBuf::from(
+                    args.next()
+                        .ok_or_else(|| error("--json-out requires path"))?,
+                ))
+            }
             "--help" => {
                 println!(
                     "engine-replay --root data --date YYYY-MM-DD [--out data/features] [--allow-open]"
@@ -49,6 +69,43 @@ fn run() -> Result<()> {
         .unwrap_or_else(|| root.join("features"))
         .join(format!("date={date}"))
         .join("features.parquet");
+    if mode == "as_live" {
+        use std::io::Write;
+        let wall = std::time::Instant::now();
+        let mut replay =
+            engine_replay::as_live::Replay::open(&root, &date, from_state.as_deref(), allow_open)?;
+        let initial_records = replay.state.engine.records;
+        let mut writer = Writer::new_mode(&out, "as_live")?;
+        let mut json = json_out
+            .map(std::fs::File::create)
+            .transpose()?
+            .map(std::io::BufWriter::new);
+        let cutoffs = std::mem::take(&mut replay.cutoffs);
+        let ticks = cutoffs.len();
+        for cutoff in cutoffs {
+            for row in replay.tick(cutoff)? {
+                if let Some(json) = json.as_mut() {
+                    serde_json::to_writer(&mut *json, &row)?;
+                    writeln!(json)?;
+                }
+                writer.push(row)?;
+            }
+        }
+        if let Some(json) = json.as_mut() {
+            json.flush()?;
+        }
+        let rows = writer.finish()?;
+        println!(
+            "{}",
+            serde_json::json!({"mode":"as_live","output":out,"ticks":ticks,"rows":rows,"records":replay.state.engine.records-initial_records,"wall_s":wall.elapsed().as_secs_f64(),"book_breaks":replay.state.engine.book_breaks,"book_break_reasons":replay.state.engine.book_break_reasons,"data_anomalies":replay.state.engine.data_anomalies,"late_records":replay.late_records,"book_switches":replay.book_switches})
+        );
+        return Ok(());
+    }
+    if mode != "ideal" || from_state.is_some() || json_out.is_some() {
+        return Err(error(
+            "use --mode ideal or as_live; --from-state/--json-out require as_live",
+        ));
+    }
     let mut merge = Merge::new(discover(&root, &date, allow_open)?)?;
     let mut writer = Writer::new(&out)?;
     let mut engine = Engine::default();
@@ -101,7 +158,7 @@ fn run() -> Result<()> {
     println!(
         "{}",
         serde_json::to_string_pretty(
-            &serde_json::json!({"output":out,"records":engine.records,"rows":rows,"wall_s":seconds,"records_per_s":engine.records as f64/seconds,"first_recv_ns":first_ns,"last_recv_ns":last_ns,"book_breaks":engine.book_breaks,"book_break_reasons":engine.book_break_reasons,"clock_steps":merge.clock_steps(),"foreign_before_day":foreign,"coverage":coverage,"max_abs_cross_bps":max_cross,"inputs":merge.snapshots})
+            &serde_json::json!({"output":out,"records":engine.records,"rows":rows,"wall_s":seconds,"records_per_s":engine.records as f64/seconds,"first_recv_ns":first_ns,"last_recv_ns":last_ns,"book_breaks":engine.book_breaks,"book_break_reasons":engine.book_break_reasons,"data_anomalies":engine.data_anomalies,"clock_steps":merge.clock_steps(),"foreign_before_day":foreign,"coverage":coverage,"max_abs_cross_bps":max_cross,"inputs":merge.snapshots})
         )?
     );
     Ok(())
