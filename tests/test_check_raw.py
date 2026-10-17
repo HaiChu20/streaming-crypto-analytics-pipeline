@@ -197,3 +197,27 @@ def test_pipeline_stop_timeout_reports_survivors(tmp_path, term_fails):
     assert result.returncode == 1
     assert "still alive after 60s: binance" in result.stderr
     assert (tmp_path / "data/sleeps").read_text().splitlines() == ["0.5"] * 120
+
+
+@pytest.mark.parametrize("later_gap", [False, True])
+def test_collector_crash_carrier_stays_checkable(tmp_path, monkeypatch, later_gap):
+    calls = []
+    original_feed = check_raw.BookCheck.feed
+
+    def feed(self, kind, payload):
+        calls.append(kind)
+        return original_feed(self, kind, payload)
+
+    monkeypatch.setattr(check_raw.BookCheck, "feed", feed)
+    crash = dict(control("drop", "new"), reason="collector_crash")
+    records = [crash, control("start", "new"), book("snapshot", 10, conn="new"),
+               book("update", 11, 10, "new"), book("update", 12, 11, "new")]
+    if later_gap:
+        records.append(book("update", 14, 13, "new"))
+    result = check(tmp_path, records)
+    assert calls == ["snapshot", "update", "update"] + (["update"] if later_gap else [])
+    assert len(result["errors"]) == int(later_gap)
+    if later_gap:
+        assert "seqId break" in result["errors"][0]
+    assert result["events"]["drop:collector_crash"] == 1
+    assert result["events"]["start"] == 1

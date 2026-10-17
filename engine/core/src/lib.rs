@@ -1,10 +1,15 @@
-//! Deterministic, synchronous order-book reconstruction. Call consume in stream file order.
+//! Deterministic, synchronous books and feature state. Consume records in stream file order.
 //! No I/O or clock access; replay/live routing and tick ordering belong to their callers.
 mod binance;
 mod book;
+pub mod features;
 mod fixed;
 pub mod kraken;
 mod okx;
+pub mod row;
+
+pub const SECOND: i64 = 1_000_000_000;
+pub const ENGINE_VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), "-ideal-v1");
 
 pub use book::{Book, Side};
 pub use fixed::{Fixed, Mid};
@@ -102,6 +107,7 @@ struct Connection {
     sync: binance::Sync,
     seq: Option<i64>,
     l3: Option<kraken::L3Book>,
+    l3_counts: [i64; 3],
     depth: usize,
     valid: bool,
 }
@@ -179,7 +185,7 @@ impl Connection {
                 let book = self
                     .l3
                     .get_or_insert_with(|| kraken::L3Book::new(self.depth));
-                book.apply(data, snapshot)?;
+                self.l3_counts = book.apply_counted(data, snapshot)?;
                 self.book = book.book()?;
                 book.checksum()
             } else {
@@ -260,6 +266,14 @@ impl StreamBook {
             .and_then(|id| self.connections.get(id))
             .map(|c| &c.book)
     }
+    /// Counts for the last applied L3 frame; snapshots are not order events.
+    pub fn l3_event_counts(&self) -> Option<[i64; 3]> {
+        self.active
+            .as_ref()
+            .and_then(|id| self.connections.get(id))
+            .filter(|c| c.valid && c.l3.is_some())
+            .map(|c| c.l3_counts)
+    }
     pub fn active_connection(&self) -> Option<&str> {
         self.active.as_deref()
     }
@@ -313,7 +327,18 @@ impl StreamBook {
                     return Ok(Outcome::Ignored);
                 }
                 Some("drop") => {
-                    self.retire(&record.conn);
+                    if record.reason.as_deref() == Some("collector_crash") {
+                        // The new connection reports the previous session's crash before its start.
+                        if let Some(old) = self.active.take() {
+                            if old != record.conn {
+                                self.retire(&old);
+                            } else {
+                                self.connections.remove(&old);
+                            }
+                        }
+                    } else {
+                        self.retire(&record.conn);
+                    }
                     let reason = BreakReason::Drop {
                         reason: record.reason.clone(),
                     };

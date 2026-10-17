@@ -1,0 +1,12 @@
+[package]
+name = "engine-replay"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.99"
+
+[dependencies]
+engine_core = { path = "../core" }
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["arbitrary_precision"] }
+parquet = { version = "56", default-features = false, features = ["zstd"] }
+flate2 = "1"

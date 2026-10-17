@@ -769,3 +769,44 @@ fn ended_connections_release_active_books_and_pending_deltas() {
         assert_eq!(stream.connection_count(), 0);
     }
 }
+
+#[test]
+fn collector_crash_retires_previous_source_but_keeps_carrier_eligible() {
+    for previous in [None, Some("A"), Some("B")] {
+        let mut stream = StreamBook::new(&snapshot(1)).unwrap();
+        if let Some(previous) = previous {
+            let mut r = snapshot(1);
+            r.conn = previous.into();
+            consume(&mut stream, &r);
+        }
+        let mut crash = control("drop", "B");
+        crash.reason = Some("collector_crash".into());
+        assert!(matches!(
+            consume(&mut stream, &crash),
+            Outcome::Break(BreakReason::Drop { .. })
+        ));
+        assert!(!stream.valid());
+        assert!(stream.book().is_none());
+        assert_eq!(stream.connection_count(), 0);
+        if previous == Some("A") {
+            assert_eq!(consume(&mut stream, &snapshot(1)), Outcome::Ignored);
+        }
+        consume(&mut stream, &control("start", "B"));
+        let mut r = snapshot(1);
+        r.conn = "B".into();
+        consume(&mut stream, &r);
+        assert!(stream.valid());
+        let mut delta = spot_delta(2, 2);
+        delta.conn = "B".into();
+        assert_eq!(consume(&mut stream, &delta), Outcome::Applied);
+        let mut gap = spot_delta(4, 5);
+        gap.conn = "B".into();
+        assert!(matches!(
+            consume(&mut stream, &gap),
+            Outcome::Break(BreakReason::SequenceGap { .. })
+        ));
+        assert!(!stream.valid());
+        assert_eq!(stream.counters().breaks, 2);
+        assert_eq!(stream.connection_count(), 0);
+    }
+}

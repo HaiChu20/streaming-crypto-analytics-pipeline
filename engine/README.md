@@ -3,7 +3,8 @@
 `engine_core` is synchronous and performs no I/O. Construct one `StreamBook` per
 (exchange, market, feed, symbol), parse archived lines with `Record::parse`, and
 call `consume` in file order. Kafka coordinates are optional for probe envelopes.
-Tick ordering, features, replay file readers, and live ingestion are later phases.
+Pure feature state is shared in `engine_core::features`. The [ideal replay CLI](replay/README.md)
+handles file ordering, ticks and Parquet; live ingestion is a later phase.
 
 `Fixed` uses signed i64 units of 10^-8; parsing rejects excess precision and
 overflow. `Book::mid` returns `Mid` in i128 units of 10^-9 so half an atom is exact.
@@ -15,8 +16,11 @@ L3 queues preserve insertion order, including when an order is modified.
 books can retain levels for diagnostics; ended connections release their books
 and buffered deltas. `connection_count()` reports retained live/pending states.
 `Outcome`, `last_break()`, and `counters()` expose continuity, checksum results,
-applied updates, and breaks. A drop or detected break retires the connection ID
-permanently; recovery uses a new connection start plus a snapshot. Stale Binance
+applied updates, and breaks. Normal drops or detected breaks retire the connection
+ID permanently; recovery uses a new connection start plus a snapshot.
+`drop(reason=collector_crash)` is carried by the restarted collector's new
+connection: it retires the previous active source, preserving the carrying ID for
+its following start and snapshot. Stale Binance
 REST snapshots wait for a retry without a break. A replacement connection's first
 snapshot retires the old source, including its later control and snapshot records.
 

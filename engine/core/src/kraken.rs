@@ -42,6 +42,11 @@ impl L3Book {
         }
     }
     pub fn apply(&mut self, data: &Value, snapshot: bool) -> Result<()> {
+        self.apply_counted(data, snapshot).map(|_| ())
+    }
+    /// Counts add/modify/delete at each event's top-ten rank, before deletes and after adds.
+    pub(crate) fn apply_counted(&mut self, data: &Value, snapshot: bool) -> Result<[i64; 3]> {
+        let mut counts = [0; 3];
         if snapshot {
             self.sides = Default::default();
             self.where_.clear();
@@ -59,6 +64,8 @@ impl L3Book {
                 } else {
                     order["event"].as_str().unwrap_or("")
                 };
+                let before = self.where_.get(oid).copied();
+                let was_top = before.is_some_and(|(s, p)| self.top10(s, p));
                 if event == "delete" {
                     let fallback = if order["limit_price"].is_null() {
                         0
@@ -97,6 +104,18 @@ impl L3Book {
                     }
                     self.where_.insert(oid.to_owned(), (side, price));
                 }
+                if !snapshot {
+                    let is_top = self
+                        .where_
+                        .get(oid)
+                        .is_some_and(|(s, p)| self.top10(*s, *p));
+                    match event {
+                        "add" if is_top => counts[0] += 1,
+                        "modify" if was_top || is_top => counts[1] += 1,
+                        "delete" if was_top => counts[2] += 1,
+                        _ => {}
+                    }
+                }
             }
         }
         for side in 0..2 {
@@ -112,7 +131,14 @@ impl L3Book {
                 }
             }
         }
-        Ok(())
+        Ok(counts)
+    }
+    fn top10(&self, side: usize, price: i64) -> bool {
+        if side == 0 {
+            self.sides[side].keys().rev().take(10).any(|p| *p == price)
+        } else {
+            self.sides[side].keys().take(10).any(|p| *p == price)
+        }
     }
     pub fn checksum(&self) -> u32 {
         let mut text = String::new();

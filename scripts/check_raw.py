@@ -128,7 +128,8 @@ def check_stream(stream: Stream, paths: list[Path], depth: int | None, deep: boo
                 if rec["kind"] == "control":
                     ev = rec["event"]
                     r["events"][f"{ev}:{rec.get('reason')}" if ev == "drop" else ev] += 1
-                    if ev in ("drop", "stop"):
+                    # Startup crash drops describe the previous session, not their new carrier.
+                    if ev in ("drop", "stop") and not (ev == "drop" and rec.get("reason") == "collector_crash"):
                         broken.add(conn)
                         started.discard(conn)
                         books.pop(conn, None)
