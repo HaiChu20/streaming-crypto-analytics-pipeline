@@ -179,9 +179,9 @@ A sequence or checksum failure is treated like a disconnect: `drop` → resync �
 
 ### 5.4 Day boundaries
 
-Day D = 00:00:00 to 23:59:59.999 UTC, by `recv_ns`. Each day stands alone: no day-D record is ever stored in another day's files.
+Day D = 00:00:00 to 23:59:59.999 UTC, by `recv_ns`. Each day stands alone: no day-D record is stored in another day's files (one counted exception: a clock step-back, rule 1).
 
-1. **File assignment (recorder):** a record goes to the file for the UTC date of its `recv_ns`.
+1. **File assignment (recorder):** a record goes to the file for the UTC date of its `recv_ns`. If the Mac clock steps back across midnight, such records stay in the current file and are counted as `foreign_day_records` in its `.meta.json`; the engine routes them by `recv_ns`.
 2. **Day close (recorder):** a stream's day-D file closes when that stream delivers its **first day-D+1 record**.
    - Each stream is in receive order (§5.1), so no day-D record can come after that.
    - Rule 3 gives every stream a day-D+1 record (the new connection's `start`) within seconds of midnight.

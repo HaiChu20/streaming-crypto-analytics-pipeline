@@ -16,6 +16,7 @@ import signal
 import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
+from functools import lru_cache
 from pathlib import Path
 
 import orjson
@@ -31,7 +32,12 @@ SYNC_INTERVAL_S = 2.0
 
 
 def utc_date(recv_ns: int) -> str:
-    return datetime.fromtimestamp(recv_ns / 1e9, tz=timezone.utc).strftime("%Y-%m-%d")
+    return _day_date(recv_ns // 86_400_000_000_000)
+
+
+@lru_cache(maxsize=32)
+def _day_date(day: int) -> str:
+    return datetime.fromtimestamp(day * 86400, tz=timezone.utc).strftime("%Y-%m-%d")
 
 
 def _file_date(path: Path) -> str:
@@ -91,19 +97,31 @@ def write_meta(path: Path) -> None:
     """Write <file>.meta.json for a closed day file: count, offsets, time range, sha256."""
     sha, lines, size = hashlib.sha256(), 0, 0
     first = None
+    last_offset = None
+    offset_gaps = []
+    foreign_day_records = 0
+    date = _file_date(path)
     with open(path, "rb") as f:
-        while block := f.read(1 << 20):
+        for line in f:
+            sha.update(line)
+            lines += 1
+            size += len(line)
+            offset = int(line[line.rfind(b',"offset":') + 10 : -2])
+            i = line.index(b'"recv_ns":') + 10
+            recv_ns = int(line[i : line.index(b",", i)])
             if first is None:
-                first = block.split(b"\n", 1)[0]
-            sha.update(block)
-            lines += block.count(b"\n")
-            size += len(block)
-    meta = {"file": path.name, "lines": lines, "bytes": size, "sha256": sha.hexdigest()}
-    last = last_line(path)
-    if first and last:
-        a, b = orjson.loads(first), orjson.loads(last)
+                first = (offset, recv_ns)
+            elif offset != last_offset + 1:
+                offset_gaps.append([last_offset + 1, offset])
+            last_offset, last_recv_ns = offset, recv_ns
+            foreign_day_records += utc_date(recv_ns) != date
+    meta = {
+        "file": path.name, "lines": lines, "bytes": size, "sha256": sha.hexdigest(),
+        "offset_gaps": offset_gaps, "foreign_day_records": foreign_day_records,
+    }
+    if first is not None:
         meta.update(
-            first_offset=a["offset"], last_offset=b["offset"], first_recv_ns=a["recv_ns"], last_recv_ns=b["recv_ns"]
+            first_offset=first[0], last_offset=last_offset, first_recv_ns=first[1], last_recv_ns=last_recv_ns
         )
     tmp = path.with_name(path.name + ".meta.tmp")
     tmp.write_bytes(orjson.dumps(meta, option=orjson.OPT_INDENT_2))
@@ -119,12 +137,14 @@ class StreamWriter:
         self.fh = None
         self.dirty = False
         self.last_offset: int | None = None
+        self.foreign_reported = False
 
     def open(self, date: str) -> None:
         final = stream_path(self.root, self.stream, date)
         final.parent.mkdir(parents=True, exist_ok=True)
         self.fh = open(final.with_name(final.name + OPEN), "ab")
         self.date = date
+        self.foreign_reported = False
 
     def close_day(self) -> None:
         self.fh.flush()
@@ -134,7 +154,13 @@ class StreamWriter:
         final = stream_path(self.root, self.stream, self.date)
         os.replace(final.with_name(final.name + OPEN), final)
         log.info("closed %s", final.relative_to(self.root))
-        self.closer.submit(write_meta, final)
+
+        def on_done(future):
+            error = future.exception()
+            if error is not None:
+                log.error("%s: metadata failed: %r", final, error)
+
+        self.closer.submit(write_meta, final).add_done_callback(on_done)
 
     def write(self, date: str, line: bytes, offset: int) -> None:
         if self.date is None:
@@ -208,9 +234,14 @@ class Recorder:
         if expected is not None and offset != expected:
             log.error("%s/%d: offset jump %d -> %d (data expired from Kafka?)", topic, partition, expected, offset)
         self.expected[key] = offset + 1
-        recv_ns = orjson.loads(value)["recv_ns"]
+        i = value.index(b'"recv_ns":') + 10
+        recv_ns = int(value[i : value.index(b",", i)])
+        date = utc_date(recv_ns)
+        if writer.date is not None and date < writer.date and not writer.foreign_reported:
+            writer.foreign_reported = True
+            log.warning("%s/%d: clock stepped back to %s; keeping record in day %s", topic, partition, date, writer.date)
         line = value[:-1] + b',"topic":"%s","partition":%d,"offset":%d}\n' % (topic.encode(), partition, offset)
-        writer.write(utc_date(recv_ns), line, offset)
+        writer.write(date, line, offset)
 
     def sync(self) -> list[TopicPartition]:
         """fsync every dirty file; return the positions that are now safely on disk."""
