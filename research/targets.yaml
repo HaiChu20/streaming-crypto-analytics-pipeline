@@ -1,0 +1,9 @@
+version: "v1"
+horizons_s: [900, 1800]
+references:
+  BTC:
+    spot: {exchange: binance, market: spot, symbol: BTCUSDT}
+    perp: {exchange: binance, market: perp, symbol: BTCUSDT}
+  ETH:
+    spot: {exchange: binance, market: spot, symbol: ETHUSDT}
+    perp: {exchange: binance, market: perp, symbol: ETHUSDT}
