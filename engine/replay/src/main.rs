@@ -1,7 +1,7 @@
 use engine_replay::{
     Result, SECOND, error,
     features::Engine,
-    input::{Merge, day_bounds, discover},
+    input::{Merge, day_bounds, discover_filtered},
     output::Writer,
 };
 use std::{collections::BTreeMap, path::PathBuf};
@@ -16,6 +16,8 @@ fn run() -> Result<()> {
     let mut date = None;
     let mut out = None;
     let mut allow_open = false;
+    let mut exchange = None;
+    let mut market = None;
     let mut mode = "ideal".to_string();
     let mut from_state = None;
     let mut json_out = None;
@@ -35,6 +37,15 @@ fn run() -> Result<()> {
                 out = Some(PathBuf::from(
                     args.next().ok_or_else(|| error("--out requires a path"))?,
                 ))
+            }
+            "--exchange" => {
+                exchange = Some(
+                    args.next()
+                        .ok_or_else(|| error("--exchange requires name"))?,
+                )
+            }
+            "--market" => {
+                market = Some(args.next().ok_or_else(|| error("--market requires name"))?)
             }
             "--allow-open" => allow_open = true,
             "--mode" => {
@@ -56,7 +67,7 @@ fn run() -> Result<()> {
             }
             "--help" => {
                 println!(
-                    "engine-replay --root data --date YYYY-MM-DD [--out data/features] [--allow-open]"
+                    "engine-replay --root data --date YYYY-MM-DD [--out data/features] [--allow-open] [--exchange NAME] [--market NAME]"
                 );
                 return Ok(());
             }
@@ -70,6 +81,9 @@ fn run() -> Result<()> {
         .join(format!("date={date}"))
         .join("features.parquet");
     if mode == "as_live" {
+        if exchange.is_some() || market.is_some() {
+            return Err(error("--exchange/--market filters require ideal mode"));
+        }
         use std::io::Write;
         let wall = std::time::Instant::now();
         let mut replay =
@@ -106,7 +120,13 @@ fn run() -> Result<()> {
             "use --mode ideal or as_live; --from-state/--json-out require as_live",
         ));
     }
-    let mut merge = Merge::new(discover(&root, &date, allow_open)?)?;
+    let mut merge = Merge::new(discover_filtered(
+        &root,
+        &date,
+        allow_open,
+        exchange.as_deref(),
+        market.as_deref(),
+    )?)?;
     let mut writer = Writer::new(&out)?;
     let mut engine = Engine::default();
     let mut coverage = BTreeMap::<String, (u64, u64)>::new();
@@ -124,7 +144,7 @@ fn run() -> Result<()> {
             }
             first_ns = Some(first_ns.map_or(r.recv_ns, |n: i128| n.min(r.recv_ns)));
             last_ns = Some(last_ns.map_or(r.recv_ns, |n: i128| n.max(r.recv_ns)));
-            engine.consume(&r)?;
+            engine.consume_at_tick(&r, tick)?;
         }
         for row in engine.tick(tick)? {
             if row.exchange != "cross" {

@@ -38,8 +38,11 @@ fn row_json(row: parquet::record::Row) -> Value {
 }
 static SERIAL: AtomicU64 = AtomicU64::new(0);
 fn scratch() -> PathBuf {
-    let p = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(format!(
-        "../target/replay-tests/{}-{}",
+    let p = PathBuf::from(
+        std::env::var_os("ENGINE_TEST_SCRATCH").unwrap_or_else(|| std::env::temp_dir().into()),
+    )
+    .join(format!(
+        "replay-tests/{}-{}",
         std::process::id(),
         SERIAL.fetch_add(1, Ordering::Relaxed)
     ));
@@ -86,22 +89,41 @@ fn row(engine: &mut Engine, tick: i64) -> Row {
         .find(|r| r.exchange != "cross")
         .unwrap()
 }
+fn raw(v: Value) -> String {
+    let mut payload: Value = serde_json::from_str(v["payload"].as_str().unwrap()).unwrap();
+    if v["kind"] == "control" {
+        payload = json!({"marker":"ws_event","event":match v["event"].as_str().unwrap() {"start" => "connected", "stop" => "disconnected", _ => "connection_error"}});
+        if let Some(detail) = v["detail"].as_object() {
+            payload.as_object_mut().unwrap().extend(detail.clone());
+        }
+    } else if v["kind"] == "snapshot" {
+        payload["type"] = json!("snapshot");
+    }
+    for (to, from) in [
+        ("recv_time_ns", "recv_ns"),
+        ("conn", "conn"),
+        ("offset", "offset"),
+    ] {
+        payload[to] = v[from].clone();
+    }
+    payload.to_string()
+}
+fn raw_path(dir: &std::path::Path, symbol: &str, feed: &str) -> PathBuf {
+    let p = dir.join(format!("raw/binance/spot/{symbol}/20261017_{feed}.jsonl"));
+    fs::create_dir_all(p.parent().unwrap()).unwrap();
+    p
+}
 #[test]
 fn merge_ties_topic_partition_offset_and_file_clock_steps() {
     let dir = scratch();
     let mut files = Vec::new();
-    for (i, topic, partition, offset, time) in [
-        (0, "b", 0, 0, 10),
-        (1, "a", 1, 0, 10),
-        (2, "a", 0, 2, 10),
-        (3, "a", 0, 1, 10),
+    for (i, symbol, feed) in [
+        (0, "ETHUSDT", "trades"),
+        (1, "BTCUSDT", "trades"),
+        (2, "BTCUSDT", "l1"),
     ] {
-        let mut v = trade(time, i, false);
-        v["topic"] = json!(topic);
-        v["partition"] = json!(partition);
-        v["offset"] = json!(offset);
-        let p = dir.join(format!("{i}.jsonl"));
-        fs::write(&p, format!("{v}\n")).unwrap();
+        let p = raw_path(&dir, symbol, feed);
+        fs::write(&p, format!("{}\n", raw(trade(10, i, false)))).unwrap();
         files.push(p);
     }
     let mut merge = Merge::new(files).unwrap();
@@ -113,15 +135,13 @@ fn merge_ties_topic_partition_offset_and_file_clock_steps() {
                 .unwrap(),
         );
     }
-    assert_eq!(ids, vec![3, 2, 1, 0]);
-    let a = dir.join("step.jsonl");
-    let b = dir.join("other.jsonl");
-    fs::write(
-        &a,
-        format!("{}\n{}\n", trade(20, 1, false), trade(5, 2, false)),
-    )
-    .unwrap();
-    fs::write(&b, format!("{}\n", trade(10, 3, false))).unwrap();
+    assert_eq!(ids, vec![2, 1, 0]);
+    let a = raw_path(&dir, "BTCUSDT", "trades");
+    let b = raw_path(&dir, "ETHUSDT", "trades");
+    let mut back = trade(5, 2, false);
+    back["offset"] = json!(1);
+    fs::write(&a, format!("{}\n{}\n", raw(trade(20, 1, false)), raw(back))).unwrap();
+    fs::write(&b, format!("{}\n", raw(trade(10, 3, false)))).unwrap();
     let mut merge = Merge::new(vec![a, b]).unwrap();
     let mut times = Vec::new();
     while let Some(r) = merge.pop().unwrap() {
@@ -132,13 +152,17 @@ fn merge_ties_topic_partition_offset_and_file_clock_steps() {
 }
 #[test]
 fn tick_cutoff_includes_exact_tick_not_one_ns_later() {
-    let path = scratch().join("trades.jsonl");
+    let path = raw_path(&scratch(), "BTCUSDT", "trades");
     fs::write(
         &path,
         format!(
             "{}\n{}\n",
-            trade(SECOND, 1, false),
-            trade(SECOND + 1, 2, true)
+            raw(trade(SECOND, 1, false)),
+            raw({
+                let mut r = trade(SECOND + 1, 2, true);
+                r["offset"] = json!(1);
+                r
+            })
         ),
     )
     .unwrap();
@@ -280,12 +304,12 @@ fn cross_rows_math_uses_valid_same_exchange_and_asset() {
 #[test]
 fn gzip_open_complete_lines_discovery_and_bad_dates() {
     let dir = scratch();
-    let parent = dir.join("raw/date=2026-10-17/exchange=binance/market=spot/feed=trades");
+    let parent = dir.join("raw/binance/spot/BTCUSDT");
     fs::create_dir_all(&parent).unwrap();
-    let open = parent.join("BTCUSDT.jsonl.open");
+    let open = parent.join("20261017_trades.jsonl.open");
     fs::write(
         &open,
-        format!("{}\n{{\"partial\":", trade(SECOND, 1, false)),
+        format!("{}\n{{\"partial\":", raw(trade(SECOND, 1, false))),
     )
     .unwrap();
     assert!(discover(&dir, "2026-10-17", false).is_err());
@@ -293,10 +317,10 @@ fn gzip_open_complete_lines_discovery_and_bad_dates() {
     let mut merge = Merge::new(paths).unwrap();
     assert!(merge.pop().unwrap().is_some());
     assert!(merge.pop().unwrap().is_none());
-    let gz = parent.join("BTCUSDT.jsonl.gz");
+    let gz = parent.join("20261017_trades.jsonl.gz");
     let mut encoder =
         flate2::write::GzEncoder::new(File::create(&gz).unwrap(), flate2::Compression::default());
-    writeln!(encoder, "{}", trade(SECOND, 2, false)).unwrap();
+    writeln!(encoder, "{}", raw(trade(SECOND, 2, false))).unwrap();
     encoder.finish().unwrap();
     let paths = discover(&dir, "2026-10-17", true).unwrap();
     assert_eq!(paths, vec![gz]);
@@ -342,16 +366,16 @@ fn end_to_end_synthetic_day_directory() {
     let day = "2026-10-17";
     let (_, end) = day_bounds(day).unwrap();
     let start = end - 3 * SECOND;
-    let book = root.join(format!(
-        "raw/date={day}/exchange=binance/market=spot/feed=l2/BTCUSDT.jsonl"
-    ));
+    let book = root.join("raw/binance/spot/BTCUSDT/20261017_l2.jsonl");
     fs::create_dir_all(book.parent().unwrap()).unwrap();
-    fs::write(&book, format!("{}\n", snap(start, "100", "102"))).unwrap();
-    let trades = root.join(format!(
-        "raw/date={day}/exchange=binance/market=spot/feed=trades/BTCUSDT.jsonl.open"
-    ));
+    fs::write(&book, format!("{}\n", raw(snap(start, "100", "102")))).unwrap();
+    let trades = root.join("raw/binance/spot/BTCUSDT/20261017_trades.jsonl.open");
     fs::create_dir_all(trades.parent().unwrap()).unwrap();
-    fs::write(&trades, format!("{}\npartial", trade(start + 1, 1, true))).unwrap();
+    fs::write(
+        &trades,
+        format!("{}\npartial", raw(trade(start + 1, 1, true))),
+    )
+    .unwrap();
     let result = std::process::Command::new(env!("CARGO_BIN_EXE_engine-replay"))
         .arg("--root")
         .arg(&root)
@@ -384,13 +408,12 @@ fn end_to_end_synthetic_day_directory() {
 fn kraken_l3_counts_only_events_within_top_ten() {
     use engine_core::kraken::L3Book;
     let bids = (90..100)
-        .map(|p| json!({"order_id":format!("b{p}"),"limit_price":p.to_string(),"order_qty":"1.00"}))
+        .map(|p| json!({"order_id":format!("b{p}"),"limit_price":p.to_string(),"order_qty":"1.00","timestamp":"2026-10-16T00:00:01.000000000Z"}))
         .chain(std::iter::once(
-            json!({"order_id":"outside","limit_price":"89","order_qty":"1"}),
+            json!({"order_id":"outside","limit_price":"89","order_qty":"1","timestamp":"2026-10-16T00:00:01.000000000Z"}),
         ))
         .collect::<Vec<_>>();
-    let mut data =
-        json!({"bids":bids,"asks":[{"order_id":"a","limit_price":"101","order_qty":"1.00"}]});
+    let mut data = json!({"bids":bids,"asks":[{"order_id":"a","limit_price":"101","order_qty":"1.00","timestamp":"2026-10-16T00:00:01.000000000Z"}]});
     let mut reference = L3Book::new(100);
     reference.apply(&data, true).unwrap();
     data["checksum"] = json!(reference.checksum());
@@ -407,7 +430,7 @@ fn kraken_l3_counts_only_events_within_top_ten() {
         .unwrap();
     let initial = row(&mut engine, SECOND);
     assert_eq!(initial.l3_adds_1s, Some(0));
-    let mut data = json!({"bids":[{"event":"add","order_id":"new","limit_price":"99","order_qty":"2.00"},{"event":"modify","order_id":"b99","limit_price":"99","order_qty":"0.5"},{"event":"delete","order_id":"outside","limit_price":"89"},{"event":"delete","order_id":"b98","limit_price":"98"}]});
+    let mut data = json!({"bids":[{"event":"add","order_id":"new","limit_price":"99","order_qty":"2.00","timestamp":"2026-10-16T00:00:02.000000000Z"},{"event":"modify","order_id":"b99","limit_price":"99","order_qty":"0.5","timestamp":"2026-10-16T00:00:01.000000000Z"},{"event":"delete","order_id":"outside","limit_price":"89"},{"event":"delete","order_id":"b98","limit_price":"98"}]});
     reference.apply(&data, false).unwrap();
     data["checksum"] = json!(reference.checksum());
     engine
@@ -531,7 +554,7 @@ fn volumes_accumulate_exactly_and_half_atom_mids_are_not_rounded() {
 fn l3_deletes_use_rank_at_each_event_not_initial_frame_rank() {
     use engine_core::kraken::L3Book;
     let bids = (89..100)
-        .map(|p| json!({"order_id":p.to_string(),"limit_price":p.to_string(),"order_qty":"1"}))
+        .map(|p| json!({"order_id":p.to_string(),"limit_price":p.to_string(),"order_qty":"1","timestamp":"2026-10-16T00:00:01.000000000Z"}))
         .collect::<Vec<_>>();
     let mut data = json!({"bids":bids,"asks":[]});
     let mut reference = L3Book::new(100);

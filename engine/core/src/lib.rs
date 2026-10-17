@@ -186,8 +186,7 @@ impl Connection {
                 let book = self
                     .l3
                     .get_or_insert_with(|| kraken::L3Book::new(self.depth));
-                self.l3_counts = book.apply_counted(data, snapshot)?;
-                self.book = book.book()?;
+                self.l3_counts = book.apply_counted_into(data, snapshot, &mut self.book)?;
                 book.checksum()
             } else {
                 self.book.objects(data)?;

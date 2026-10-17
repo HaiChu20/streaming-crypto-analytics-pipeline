@@ -4,7 +4,10 @@ use crate::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::collections::{BTreeMap, HashMap};
+use std::{
+    cell::OnceCell,
+    collections::{BTreeMap, BTreeSet, HashMap},
+};
 
 pub(crate) fn l2_checksum(book: &Book) -> u32 {
     let mut text = String::new();
@@ -20,13 +23,79 @@ pub(crate) fn l2_checksum(book: &Book) -> u32 {
     crc32fast::hash(text.as_bytes())
 }
 
+fn order_timestamp(text: &str) -> Result<String> {
+    let bytes = text.as_bytes();
+    let pair = |at: usize| -> Option<u8> {
+        let a = *bytes.get(at)?;
+        let b = *bytes.get(at + 1)?;
+        if a.is_ascii_digit() && b.is_ascii_digit() {
+            Some((a - b'0') * 10 + b - b'0')
+        } else {
+            None
+        }
+    };
+    let valid = (22..=30).contains(&bytes.len())
+        && bytes[4] == b'-'
+        && bytes[7] == b'-'
+        && bytes[10] == b'T'
+        && bytes[13] == b':'
+        && bytes[16] == b':'
+        && bytes[19] == b'.'
+        && bytes[bytes.len() - 1] == b'Z'
+        && bytes[..4].iter().all(u8::is_ascii_digit)
+        && bytes[20..bytes.len() - 1].iter().all(u8::is_ascii_digit);
+    if !valid {
+        return Err(Error("invalid L3 order timestamp".into()));
+    }
+    let year: u16 = text[..4]
+        .parse()
+        .map_err(|_| Error("invalid L3 order timestamp".into()))?;
+    let month = pair(5).ok_or_else(|| Error("invalid L3 order timestamp".into()))?;
+    let day = pair(8).ok_or_else(|| Error("invalid L3 order timestamp".into()))?;
+    let hour = pair(11).ok_or_else(|| Error("invalid L3 order timestamp".into()))?;
+    let minute = pair(14).ok_or_else(|| Error("invalid L3 order timestamp".into()))?;
+    let second = pair(17).ok_or_else(|| Error("invalid L3 order timestamp".into()))?;
+    let leap = year.is_multiple_of(4) && (!year.is_multiple_of(100) || year.is_multiple_of(400));
+    let days = match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 if leap => 29,
+        2 => 28,
+        _ => 0,
+    };
+    if year == 0 || day == 0 || day > days || hour > 23 || minute > 59 || second > 59 {
+        return Err(Error("invalid L3 order timestamp".into()));
+    }
+    if bytes.len() == 30 {
+        return Ok(text.to_owned());
+    }
+    let mut normalized = String::with_capacity(30);
+    normalized.push_str(&text[..text.len() - 1]);
+    for _ in 0..30 - bytes.len() {
+        normalized.push('0');
+    }
+    normalized.push('Z');
+    Ok(normalized)
+}
+
 #[derive(Serialize, Deserialize, Debug, Default)]
 struct Queue {
     price_text: String,
-    orders: Vec<(String, String)>,
+    #[serde(skip)]
+    checksum_price: OnceCell<String>,
+    orders: Vec<Order>,
 }
 
-/// Individual orders in insertion/queue order, truncated by price-level depth.
+#[derive(Serialize, Deserialize, Debug)]
+struct Order {
+    id: String,
+    qty: String,
+    timestamp: String,
+    #[serde(skip)]
+    checksum_qty: OnceCell<String>,
+}
+
+/// Individual orders in timestamp/arrival order, truncated by price-level depth.
 #[derive(Serialize, Deserialize, Debug)]
 pub struct L3Book {
     depth: usize,
@@ -47,7 +116,24 @@ impl L3Book {
     }
     /// Counts add/modify/delete at each event's top-ten rank, before deletes and after adds.
     pub(crate) fn apply_counted(&mut self, data: &Value, snapshot: bool) -> Result<[i64; 3]> {
+        self.apply_inner(data, snapshot, None)
+    }
+    pub(crate) fn apply_counted_into(
+        &mut self,
+        data: &Value,
+        snapshot: bool,
+        aggregate: &mut Book,
+    ) -> Result<[i64; 3]> {
+        self.apply_inner(data, snapshot, Some(aggregate))
+    }
+    fn apply_inner(
+        &mut self,
+        data: &Value,
+        snapshot: bool,
+        aggregate: Option<&mut Book>,
+    ) -> Result<[i64; 3]> {
         let mut counts = [0; 3];
+        let mut dirty = BTreeSet::new();
         if snapshot {
             self.sides = Default::default();
             self.where_.clear();
@@ -67,41 +153,53 @@ impl L3Book {
                 };
                 let before = self.where_.get(oid).copied();
                 let was_top = before.is_some_and(|(s, p)| self.top10(s, p));
-                if event == "delete" {
-                    let fallback = if order["limit_price"].is_null() {
-                        0
-                    } else {
-                        decimal(&order["limit_price"])?.parse::<Fixed>()?.0
-                    };
-                    let (s, p) = self.where_.remove(oid).unwrap_or((side, fallback));
-                    if let Some(queue) = self.sides[s].get_mut(&p) {
-                        queue.orders.retain(|(id, _)| id != oid);
-                        if queue.orders.is_empty() {
-                            self.sides[s].remove(&p);
-                        }
+                // An add may replace an order already inside the subscribed depth.
+                // A modify also carries its new queue timestamp and can change price.
+                if let Some((s, p)) = self.where_.remove(oid)
+                    && let Some(queue) = self.sides[s].get_mut(&p)
+                {
+                    dirty.insert((s, p));
+                    queue.orders.retain(|entry| entry.id != oid);
+                    if queue.orders.is_empty() {
+                        self.sides[s].remove(&p);
                     }
-                } else if event == "modify" && self.where_.contains_key(oid) {
-                    let (s, p) = self.where_[oid];
-                    let qty = decimal(&order["order_qty"])?;
-                    let queue = self.sides[s].get_mut(&p).expect("indexed order");
-                    queue
-                        .orders
-                        .iter_mut()
-                        .find(|(id, _)| id == oid)
-                        .expect("indexed order")
-                        .1 = qty;
-                } else {
+                }
+                if event != "delete" {
                     let price_text = decimal(&order["limit_price"])?;
                     let price = price_text.parse::<Fixed>()?.0;
+                    dirty.insert((side, price));
                     let qty = decimal(&order["order_qty"])?;
+                    let timestamp = order_timestamp(
+                        order["timestamp"]
+                            .as_str()
+                            .ok_or_else(|| Error("missing L3 order timestamp".into()))?,
+                    )?;
                     let queue = self.sides[side].entry(price).or_insert_with(|| Queue {
                         price_text,
+                        checksum_price: OnceCell::new(),
                         orders: Vec::new(),
                     });
-                    if let Some((_, size)) = queue.orders.iter_mut().find(|(id, _)| id == oid) {
-                        *size = qty;
+                    let append = queue
+                        .orders
+                        .last()
+                        .is_none_or(|entry| entry.timestamp <= timestamp);
+                    let position = if append {
+                        queue.orders.len()
                     } else {
-                        queue.orders.push((oid.to_owned(), qty));
+                        queue
+                            .orders
+                            .partition_point(|entry| entry.timestamp <= timestamp)
+                    };
+                    let entry = Order {
+                        id: oid.to_owned(),
+                        qty,
+                        timestamp,
+                        checksum_qty: OnceCell::new(),
+                    };
+                    if append {
+                        queue.orders.push(entry);
+                    } else {
+                        queue.orders.insert(position, entry);
                     }
                     self.where_.insert(oid.to_owned(), (side, price));
                 }
@@ -121,14 +219,40 @@ impl L3Book {
         }
         for side in 0..2 {
             while self.sides[side].len() > self.depth {
-                let (_, queue) = if side == 0 {
+                let (price, queue) = if side == 0 {
                     self.sides[side].pop_first()
                 } else {
                     self.sides[side].pop_last()
                 }
                 .expect("nonempty side");
-                for (oid, _) in queue.orders {
-                    self.where_.remove(&oid);
+                dirty.insert((side, price));
+                for order in queue.orders {
+                    self.where_.remove(&order.id);
+                }
+            }
+        }
+        if let Some(aggregate) = aggregate {
+            if snapshot {
+                *aggregate = Book::default();
+            }
+            for (side, price) in dirty {
+                let book_side = if side == 0 { Side::Bid } else { Side::Ask };
+                if let Some(queue) = self.sides[side].get(&price) {
+                    let mut size = 0i64;
+                    for order in &queue.orders {
+                        size = size
+                            .checked_add(order.qty.parse::<Fixed>()?.0)
+                            .ok_or_else(|| Error("L3 level size overflow".into()))?;
+                    }
+                    aggregate.set_text(
+                        book_side,
+                        queue.price_text.clone(),
+                        Fixed(size).to_string(),
+                    )?;
+                } else if side == 0 {
+                    aggregate.bids.remove(&price);
+                } else {
+                    aggregate.asks.remove(&price);
                 }
             }
         }
@@ -142,18 +266,22 @@ impl L3Book {
         }
     }
     pub fn checksum(&self) -> u32 {
-        let mut text = String::new();
+        let mut hash = crc32fast::Hasher::new();
         for queue in self.sides[1]
             .values()
             .take(10)
             .chain(self.sides[0].values().rev().take(10))
         {
-            for (_, qty) in &queue.orders {
-                text.push_str(&kraken_fmt(&queue.price_text));
-                text.push_str(&kraken_fmt(qty));
+            let price = queue
+                .checksum_price
+                .get_or_init(|| kraken_fmt(&queue.price_text));
+            for order in &queue.orders {
+                hash.update(price.as_bytes());
+                let qty = order.checksum_qty.get_or_init(|| kraken_fmt(&order.qty));
+                hash.update(qty.as_bytes());
             }
         }
-        crc32fast::hash(text.as_bytes())
+        hash.finalize()
     }
     pub fn orders_at(&self, side: Side, price: Fixed) -> Vec<(&str, Fixed)> {
         self.sides[if side == Side::Bid { 0 } else { 1 }]
@@ -161,7 +289,12 @@ impl L3Book {
             .map_or_else(Vec::new, |q| {
                 q.orders
                     .iter()
-                    .map(|(id, qty)| (id.as_str(), qty.parse().expect("validated quantity")))
+                    .map(|order| {
+                        (
+                            order.id.as_str(),
+                            order.qty.parse().expect("validated quantity"),
+                        )
+                    })
                     .collect()
             })
     }
@@ -170,9 +303,9 @@ impl L3Book {
         for side in 0..2 {
             for queue in self.sides[side].values() {
                 let mut size = 0i64;
-                for (_, qty) in &queue.orders {
+                for order in &queue.orders {
                     size = size
-                        .checked_add(qty.parse::<Fixed>()?.0)
+                        .checked_add(order.qty.parse::<Fixed>()?.0)
                         .ok_or_else(|| Error("L3 level size overflow".into()))?;
                 }
                 book.set_text(

@@ -114,3 +114,84 @@ That independent replay's sampled prefix is unchanged; it was not rerun for FIX2
 
 Feature contract and official exchange field-semantic citations remain in
 [README.md](README.md). Raw data and the running pipeline were not modified.
+
+# P10 validation — v2 raw replay and partition ordering
+
+Ideal, as_live, and live checkpoints now merge only per-partition heads. A
+backward `recv_ns` cannot reorder a later offset ahead of an earlier one; flow
+from a late record is attributed to the tick that processes it. A regression
+holds a Kraken futures sequence valid through a backward step, and a no-step
+fixture produces exactly the former global-sort order.
+
+The converted v2-ours tree contains 42 streams and 70,934,797 records. Its
+full-day ideal replay emitted 1,112,572 rows at 302,771 records/s (internal
+wall); peak RSS was 109,346,816 bytes. All 92 book breaks were explicit drops
+(88 disconnect, 4 collector crash), with zero detected sequence or CRC breaks.
+The 55 receive-clock steps were preserved in file order.
+
+For an exact comparison with the earlier P5b v1 Parquet, the v2 replay was
+capped at the same final offset of each stream: 33,480,192 records, 1,112,572
+rows, and the same 68 explicit book breaks. Ignoring `available_ns` and the
+engine-version label, 86 rows differ, all in OKX perp BTC/ETH trade volume and
+buy/sell volume during four trade-connection stop/start gaps (01:59:17–01:59:26,
+02:02:53–02:03:02, 02:05:43–02:05:55, and 09:18:00–09:18:09 UTC).
+The old artifact emitted zero; the current engine correctly emits null because
+the disconnected connection's `ctVal` is no longer available. The earlier
+artifact used engine version `0.1.0-ideal-v1`; the current version is
+`0.1.0-features-v2`. There are no other row differences in the capped input.
+
+The corrected offline live reference replayed 1,622,211 original v1 envelopes
+through the shared checkpoint and queue logic over the P6a parity window.
+Converted v2 as_live produced exactly the same 25,340 rows, with zero field
+mismatches (excluding nondeterministic publication time) and the same four
+pre-existing `missing_snapshot` breaks. Compared with the old captured live
+rows, the corrected reference changes 3,050 rows: three Kraken books (perp
+PF_ETHUSD, perp PF_XBTUSD, spot ETH/USD) and their two cross rows, each for
+610 ticks from 15:04:03 through 15:14:12 UTC. The old global batch sort
+reversed offsets at a backward clock step and falsely retired those books;
+the corrected reference has no such continuity breaks. No late flow records
+occurred in this parity window.
+
+The real Kraken BTC/USD 2026-10-16 audit uses the completed corrected
+`v2-legacy-fixed` tree. Kraken L3 queue order is determined by order timestamp,
+with arrival-order ties; duplicate adds replace prior entries and price-level
+depth is truncated after each frame. The old queue model produced 15 false
+checksum failures. An independent full-day reconstruction verified
+11,053,252 L3 CRCs and zero failures with these rules. The Rust full-day audit
+agrees: **11,053,154 L3 CRC passes, 0 failures**. The converted and source
+L3 files have the same 11,053,281 lines. The source-file audit also checks 98
+data frames timestamped after the last 23:59:59 replay tick; those await the
+next day's tick and account exactly for the count difference. L2 has
+**11,052,596 CRC passes, 0 failures**. The Rust replay processed 22,250,352
+records, emitted 172,794 Parquet rows, and preserved zero clock steps. Its
+506.63 s internal wall time yields **43,918 records/s**; peak RSS was
+25,427,968 bytes (24.25 MiB). This rate includes continuous L3 CRC checks;
+the former, invalid L3 model retired most of each connection and therefore
+appeared faster.
+
+The L2 book is valid on **86,330/86,397 ticks (99.92245%)** and the L3 book
+on **86,344/86,397 (99.93866%)**. The 14 L2 and 12 L3 invalidation breaks
+align one-for-one with `connection_error` markers and recover at the next
+snapshot; the only additional invalid interval is initial startup for each
+book. There are no checksum or sequence breaks. The L3 feed carries 9,797,458
+adds, 49,736 modifies, and 5,439,670 deletes across all levels. Within the
+top ten, applied event counts are 2,303,508 adds, 47,090 modifies, and
+2,240,916 deletes.
+
+At the 86,279 ticks where both books are valid, the L3-aggregated and L2
+books agree on both best bid/ask prices for **85,305 ticks (98.871%)**, on
+best price and size for **81,099 (93.996%)**, on summed top-ten size on both
+sides for **76,123 (88.229%)**, and on all top-ten price/size levels for
+**75,726 (87.769%)**. These are comparisons at one-second replay ticks, not
+exchange-sequenced snapshots of the same instant. For example, at 00:00:13
+the L2 exchange timestamp is 00:00:12.449740 and L3 is
+00:00:12.530621502; best prices agree but sizes differ. Kraken documents
+that the feeds use different market-data stacks and that larger L3 payloads
+take longer to encode and transmit; [its L3 guide](https://docs.kraken.com/exchange/guides/general/l3-data)
+supports this timing explanation.
+
+P10 artifacts are under `scratchpad/p10/`: `legacy-ts-features`,
+`legacy-ts-report.json`, `legacy-ts-audit.json`, `legacy-ts-time.txt`,
+`ours-features` and `ours-report.json`,
+`v2-aslive-rows.jsonl`, `reference-live-rows.jsonl`, and the row-diff JSONs.
+All raw inputs were read only.

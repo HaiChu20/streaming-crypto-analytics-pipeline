@@ -10,11 +10,21 @@ use std::{
     path::PathBuf,
     sync::atomic::{AtomicU64, Ordering},
 };
+fn v2(r: &Record) -> String {
+    let mut payload: serde_json::Value = serde_json::from_str(&r.payload).unwrap();
+    payload["recv_time_ns"] = json!(r.recv_ns);
+    payload["offset"] = json!(r.offset);
+    payload["conn"] = json!(r.conn);
+    payload.to_string()
+}
 static ID: AtomicU64 = AtomicU64::new(0);
 #[test]
 fn synthetic_live_session_replays_cutoffs_carry_and_late_records_exactly() {
-    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(format!(
-        "../target/as-live-tests/{}-{}",
+    let root = PathBuf::from(
+        std::env::var_os("ENGINE_TEST_SCRATCH").unwrap_or_else(|| std::env::temp_dir().into()),
+    )
+    .join(format!(
+        "as-live-tests/{}-{}",
         std::process::id(),
         ID.fetch_add(1, Ordering::Relaxed)
     ));
@@ -36,18 +46,11 @@ fn synthetic_live_session_replays_cutoffs_carry_and_late_records_exactly() {
         format!("{}\n", serde_json::to_string(&carry).unwrap()),
     )
     .unwrap();
-    let raw = root
-        .join("raw")
-        .join(format!("date={date}"))
-        .join("exchange=binance/market=spot/feed=trades");
+    let raw = root.join("raw/binance/spot/BTCUSDT");
     fs::create_dir_all(&raw).unwrap();
     fs::write(
-        raw.join("BTCUSDT.jsonl"),
-        format!(
-            "{}\n{}\n",
-            serde_json::to_string(&late).unwrap(),
-            serde_json::to_string(&future).unwrap()
-        ),
+        raw.join("20261017_trades.jsonl"),
+        format!("{}\n{}\n", v2(&late), v2(&future)),
     )
     .unwrap();
     let c0 = Cutoff {

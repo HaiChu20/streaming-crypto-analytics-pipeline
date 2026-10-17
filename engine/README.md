@@ -1,8 +1,9 @@
 # Engine core
 
 `engine_core` is synchronous and performs no I/O. Construct one `StreamBook` per
-(exchange, market, feed, symbol), parse archived lines with `Record::parse`, and
-call `consume` in file order. Kafka coordinates are optional for probe envelopes.
+(exchange, market, feed, symbol), parse Kafka v1 envelopes with `Record::parse`, and
+call `consume_at_tick` in partition offset order. Replay reads only native v2 raw
+files through its small path/line adapter; the Kafka envelope path is unchanged.
 Pure feature state is shared in `engine_core::features`. The [ideal replay CLI](replay/README.md)
 handles file ordering, ticks and Parquet; live ingestion is a later phase.
 
@@ -10,7 +11,12 @@ handles file ordering, ticks and Parquet; live ingestion is a later phase.
 overflow. `Book::mid` returns `Mid` in i128 units of 10^-9 so half an atom is exact.
 Native decimal text is retained for checksums, including Kraken's trailing zeros
 and exponent expansion (the collector's Decimal `_fmt`, without metadata padding).
-L3 queues preserve insertion order, including when an order is modified.
+Kraken L3 price queues sort by each order's timestamp, breaking ties by arrival
+order. The book truncates each side to its subscribed price-level depth after
+every frame; orders outside that window need no delete and may re-enter through
+an add with their original timestamp. Duplicate adds replace the old order.
+Modifies remove and reinsert using the event timestamp: decreases normally
+retain priority, while increases receive a newer timestamp and move back.
 
 `valid()` must be checked before using `book()` for features. Pending or stale
 books can retain levels for diagnostics; ended connections release their books
@@ -141,3 +147,20 @@ already eligible at the previous tick but whose offset first appears in the
 current cutoff.
 The replay report also lists L2 connection switches, their tick, and the source
 validity on each side of the switch for overlap audits.
+
+## Replay ordering and late flow (P10)
+
+All modes merge only each partition's next record by
+`(recv_ns, topic, partition, offset)`. Offset order survives backward receive-clock
+steps, both inside tick batches and across raw files. Live queues and checkpoints
+share one batch merge implementation; ideal replay streams partition heads.
+Flow buckets use `max(window_tick(recv_ns), current_tick)` in the shared core, so
+late trade, liquidation and L3 flow reaches an emitted row. Freshness still uses
+the original receive timestamp. No-step ordering equals the former global sort.
+
+Raw v2 paths are `raw/<exchange>/<market>/<SYMBOL>/YYYYMMDD_<feed>.jsonl[.gz|.open]`.
+The adapter derives stream coordinates from the path, requires connection/offset/
+receive metadata, maps markers to controls, and retains the original native line
+as payload. JSON decimal strings and number tokens both use exact fixed point;
+Kraken CRC32 uses their original decimal characters. See
+[replay usage](replay/README.md) and [validation](replay/VALIDATION.md).

@@ -146,7 +146,7 @@ impl Instrument {
         }
         true
     }
-    fn consume(&mut self, r: &Record) -> Result<()> {
+    fn consume(&mut self, r: &Record, current_tick: Option<i64>) -> Result<()> {
         self.seen.insert(r.feed.clone());
         let crash = r.kind == Kind::Control
             && r.event.as_deref() == Some("drop")
@@ -216,7 +216,10 @@ impl Instrument {
             }
             if r.feed == "l3" && outcome == Outcome::Applied {
                 let counts = state.l3_event_counts().unwrap();
-                let bucket = self.buckets.entry(window_tick(r.recv_ns)?).or_default();
+                let bucket = self
+                    .buckets
+                    .entry(window_tick(r.recv_ns, current_tick)?)
+                    .or_default();
                 for (total, count) in bucket.l3.iter_mut().zip(counts) {
                     *total += count;
                 }
@@ -286,7 +289,10 @@ impl Instrument {
                     if !self.remember(id) || r.kind == Kind::Snapshot {
                         continue;
                     }
-                    let bucket = self.buckets.entry(window_tick(r.recv_ns)?).or_default();
+                    let bucket = self
+                        .buckets
+                        .entry(window_tick(r.recv_ns, current_tick)?)
+                        .or_default();
                     bucket.count += 1;
                     let Some(factor) = factor else {
                         bucket.unscaled_trades = true;
@@ -323,7 +329,10 @@ impl Instrument {
                 self.oi = number(&payload["openInterest"]);
             }
             "liquidations" => {
-                let bucket = self.buckets.entry(window_tick(r.recv_ns)?).or_default();
+                let bucket = self
+                    .buckets
+                    .entry(window_tick(r.recv_ns, current_tick)?)
+                    .or_default();
                 bucket.liq_count += 1;
                 // forceOrder is sampled; z is cumulative filled quantity of the pushed order.
                 let quantity = i128::from(fixed(&payload["data"]["o"]["z"])?) * i128::from(UNIT);
@@ -502,9 +511,11 @@ fn taker_buy(trade: &Value) -> Result<bool> {
         _ => Err(error("invalid taker side")),
     }
 }
-fn window_tick(ns: i128) -> Result<i64> {
+/// Late records belong to the tick that processes them, never a closed bucket.
+pub fn window_tick(ns: i128, current_tick: Option<i64>) -> Result<i64> {
     let ns = i64::try_from(ns).map_err(|_| error("receive timestamp out of i64 range"))?;
-    Ok(ns.div_euclid(SECOND) * SECOND + if ns.rem_euclid(SECOND) > 0 { SECOND } else { 0 })
+    let tick = ns.div_euclid(SECOND) * SECOND + if ns.rem_euclid(SECOND) > 0 { SECOND } else { 0 };
+    Ok(current_tick.map_or(tick, |current| tick.max(current)))
 }
 
 #[derive(Default, Serialize, Deserialize)]
@@ -531,6 +542,12 @@ impl Engine {
             .collect()
     }
     pub fn consume(&mut self, r: &Record) -> Result<()> {
+        self.consume_inner(r, None)
+    }
+    pub fn consume_at_tick(&mut self, r: &Record, tick: i64) -> Result<()> {
+        self.consume_inner(r, Some(tick))
+    }
+    fn consume_inner(&mut self, r: &Record, current_tick: Option<i64>) -> Result<()> {
         let key = (r.exchange.clone(), r.market.clone(), r.symbol.clone());
         if r.kind == Kind::Control
             && r.event.as_deref() == Some("drop")
@@ -560,7 +577,7 @@ impl Engine {
                     state.gates.entry(r.feed.clone()).or_default().end(&conn);
                 }
             } else if r.feed == "trades" {
-                if let Ok(tick) = window_tick(r.recv_ns) {
+                if let Ok(tick) = window_tick(r.recv_ns, current_tick) {
                     state.buckets.entry(tick).or_default().malformed_trades = true;
                 } else {
                     state.uncertain_trades = true;
@@ -583,7 +600,7 @@ impl Engine {
         let state = self.instruments.entry(key).or_default();
         let before = state.l2.as_ref().map_or(0, |b| b.counters().breaks)
             + state.l3.as_ref().map_or(0, |b| b.counters().breaks);
-        if let Err(error) = state.consume(r) {
+        if let Err(error) = state.consume(r, current_tick) {
             let stream = if r.feed == "l2" {
                 &mut state.l2
             } else {
@@ -595,7 +612,7 @@ impl Engine {
                 }
                 state.gates.entry(r.feed.clone()).or_default().end(&r.conn);
             } else if r.feed == "trades" {
-                if let Ok(tick) = window_tick(r.recv_ns) {
+                if let Ok(tick) = window_tick(r.recv_ns, current_tick) {
                     state.buckets.entry(tick).or_default().malformed_trades = true;
                 }
             } else if r.feed == "mark" || r.feed == "ticker" {

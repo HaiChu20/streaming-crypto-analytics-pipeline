@@ -12,8 +12,11 @@ record/row counts, clock steps, break reasons, coverage and cross-price maxima.
 
 ## Input and ordering
 
-Files present under `raw/date=D/` define the streams; no YAML/config parser is
-used. Known feeds are l1, l2, l3, trades, trades_agg, mark, liquidations and ticker.
+Only v2 files under `raw/<exchange>/<market>/<SYMBOL>/YYYYMMDD_<feed>.jsonl`
+define the streams (the root may be either the data directory or `raw` itself).
+`--exchange NAME` and `--market NAME` filter ideal replay. Missing streams are
+absent; cross features requiring them are null. Native symbols and BTC/ETH
+partitions follow `config/markets.yaml`; no YAML parser is required. Known feeds are l1, l2, l3, trades, trades_agg, mark, liquidations and ticker.
 Unknown feeds are skipped with a warning. If several representations of the same
 stream exist, prefer `.jsonl`, then `.jsonl.gz`, then `.jsonl.open`. Open files
 require `--allow-open`. Every reader is capped at the file's size when opened;
@@ -23,13 +26,20 @@ an append-only archive without stopping collection.
 
 A min-heap contains one head per buffered reader and compares
 `(recv_ns, topic, partition, offset, file_index)`. The final file index only breaks
-otherwise identical coordinates. Archived Kafka coordinates are retained; probe
-envelopes without them use the native stream topic, BTC/ETH partition and line
-index. Each file is advanced only after popping its previous head. Thus a receive
+otherwise identical coordinates. Archive lines require `recv_time_ns`, `conn` and `offset`; paths supply topic,
+partition, exchange, market, symbol and feed. Marker events map back to controls,
+including start metadata; gap and rollover markers are ignored. Native payload text is
+retained without reserialization, preserving exact decimal tokens for CRC32.
+Files of a partition are read sequentially, and each partition is advanced only
+after popping its previous head. Thus a receive
 clock step-back cannot move a later line before its predecessor: its older time
 is exposed only after that predecessor. This preserves file order even when a
 globally increasing timestamp order is impossible. Older hidden records become
-eligible at that later tick; old trade buckets never leak into a current window.
+eligible at that later tick. Live queues and checkpoint/as_live batches use the
+same head-only ordering rule. Flow attribution uses one shared helper:
+`max(ceil_to_second(recv_ns), current_tick)`. Thus a late record's trade,
+liquidation or L3 event flow appears in the tick that processes it, never a
+closed bucket. No-step input produces the same order as the former global sort.
 
 ## Feature contract
 
@@ -56,7 +66,7 @@ emitted instrument ticks. The audit separately reports observed stale percentage
 and asserts all book/extras/cross fields are null in the tail after the grace period.
 
 Rows are sorted by `(tick_ns, exchange, market, symbol, engine_version)`. The
-version is a crate version plus the git-independent constant `ideal-v1`.
+version is the shared `engine_core::ENGINE_VERSION`.
 
 - L2 supplies book features. Invalid, empty or crossed books have null book values.
   Midpoint source values remain exact fixed point. `mid_e9` is an exact i64
@@ -77,7 +87,8 @@ version is a crate version plus the git-independent constant `ideal-v1`.
   crash still counts as a book break and remains UNCERTAIN in `check_raw` reports.
   Historical trade snapshots seed IDs but
   contribute no new one-second volume. Window membership is receive time in
-  `(T-1s,T]`, independent of exchange timestamps. Absent optional feeds have null
+  `(T-1s,T]`, clamped to the processing tick for late/backward records, independent
+  of exchange timestamps. Absent optional feeds have null
   metrics; a seen feed with no events in the window has zero metrics.
 - Returns are log(mid_e9(T)/mid_e9(T-h)); missing/invalid endpoints yield null.
   Realized volatility is `sqrt(sum(ret_1s^2))`, not annualized, requiring every

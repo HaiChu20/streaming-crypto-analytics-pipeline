@@ -424,8 +424,8 @@ fn kraken_l3_documented_checksum() {
 #[test]
 fn kraken_l3_queue_modify_delete_and_truncate() {
     let mut book = L3Book::new(2);
-    book.apply(&json!({"bids":[{"order_id":"a","limit_price":"10.0","order_qty":"1.0"},{"order_id":"b","limit_price":"10.0","order_qty":"2.0"},{"order_id":"c","limit_price":"9.0","order_qty":"1.0"}]}),true).unwrap();
-    book.apply(&json!({"bids":[{"event":"modify","order_id":"a","order_qty":"0.5"},{"event":"add","order_id":"d","limit_price":"8.0","order_qty":"1.0"}]}),false).unwrap();
+    book.apply(&json!({"bids":[{"order_id":"a","limit_price":"10.0","order_qty":"1.0","timestamp":"2026-10-16T00:00:01.000000000Z"},{"order_id":"b","limit_price":"10.0","order_qty":"2.0","timestamp":"2026-10-16T00:00:02.000000000Z"},{"order_id":"c","limit_price":"9.0","order_qty":"1.0","timestamp":"2026-10-16T00:00:03.000000000Z"}]}),true).unwrap();
+    book.apply(&json!({"bids":[{"event":"modify","order_id":"a","limit_price":"10.0","order_qty":"0.5","timestamp":"2026-10-16T00:00:01.000000000Z"},{"event":"add","order_id":"d","limit_price":"8.0","order_qty":"1.0","timestamp":"2026-10-16T00:00:04.000000000Z"}]}),false).unwrap();
     let p = "10".parse().unwrap();
     let orders = book.orders_at(Side::Bid, p);
     assert_eq!(
@@ -440,7 +440,7 @@ fn kraken_l3_queue_modify_delete_and_truncate() {
     .unwrap();
     assert_eq!(book.book().unwrap().top(Side::Bid, 10).len(), 1);
     // Unknown modify is add, and delete uses the stored side/price.
-    book.apply(&json!({"asks":[{"event":"modify","order_id":"e","limit_price":"11.0","order_qty":"1.0"},{"event":"delete","order_id":"a"}]}),false).unwrap();
+    book.apply(&json!({"asks":[{"event":"modify","order_id":"e","limit_price":"11.0","order_qty":"1.0","timestamp":"2026-10-16T00:00:05.000000000Z"},{"event":"delete","order_id":"a"}]}),false).unwrap();
     assert_eq!(
         book.orders_at(Side::Bid, p),
         vec![("b", "2".parse().unwrap())]
@@ -449,6 +449,139 @@ fn kraken_l3_queue_modify_delete_and_truncate() {
         book.book().unwrap().best_ask().unwrap().0,
         "11".parse().unwrap()
     );
+}
+#[test]
+fn kraken_l3_modify_uses_order_timestamp() {
+    let mut book = L3Book::new(10);
+    let price = "10".parse().unwrap();
+    book.apply(
+        &json!({"asks":[
+            {"order_id":"a","limit_price":"10.0","order_qty":"1.0","timestamp":"2026-10-16T00:00:01.000000000Z"},
+            {"order_id":"b","limit_price":"10.0","order_qty":"2.0","timestamp":"2026-10-16T00:00:02.000000000Z"}
+        ]}),
+        true,
+    )
+    .unwrap();
+    book.apply(
+        &json!({"asks":[{"event":"modify","order_id":"a","limit_price":"10.0","order_qty":"1.5","timestamp":"2026-10-16T00:00:03.000000000Z"}]}),
+        false,
+    )
+    .unwrap();
+    assert_eq!(
+        book.orders_at(Side::Ask, price),
+        vec![("b", "2".parse().unwrap()), ("a", "1.5".parse().unwrap())]
+    );
+    assert_eq!(book.checksum(), 741273247);
+    book.apply(
+        &json!({"asks":[{"event":"modify","order_id":"b","limit_price":"10.0","order_qty":"1.0","timestamp":"2026-10-16T00:00:02.000000000Z"}]}),
+        false,
+    )
+    .unwrap();
+    assert_eq!(
+        book.orders_at(Side::Ask, price),
+        vec![("b", "1".parse().unwrap()), ("a", "1.5".parse().unwrap())]
+    );
+    book.apply(
+        &json!({"asks":[{"event":"modify","order_id":"b","limit_price":"10.0","order_qty":"1.0","timestamp":"2026-10-16T00:00:04.000000000Z"}]}),
+        false,
+    )
+    .unwrap();
+    assert_eq!(
+        book.orders_at(Side::Ask, price),
+        vec![("a", "1.5".parse().unwrap()), ("b", "1".parse().unwrap())]
+    );
+    assert_eq!(book.checksum(), 1029804350);
+}
+#[test]
+fn kraken_l3_depth_reentry_duplicate_add_and_timestamp_priority() {
+    let mut book = L3Book::new(1);
+    let (best, outside) = ("10".parse().unwrap(), "9".parse().unwrap());
+    book.apply(
+        &json!({"bids":[
+            {"order_id":"a","limit_price":"10.0","order_qty":"1.0","timestamp":"2026-10-16T00:00:02.000000000Z"},
+            {"order_id":"b","limit_price":"10.0","order_qty":"2.0","timestamp":"2026-10-16T00:00:01.000000000Z"},
+            {"order_id":"c","limit_price":"9.0","order_qty":"3.0","timestamp":"2026-10-16T00:00:00.000000000Z"}
+        ]}),
+        true,
+    )
+    .unwrap();
+    assert!(book.orders_at(Side::Bid, outside).is_empty());
+    assert_eq!(
+        book.orders_at(Side::Bid, best),
+        vec![("b", "2".parse().unwrap()), ("a", "1".parse().unwrap())]
+    );
+    // The exchange re-sends an add with the original timestamp on re-entry.
+    book.apply(&json!({"bids":[{"event":"add","order_id":"c","limit_price":"10.0","order_qty":"3.0","timestamp":"2026-10-16T00:00:00.000000000Z"}]}), false).unwrap();
+    assert_eq!(
+        book.orders_at(Side::Bid, best)
+            .iter()
+            .map(|(id, _)| *id)
+            .collect::<Vec<_>>(),
+        ["c", "b", "a"]
+    );
+    // Duplicate add replaces the existing order, including its queue position.
+    book.apply(&json!({"bids":[{"event":"add","order_id":"b","limit_price":"10.0","order_qty":"2.0","timestamp":"2026-10-16T00:00:04.000000000Z"}]}), false).unwrap();
+    assert_eq!(
+        book.orders_at(Side::Bid, best)
+            .iter()
+            .map(|(id, _)| *id)
+            .collect::<Vec<_>>(),
+        ["c", "a", "b"]
+    );
+    book.apply(&json!({"bids":[{"event":"modify","order_id":"a","limit_price":"10.0","order_qty":"0.5","timestamp":"2026-10-16T00:00:02.000000000Z"}]}), false).unwrap();
+    assert_eq!(
+        book.orders_at(Side::Bid, best)
+            .iter()
+            .map(|(id, _)| *id)
+            .collect::<Vec<_>>(),
+        ["c", "a", "b"]
+    );
+    book.apply(&json!({"bids":[{"event":"modify","order_id":"a","limit_price":"10.0","order_qty":"1.5","timestamp":"2026-10-16T00:00:05.000000000Z"}]}), false).unwrap();
+    assert_eq!(
+        book.orders_at(Side::Bid, best)
+            .iter()
+            .map(|(id, _)| *id)
+            .collect::<Vec<_>>(),
+        ["c", "b", "a"]
+    );
+    assert_eq!(book.checksum(), 2321152324);
+}
+#[test]
+fn kraken_l3_timestamp_normalization_and_malformed_break() {
+    let mut book = L3Book::new(100);
+    let first = json!({"order_id":"a","limit_price":"10","order_qty":"1","timestamp":"2026-10-16T00:00:01.500000001Z"});
+    let short = json!({"order_id":"b","limit_price":"10","order_qty":"2","timestamp":"2026-10-16T00:00:01.5Z"});
+    book.apply(&json!({"bids":[first, short]}), true).unwrap();
+    assert_eq!(
+        book.orders_at(Side::Bid, "10".parse().unwrap()),
+        vec![("b", "2".parse().unwrap()), ("a", "1".parse().unwrap())]
+    );
+
+    let mut seed = L3Book::new(100);
+    seed.apply(&json!({"bids":[{"order_id":"a","limit_price":"10","order_qty":"1","timestamp":"2026-10-16T00:00:01.500000000Z"}]}), true).unwrap();
+    let checksum = seed.checksum();
+    let snapshot = json!({"data":[{"bids":[{"order_id":"a","limit_price":"10","order_qty":"1","timestamp":"2026-10-16T00:00:01.5Z"}],"asks":[],"checksum":checksum}]});
+    let mut start = record("kraken", "spot", "snapshot", snapshot);
+    start.feed = "l3".into();
+    let mut stream = StreamBook::new(&start).unwrap();
+    assert!(matches!(
+        consume(&mut stream, &start),
+        Outcome::Snapshot { .. }
+    ));
+    assert!(stream.valid());
+    let mut bad = record(
+        "kraken",
+        "spot",
+        "update",
+        json!({"data":[{"bids":[{"event":"add","order_id":"b","limit_price":"10","order_qty":"2","timestamp":"2026-02-30T00:00:01.5Z"}],"asks":[],"checksum":0}]}),
+    );
+    bad.feed = "l3".into();
+    assert!(stream.consume(&bad).is_err());
+    assert!(!stream.valid());
+    assert!(matches!(
+        stream.last_break(),
+        Some(BreakReason::Malformed(_))
+    ));
 }
 #[test]
 fn fixed_precision_overflow_and_exponents() {

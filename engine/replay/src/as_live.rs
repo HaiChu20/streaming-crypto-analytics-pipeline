@@ -1,39 +1,32 @@
 //! Replay recorded offset prefixes; recv_ns never decides membership in a tick.
-use crate::{Result, error, input::discover, state_io};
+use crate::{
+    Result, error,
+    input::{Source, discover},
+    state_io,
+};
 use engine_core::{
     Record,
     session::{Checkpoint, Cutoff, partition_key},
 };
-use flate2::read::MultiGzDecoder;
 use serde::Serialize;
 use std::{
     collections::{BTreeMap, VecDeque},
     fs::File,
-    io::{BufRead, BufReader, Read},
+    io::{BufRead, BufReader},
     path::Path,
 };
 
 struct Archive {
-    reader: Box<dyn BufRead>,
+    reader: Source,
     head: Option<Record>,
     key: String,
-    path: String,
 }
 impl Archive {
     fn new(path: &Path) -> Result<Self> {
-        let file = File::open(path)?;
-        let bytes = file.metadata()?.len();
-        let capped = file.take(bytes);
-        let reader: Box<dyn BufRead> = if path.to_string_lossy().ends_with(".gz") {
-            Box::new(BufReader::new(MultiGzDecoder::new(capped)))
-        } else {
-            Box::new(BufReader::new(capped))
-        };
         let mut source = Self {
-            reader,
+            reader: Source::new(path)?,
             head: None,
             key: String::new(),
-            path: path.display().to_string(),
         };
         source.advance()?;
         if let Some(head) = &source.head {
@@ -42,30 +35,7 @@ impl Archive {
         Ok(source)
     }
     fn advance(&mut self) -> Result<()> {
-        let mut line = String::new();
-        self.head = if self.reader.read_line(&mut line)? == 0 || !line.ends_with('\n') {
-            None // Snapshot the open file, including complete lines only.
-        } else {
-            let record = crate::input::recover_archived(&line, None)?;
-            if record.offset.is_none() {
-                return Err(error("as_live requires archived Kafka offsets"));
-            }
-            let key = partition_key(&record)?;
-            if !self.key.is_empty() && self.key != key {
-                return Err(error(format!("mixed partitions in {}", self.path)));
-            }
-            if self
-                .head
-                .as_ref()
-                .is_some_and(|prev| prev.offset >= record.offset)
-            {
-                return Err(error(format!(
-                    "non-increasing archived offsets in {}",
-                    self.path
-                )));
-            }
-            Some(record)
-        };
+        self.head = self.reader.next()?;
         Ok(())
     }
 }
