@@ -145,3 +145,21 @@ Grafana compares predictions with exact `mid_e9` endpoints on the versioned
 Binance reference and shows directional hit rate for matured, non-flat outcomes
 in the visible range. Roughly nine-hour models verify plumbing only; several
 weeks are needed for meaningful evaluation.
+
+## Daily report
+
+```bash
+PYTHON_DOTENV_DISABLED=1 uv run python scripts/report_daily.py --date 2026-10-17 --allow-open
+```
+
+Writes new `data/reports/YYYYMMDD.md` and `.json` files (existing reports are refused).
+Use `--root` for another data directory; omit `--allow-open` to require closed inputs.
+The scan is read-only, bounds live-file reads at their captured sizes, and parses native
+payloads only for a deterministic freshness sample. Reports include coverage, per-stream
+drops and deduplicated connection incidents, minute rates, offset gaps, freshness, gzip
+estimates, disk runway and S3 projections. Closed metadata supplies verified counts;
+open-file metadata is ignored. Gzip estimates use up to 64 MiB per stream; freshness
+uses up to 8,192 byte-spaced frames per stream, with missing clocks excluded.
+Prices come from exported `S3_PRICE_GB_MONTH` / `S3_PRICE_PUT_PER_1000` or the defaults
+in `.env.example`; the report never loads `.env` or contacts AWS/Kafka. Local archive
+retention does not expire S3 objects, so the report shows growing S3 monthly run-rate.

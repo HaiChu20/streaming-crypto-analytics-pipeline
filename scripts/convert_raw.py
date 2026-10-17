@@ -170,9 +170,10 @@ def convert(root: Path, output: Path, *, legacy=False, exchange=None, market=Non
                 tomorrow = (datetime.fromisoformat(day) + timedelta(days=1)).strftime("%Y%m%d")
                 dst.write(rawfmt.rollover(tomorrow))
                 rows += 1
-        write_meta(target, extra={"synthetic_offsets": legacy,
-                               **({"orphan_records": state.orphan_records, "orphan_epochs": state.orphan_epochs} if legacy else {}),
-                               **({"offset_source": "zero-based source line index"} if legacy else {})}, exclusive=True)
+        if not target.name.endswith(".open"):
+            write_meta(target, extra={"synthetic_offsets": legacy,
+                                   **({"orphan_records": state.orphan_records, "orphan_epochs": state.orphan_epochs} if legacy else {}),
+                                   **({"offset_source": "zero-based source line index"} if legacy else {})}, exclusive=True)
         info = dict(source=str(source), output=str(target), rows=rows, bytes_in=source.stat().st_size,
                     bytes_out=target.stat().st_size, partial_bytes=partial_bytes,
                     seconds=round(time.perf_counter() - start, 3),

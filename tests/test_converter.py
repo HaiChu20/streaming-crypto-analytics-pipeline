@@ -21,6 +21,7 @@ def test_v1_preserves_offsets_connection_open_and_tail(tmp_path):
     report = convert(tmp_path / 'v1', out)
     target = out / 'kraken/spot/BTC-USD/20261016_l2.jsonl.open'
     r = json.loads(target.read_bytes())
+    assert not target.with_name(target.name + '.meta.json').exists()
     assert r['offset'] == 42 and r['conn'] == 'original'
     assert r['data'][0]['price'] == '1.2300'
     assert report[0]['partial_bytes'] == len(b'{"partial":')
@@ -105,3 +106,13 @@ def test_legacy_unconnected_data_has_separate_orphan_epochs():
     assert emit(data, 5) == after
     assert len({first, live, after}) == 3
     assert state.orphan_records == 3
+
+
+def test_legacy_open_has_no_metadata(tmp_path):
+    source = tmp_path / 'legacy/BTC-USD/20261016_book.jsonl.open'
+    source.parent.mkdir(parents=True)
+    source.write_text(json.dumps(dict(marker='ws_event', event='connected', conn='c', recv_time_ns=1)) + '\n')
+    report = convert(tmp_path / 'legacy', tmp_path / 'out', legacy=True, exchange='kraken', market='spot')
+    target = Path(report[0]['output'])
+    assert target.name.endswith('.open')
+    assert not target.with_name(target.name + '.meta.json').exists()
