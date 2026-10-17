@@ -32,6 +32,41 @@ uv run python scripts/check_raw.py                       # data-quality report o
 - `uv run python scripts/probe_feeds.py --seconds 60`: subscribes to every feed without Kafka, saves test fixtures, and prints rates and GiB/day.
 - `uv run pytest`: unit tests.
 
+## Phase 2: S3 archive
+
+Requires Terraform >=1.13.4 and the AWS CLI (`brew install terraform awscli`). Fill the AWS/S3
+fields in `.env`: `AWS_ADMIN_PROFILE` names an existing admin profile used only during setup;
+`AWS_PROFILE` defaults to `crypto-archiver`, the least-privilege profile used by the daily job.
+Then run:
+
+```bash
+scripts/aws_setup.sh
+scripts/install_launchd.sh
+```
+
+This creates a private, AES256-encrypted bucket, a monthly budget with email alerts, and an
+archiver IAM user/profile with only list/read/write permissions. It is safe to rerun:
+`terraform apply` is idempotent, and a key is created only once, when the archiver profile has
+no access key configured. The key goes directly into the named AWS profile, never into the
+repo or Terraform state. Terraform uses local state in
+`infra/terraform/`; keep that state safe and retain `.terraform.lock.hcl` in version control.
+The launchd installer schedules the hourly job (minute 15); its UTC logs go to
+`data/logs/archive.log`. The job catches up past UTC dates, compresses and verifies closed
+files, and writes each S3 manifest last. Open/missing streams keep a day provisional.
+Kraken auth streams with no files and no API key are skipped; existing files are archived
+regardless of today's key. Offset gaps are recorded even when a day is complete. Engine
+files will be added when the engine exists.
+
+```bash
+uv run python -m archiver.archive_daily --date 2026-10-17
+uv run python -m archiver.archive_daily --verify 2026-10-17
+```
+
+Local deletion is disabled while `ARCHIVE_DELETE_LOCAL_AFTER_H` is empty. After verifying
+downloaded days, set it to `48` to follow the plan: raw files and metadata are removed only
+after the complete manifest has aged 48 hours and every object's metadata matches its hash.
+The temporary `.gz` is removed after each verified upload.
+
 ## Layout
 
 ```text

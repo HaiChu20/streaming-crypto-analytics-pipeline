@@ -9,3 +9,9 @@ __pycache__/
 # Local market data, collector state, and old Kafka bind-mount data
 data/
 kafka-data/
+
+# Terraform uses local state; keep .terraform.lock.hcl in version control.
+infra/terraform/.terraform/
+*.tfstate
+*.tfstate.*
+*.tfplan

@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.crypto-pipeline.archive</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>__PROJECT_ROOT__/.venv/bin/python</string>
+    <string>-m</string><string>archiver.archive_daily</string>
+  </array>
+  <key>WorkingDirectory</key><string>__PROJECT_ROOT__</string>
+  <key>StartCalendarInterval</key>
+  <dict><key>Minute</key><integer>15</integer></dict>
+  <key>StandardOutPath</key><string>__PROJECT_ROOT__/data/logs/archive.log</string>
+  <key>StandardErrorPath</key><string>__PROJECT_ROOT__/data/logs/archive.log</string>
+</dict>
+</plist>

@@ -5,6 +5,7 @@ description = "BTC/ETH spot + perp market data from Kraken, Binance and OKX via 
 readme = "README.md"
 requires-python = ">=3.12,<3.13"
 dependencies = [
+    "boto3==1.40.56",
     "confluent-kafka==2.15.1",
     "httpx==0.28.1",
     "orjson==3.12.0",
