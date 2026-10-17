@@ -32,6 +32,30 @@ uv run python scripts/check_raw.py                       # data-quality report o
 - `uv run python scripts/probe_feeds.py --seconds 60`: subscribes to every feed without Kafka, saves test fixtures, and prints rates and GiB/day.
 - `uv run pytest`: unit tests.
 
+Raw disk files use **v2**: native JSON with exact decimal tokens stored as strings,
+plus `recv_time_ns`, `conn`, and Kafka `offset`. Non-object payloads and native
+key collisions carry the exact original text in `raw`. In-band connection markers delimit
+epochs; closed day files end with a rollover marker. Kafka envelopes and probe fixtures
+remain v1. Symbols replace `/` with `-`; `.jsonl.open` files are still being written.
+
+Convert originals into a new tree (existing outputs are refused):
+
+```bash
+PYTHON_DOTENV_DISABLED=1 uv run python scripts/convert_raw.py data/raw --output-root /path/to/new-raw
+PYTHON_DOTENV_DISABLED=1 uv run python scripts/convert_raw.py data/Test/BTC-USD --legacy --exchange kraken --market spot --output-root /path/to/new-raw
+PYTHON_DOTENV_DISABLED=1 uv run python scripts/check_raw.py --root /path/to/new-raw --present-only
+```
+
+Legacy gzip recordings stay gzip. Their offsets are synthetic zero-based source line
+indices per file (flagged in metadata); connections receive a new `#n` epoch at each
+`connected`. Data outside an active connection gets a separate `#pre<n>` carrier
+and is counted as `orphan_records`. Public Kraken instrument metadata is copied from matching recorded v1
+starts when available, with `instrument_source: "copied"`. Conversion streams input,
+leaves originals untouched, and skips incomplete tails only for `.open` files.
+`check_raw --json` includes per-file line/CRC counts, connection counts, and trade ID
+duplicates and observed gaps. Trade ID gaps are informational. Use
+`scripts/pipeline.sh restart <name>` to restart just one service.
+
 ## Phase 2: S3 archive
 
 Requires Terraform >=1.13.4 and the AWS CLI (`brew install terraform awscli`). Fill the AWS/S3
@@ -71,9 +95,9 @@ The temporary `.gz` is removed after each verified upload.
 
 ```text
 collectors/        exchange collectors: binance.py, okx.py, kraken.py; common/ (config, envelope, sinks, runner)
-archiver/          record_raw.py: Kafka → data/raw/date=…/exchange=…/market=…/feed=…/<SYMBOL>.jsonl
+archiver/          record_raw.py + rawfmt.py: Kafka → data/raw/<exchange>/<market>/<SYMBOL>/<YYYYMMDD>_<feed>.jsonl
 config/            markets.yaml: exchanges, symbols, feeds, partitions, rotation
-scripts/           create_topics.py, probe_feeds.py, check_raw.py, pipeline.sh
+scripts/           create_topics.py, probe_feeds.py, convert_raw.py, check_raw.py, pipeline.sh
 docker/kafka/      single KRaft broker + kafka-ui
 tests/             unit tests + fixtures (live captures, Kraken checksum examples)
 ```

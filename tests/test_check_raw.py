@@ -221,3 +221,77 @@ def test_collector_crash_carrier_stays_checkable(tmp_path, monkeypatch, later_ga
         assert "seqId break" in result["errors"][0]
     assert result["events"]["drop:collector_crash"] == 1
     assert result["events"]["start"] == 1
+
+
+@pytest.mark.parametrize('feed', ['l2', 'l3'])
+@pytest.mark.parametrize('bad', [False, True])
+def test_v2_kraken_crc_pass_and_fail(tmp_path, feed, bad):
+    import json
+    from archiver import rawfmt
+    stream = replace(BOOK, exchange='kraken', symbol='BTC/USD', feed=feed)
+    source = Path(f'tests/fixtures/kraken_docs/{feed}_checksum_example.json')
+    payload = source.read_text()
+    if bad:
+        p = json.loads(payload, parse_float=str)
+        p['data'][0]['checksum'] = 1
+        payload = json.dumps(p)
+    path = tmp_path/'20261016_l2.jsonl'
+    e = dict(kind='snapshot', payload=payload, recv_ns=1, conn='c', exchange='kraken')
+    path.write_bytes(rawfmt.line(e, 0) + rawfmt.rollover('20261017'))
+    result = check_raw.check_stream(stream, [path], 100, True)
+    assert result['crc_fail'] == int(bad)
+    assert result['crc_pass'] == int(not bad)
+    assert len(result['errors']) == int(bad)
+    assert result['file_stats'][0]['lines'] == 2
+
+
+def test_v2_discovery_and_date_filter(tmp_path):
+    from archiver.record_raw import stream_path
+    for day in ['2026-10-15', '2026-10-16']:
+        p = stream_path(tmp_path, BOOK, day)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.with_name(p.name+'.open').touch()
+    found = check_raw.files_for(tmp_path, BOOK, ['2026-10-16'])
+    assert len(found) == 1 and found[0].name == '20261016_l2.jsonl.open'
+    assert check_raw.files_for(tmp_path/'raw', BOOK, None, raw_root=True) == check_raw.files_for(tmp_path, BOOK, None)
+
+
+def test_restart_only_targets_named_service(tmp_path):
+    script = pipeline_copy(tmp_path)
+    # Fake all process operations, including start; no signals or real services.
+    text = script.read_text().replace('case "${1:-}" in', '''
+alive() { [[ "$1" == binance && ! -f data/stopped ]]; }
+kill() { echo "$*" >> data/signals; touch data/stopped; }
+nohup() { echo "$*" >> data/started; }
+sleep() { :; }
+case "${1:-}" in''')
+    # The post-start liveness check is also simulated.
+    text = text.replace('if ! alive "$name"; then echo "FAILED to start $name, see data/logs/$name.log" >&2; exit 1; fi', ':')
+    script.write_text(text)
+    state = tmp_path/'data/state'
+    state.mkdir(parents=True)
+    (state/'binance.pid').write_text('999999999')
+    result = subprocess.run(['bash', str(script), 'restart', 'binance'], capture_output=True, text=True, timeout=10)
+    assert result.returncode == 0
+    assert (tmp_path/'data/signals').read_text().strip() == '-TERM 999999999'
+    assert '-m collectors binance' in (tmp_path/'data/started').read_text()
+    assert not (state/'okx.pid').exists()
+    bad = subprocess.run(['bash', str(script), 'restart', 'unknown'], capture_output=True, text=True)
+    assert bad.returncode == 2
+
+
+def test_v2_raw_fallback_checks_native_collision_and_skips_invalid_text(tmp_path):
+    import json
+    from archiver import rawfmt
+    stream = replace(BOOK, exchange='kraken', symbol='BTC/USD')
+    doc = Path('tests/fixtures/kraken_docs/l2_checksum_example.json').read_text()
+    native = json.loads(doc, parse_float=str)
+    native['offset'] = 999  # force exact-raw fallback
+    e = dict(kind='snapshot', payload=json.dumps(native), recv_ns=1, conn='c', exchange='kraken',
+             market='spot', symbol='BTC/USD', feed='l2')
+    path = tmp_path/'20261016_l2.jsonl'
+    path.write_bytes(rawfmt.line(e, 0) + rawfmt.line(dict(e, kind='update', payload='bad json'), 1))
+    result = check_raw.check_stream(stream, [path], 100, True)
+    assert result['records'] == 2
+    assert result['crc_pass'] == 1
+    assert not result['errors']

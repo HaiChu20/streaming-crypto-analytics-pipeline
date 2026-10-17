@@ -83,6 +83,7 @@ class DailyArchive:
     def _upload(self, path: Path) -> dict:
         meta = orjson.loads(path.with_name(path.name + ".meta.json").read_bytes())
         info = {k: meta[k] for k in ("lines", "bytes", "sha256", "offset_gaps", "foreign_day_records")}
+        info["format"] = meta["format"]
         info.update(first_offset=meta.get("first_offset"), last_offset=meta.get("last_offset"))
         key = path.relative_to(self.root).as_posix() + ".gz"
         info["key"] = key
@@ -166,7 +167,10 @@ class DailyArchive:
         paths = []
         for file in manifest["files"]:
             key = file["key"]
-            if not key.startswith(f"raw/date={manifest['date']}/") or ".." in Path(key).parts or not key.endswith(".jsonl.gz"):
+            parts = Path(key).parts
+            expected_name = manifest["date"].replace("-", "") + "_"
+            if (len(parts) != 5 or parts[0] != "raw" or ".." in parts
+                    or not parts[-1].startswith(expected_name) or not parts[-1].endswith(".jsonl.gz")):
                 raise ValueError(f"invalid archive key: {key}")
             head = self._head(key)
             if head is None or head.get("Metadata", {}).get("raw-sha256") != file["sha256"]:
@@ -192,9 +196,13 @@ class DailyArchive:
 
     def run(self, now: datetime | None = None) -> None:
         now = now or datetime.now(timezone.utc)
-        for path in sorted((self.root / "raw").glob("date=*")):
-            day = path.name.removeprefix("date=")
-            if date.fromisoformat(day) < now.date() and any(path.rglob("*.jsonl*")):
+        days = set()
+        for path in (self.root / "raw").glob("*/*/*/*.jsonl*"):
+            token = path.name.split("_", 1)[0]
+            if len(token) == 8 and token.isdigit():
+                days.add(f"{token[:4]}-{token[4:6]}-{token[6:8]}")
+        for day in sorted(days):
+            if date.fromisoformat(day) < now.date():
                 try:
                     self.archive_day(day, now)
                 except Exception:

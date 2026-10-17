@@ -21,6 +21,15 @@ from collectors.common.envelope import control_record, data_record
 from collectors.common.session import Session
 
 log = logging.getLogger(__name__)
+_last_recv_ns = 0
+
+
+def stamp(recv_ns: int | None = None) -> int:
+    """One process-wide clock clamp at the envelope stamping point (no await)."""
+    global _last_recv_ns
+    _last_recv_ns = max(time.time_ns() if recv_ns is None else recv_ns, _last_recv_ns)
+    return _last_recv_ns
+
 
 
 class Disabled(Exception):
@@ -82,7 +91,7 @@ class ConnRun:
     def emit(self, stream: Stream, kind: str, payload: str, recv_ns: int) -> None:
         if stream.key not in self.started:
             self.start_stream(stream)
-        value = data_record(stream, kind, self.conn, self._next_seq(), recv_ns, payload)
+        value = data_record(stream, kind, self.conn, self._next_seq(), stamp(recv_ns), payload)
         if self.sink.send(stream, value):
             self.sup.stats.add(stream, len(value))
         if stream.key not in self.received:
@@ -90,7 +99,7 @@ class ConnRun:
             self._check_ready()
 
     def control(self, stream: Stream, event: str, reason: str | None = None, detail: dict | None = None) -> bool:
-        value = control_record(stream, event, self.conn, self._next_seq(), time.time_ns(), reason, detail)
+        value = control_record(stream, event, self.conn, self._next_seq(), stamp(), reason, detail)
         return self.sink.send(stream, value)
 
     def start_stream(self, stream: Stream, ack: object = None) -> None:

@@ -10,7 +10,7 @@ import orjson
 import pytest
 from botocore.exceptions import ClientError
 
-from archiver import archive_daily
+from archiver import archive_daily, rawfmt
 from archiver.archive_daily import DailyArchive
 from archiver.record_raw import OPEN, stream_path, write_meta
 from collectors.common.config import all_streams
@@ -80,10 +80,7 @@ def day_file(root, stream, day=DAY, opened=False, gaps=False):
     lines = []
     for offset in (0, 2 if gaps else 1):
         value = data_record(stream, "snapshot", "c", offset, recv_ns, "{}")
-        lines.append(
-            value[:-1] + b',"topic":"%s","partition":%d,"offset":%d}\n' %
-            (stream.topic.encode(), stream.partition, offset)
-        )
+        lines.append(rawfmt.line(value, offset))
     path.write_bytes(b"".join(lines))
     if not opened:
         write_meta(path)
@@ -272,3 +269,11 @@ def test_verify_cli_exits_one_on_corruption(tmp_path, monkeypatch):
     with pytest.raises(SystemExit) as exc:
         archive_daily.main()
     assert exc.value.code == 1
+
+
+def test_archive_uses_v2_s3_key(tmp_path):
+    s3 = FakeS3()
+    day_file(tmp_path, all_streams(CFG)[0])
+    manifest = DailyArchive(tmp_path, CFG, s3, 'bucket').archive_day(DAY, NOW)
+    assert manifest['files'][0]['key'] == 'raw/kraken/spot/BTC-USD/20261016_l2.jsonl.gz'
+    assert manifest['files'][0]['format'] == 'v2'

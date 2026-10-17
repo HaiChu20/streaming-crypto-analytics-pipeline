@@ -9,19 +9,21 @@
 """
 
 import argparse
+import gzip
 import hashlib
 import logging
 import os
 import signal
 import time
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from functools import lru_cache
 from pathlib import Path
 
 import orjson
 from confluent_kafka import OFFSET_BEGINNING, Consumer, KafkaError, KafkaException, TopicPartition
 
+from archiver import rawfmt
 from collectors.common.config import Stream, data_dir, kafka_bootstrap, load_config, stream_index
 from collectors.common.lock import single_instance
 
@@ -41,34 +43,41 @@ def _day_date(day: int) -> str:
 
 
 def _file_date(path: Path) -> str:
-    return next(part for part in path.parts if part.startswith("date=")).removeprefix("date=")
+    day = path.name.split("_", 1)[0]
+    return f"{day[:4]}-{day[4:6]}-{day[6:8]}"
 
 
 def stream_path(root: Path, stream: Stream, date: str) -> Path:
-    return (
-        root / "raw" / f"date={date}" / f"exchange={stream.exchange}" / f"market={stream.market}"
-        / f"feed={stream.feed}" / f"{stream.file_symbol}.jsonl"
-    )
+    return rawfmt.path(root / "raw", stream.exchange, stream.market, stream.symbol, date, stream.feed)
 
 
 def last_line(path: Path) -> bytes | None:
-    """Last complete line of a file, reading backwards from the end."""
+    """Last complete line with an offset, skipping rollover markers; bounded memory."""
     with open(path, "rb") as f:
         f.seek(0, os.SEEK_END)
-        end = f.tell()
-        if end == 0:
-            return None
-        chunk, pos, buf = 1 << 16, end, b""
-        while pos > 0:
-            step = min(chunk, pos)
+        pos, buf = f.tell(), b""
+        while pos:
+            step = min(1 << 16, pos)
             pos -= step
             f.seek(pos)
-            buf = f.read(step) + buf
-            # buf ends with "\n"; find the newline before the last line
-            idx = buf.rfind(b"\n", 0, len(buf) - 1)
-            if idx >= 0:
-                return buf[idx + 1 : -1]
-        return buf[:-1]
+            parts = (f.read(step) + buf).split(b"\n")
+            buf = parts[0]
+            for line in reversed(parts[1:]):
+                if line:
+                    try:
+                        rec = orjson.loads(line)
+                    except orjson.JSONDecodeError:
+                        rec = rawfmt.loads(line.decode())
+                    if "offset" in rec:
+                        return line
+        if buf:
+            try:
+                rec = orjson.loads(buf)
+            except orjson.JSONDecodeError:
+                rec = rawfmt.loads(buf.decode())
+            if "offset" in rec:
+                return buf
+    return None
 
 
 def repair(path: Path) -> None:
@@ -93,7 +102,7 @@ def repair(path: Path) -> None:
             f.truncate(keep)
 
 
-def write_meta(path: Path) -> None:
+def write_meta(path: Path, *, extra: dict | None = None, exclusive: bool = False) -> None:
     """Write <file>.meta.json for a closed day file: count, offsets, time range, sha256."""
     sha, lines, size = hashlib.sha256(), 0, 0
     first = None
@@ -101,14 +110,19 @@ def write_meta(path: Path) -> None:
     offset_gaps = []
     foreign_day_records = 0
     date = _file_date(path)
-    with open(path, "rb") as f:
+    with (gzip.open(path, "rb") if path.suffix == ".gz" else open(path, "rb")) as f:
         for line in f:
             sha.update(line)
             lines += 1
             size += len(line)
-            offset = int(line[line.rfind(b',"offset":') + 10 : -2])
-            i = line.index(b'"recv_ns":') + 10
-            recv_ns = int(line[i : line.index(b",", i)])
+            try:
+                rec = orjson.loads(line)
+            except orjson.JSONDecodeError:
+                rec = rawfmt.loads(line.decode())
+            if rec.get("marker") == "rollover":
+                continue
+            offset = rec["offset"]
+            recv_ns = rec["recv_time_ns"]
             if first is None:
                 first = (offset, recv_ns)
             elif offset != last_offset + 1:
@@ -116,13 +130,18 @@ def write_meta(path: Path) -> None:
             last_offset, last_recv_ns = offset, recv_ns
             foreign_day_records += utc_date(recv_ns) != date
     meta = {
-        "file": path.name, "lines": lines, "bytes": size, "sha256": sha.hexdigest(),
+        "format": "v2", "file": path.name, "lines": lines, "bytes": size, "sha256": sha.hexdigest(),
         "offset_gaps": offset_gaps, "foreign_day_records": foreign_day_records,
     }
     if first is not None:
         meta.update(
             first_offset=first[0], last_offset=last_offset, first_recv_ns=first[1], last_recv_ns=last_recv_ns
         )
+    meta.update(extra or {})
+    if exclusive:
+        with path.with_name(path.name + ".meta.json").open("xb") as f:
+            f.write(orjson.dumps(meta, option=orjson.OPT_INDENT_2))
+        return
     tmp = path.with_name(path.name + ".meta.tmp")
     tmp.write_bytes(orjson.dumps(meta, option=orjson.OPT_INDENT_2))
     os.replace(tmp, path.with_name(path.name + ".meta.json"))
@@ -146,7 +165,10 @@ class StreamWriter:
         self.date = date
         self.foreign_reported = False
 
-    def close_day(self) -> None:
+    def close_day(self, new_period: str | None = None) -> None:
+        if new_period is None:
+            new_period = (datetime.fromisoformat(self.date) + timedelta(days=1)).strftime("%Y%m%d")
+        self.fh.write(rawfmt.rollover(new_period))
         self.fh.flush()
         os.fsync(self.fh.fileno())
         self.fh.close()
@@ -166,7 +188,7 @@ class StreamWriter:
         if self.date is None:
             self.open(date)
         elif date > self.date:
-            self.close_day()
+            self.close_day(date)
             self.open(date)
         # date < self.date (clock stepped back) stays in the current file: days never reopen.
         self.fh.write(line)
@@ -213,12 +235,15 @@ class Recorder:
                 if path.name.endswith(OPEN):
                     repair(path)
                     if path.stat().st_size == 0:
-                        path.unlink()
                         continue
                 line = last_line(path)
                 if not line:
                     continue
-                resume[key] = orjson.loads(line)["offset"] + 1
+                try:
+                    rec = orjson.loads(line)
+                except orjson.JSONDecodeError:
+                    rec = rawfmt.loads(line.decode())
+                resume[key] = rec["offset"] + 1
                 if path.name.endswith(OPEN):
                     # keep appending to the open day so its first next-day record closes it
                     self.writers[key].open(_file_date(path))
@@ -234,13 +259,13 @@ class Recorder:
         if expected is not None and offset != expected:
             log.error("%s/%d: offset jump %d -> %d (data expired from Kafka?)", topic, partition, expected, offset)
         self.expected[key] = offset + 1
-        i = value.index(b'"recv_ns":') + 10
-        recv_ns = int(value[i : value.index(b",", i)])
+        envelope = orjson.loads(value)
+        recv_ns = envelope["recv_ns"]
         date = utc_date(recv_ns)
         if writer.date is not None and date < writer.date and not writer.foreign_reported:
             writer.foreign_reported = True
             log.warning("%s/%d: clock stepped back to %s; keeping record in day %s", topic, partition, date, writer.date)
-        line = value[:-1] + b',"topic":"%s","partition":%d,"offset":%d}\n' % (topic.encode(), partition, offset)
+        line = rawfmt.line(envelope, offset)
         writer.write(date, line, offset)
 
     def sync(self) -> list[TopicPartition]:

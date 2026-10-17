@@ -475,3 +475,24 @@ def test_lag_probe_and_stats_interval_reset(monkeypatch, caplog):
     asyncio.run(check())
 
 
+
+
+def test_process_receive_clock_never_goes_backwards(monkeypatch):
+    from collectors.common import runner
+    monkeypatch.setattr(runner, "_last_recv_ns", 0)
+    clock = iter([100, 90, 90, 120])
+    monkeypatch.setattr(runner.time, "time_ns", lambda: next(clock))
+    assert [runner.stamp() for _ in range(4)] == [100, 100, 100, 120]
+    assert runner.stamp(110) == 120  # buffered frames share the same clamp
+
+
+def test_envelope_stamp_shared_between_connections_and_controls(monkeypatch):
+    monkeypatch.setattr(runner, '_last_recv_ns', 0)
+    monkeypatch.setattr(runner.time, 'time_ns', lambda: 100)
+    sup = supervisor(feed='trades')
+    a, b = ConnRun(sup), ConnRun(sup)
+    stream = sup.spec.streams[0]
+    a.emit(stream, 'trade', '{}', 90)  # auto-start at 100 precedes this older frame
+    b.emit(stream, 'trade', '{}', 80)
+    a.control(stream, 'stop', 'rotation')
+    assert [r['recv_ns'] for r in sup.sink.records] == [100] * 5

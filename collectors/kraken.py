@@ -14,6 +14,8 @@ import os
 import time
 import urllib.parse
 import zlib
+from bisect import insort
+from datetime import datetime
 from decimal import Decimal
 
 import orjson
@@ -38,6 +40,27 @@ def _fmt(value: Decimal) -> str:
 
 def _decimal_json(text: str) -> dict:
     return json.loads(text, parse_float=Decimal, parse_int=Decimal)
+
+
+class L3TimestampError(ValueError):
+    """A level3 order cannot be placed in timestamp queue order."""
+
+
+def _l3_timestamp(value: str) -> str:
+    if isinstance(value, str) and len(value) == 30:
+        return value  # Kraken's usual nine fractional digits need no normalization.
+    try:
+        if not isinstance(value, str) or not value.endswith("Z"):
+            raise ValueError
+        body = value[:-1]
+        base, dot, fraction = body.partition(".")
+        if (len(base) != 19 or (dot and not fraction) or len(fraction) > 9
+                or (fraction and not (fraction.isascii() and fraction.isdigit()))):
+            raise ValueError
+        datetime.strptime(base, "%Y-%m-%dT%H:%M:%S")
+        return base + "." + fraction.ljust(9, "0") + "Z"
+    except ValueError as exc:
+        raise L3TimestampError("invalid level3 order timestamp") from exc
 
 
 class L2Book:
@@ -72,52 +95,59 @@ class L2Book:
 
 
 class L3Book:
-    """Price -> {order_id: qty} per side (insertion = queue order), truncated to the subscribed depth."""
+    """Price -> timestamp-ordered order queue, truncated to the subscribed depth."""
 
     def __init__(self, depth: int):
         self.depth = depth
-        self.sides: dict[str, dict[Decimal, dict[str, Decimal]]] = {"bids": {}, "asks": {}}
+        self.sides: dict[str, dict[Decimal, list[tuple[str, int, str, Decimal]]]] = {"bids": {}, "asks": {}}
         self.where: dict[str, tuple[str, Decimal]] = {}
+        self.seq = 0
+
+    def _remove(self, oid: str) -> None:
+        location = self.where.pop(oid, None)
+        if location is None:
+            return
+        side, price = location
+        level = self.sides[side][price]
+        for i, (_, _, order_id, _) in enumerate(level):
+            if order_id == oid:
+                level.pop(i)
+                break
+        if not level:
+            del self.sides[side][price]
 
     def apply(self, data: dict, snapshot: bool) -> None:
         if snapshot:
             self.sides = {"bids": {}, "asks": {}}
             self.where = {}
+            self.seq = 0
         for side in ("bids", "asks"):
             book = self.sides[side]
-            # Snapshot and add events arrive in queue order; insertion order keeps it.
             for order in data.get(side, []):
                 oid = order["order_id"]
                 event = "add" if snapshot else order.get("event")
-                if event == "delete":
-                    side_, price = self.where.pop(oid, (side, _num(order.get("limit_price", 0))))
-                    level = self.sides[side_].get(price)
-                    if level is not None:
-                        level.pop(oid, None)
-                        if not level:
-                            del self.sides[side_][price]
-                elif event == "modify" and oid in self.where:
-                    side_, price = self.where[oid]
-                    self.sides[side_][price][oid] = _num(order["order_qty"])
-                else:  # add
+                timestamp = _l3_timestamp(order.get("timestamp")) if event in ("add", "modify") else None
+                self._remove(oid)
+                if event in ("add", "modify"):
                     price = _num(order["limit_price"])
-                    book.setdefault(price, {})[oid] = _num(order["order_qty"])
+                    self.seq += 1
+                    insort(book.setdefault(price, []), (timestamp, self.seq, oid, _num(order["order_qty"])))
                     self.where[oid] = (side, price)
         for side, best_first in (("bids", True), ("asks", False)):
             book = self.sides[side]
             if len(book) > self.depth:
                 for price in sorted(book, reverse=best_first)[self.depth :]:
-                    for oid in book.pop(price):
+                    for _, _, oid, _ in book.pop(price):
                         self.where.pop(oid, None)
 
     def checksum(self) -> int:
         asks = self.sides["asks"]
         bids = self.sides["bids"]
         text = "".join(
-            _fmt(p) + _fmt(qty) for p in sorted(asks)[:10] for qty in asks[p].values()
+            _fmt(p) + _fmt(qty) for p in sorted(asks)[:10] for _, _, _, qty in asks[p]
         )
         text += "".join(
-            _fmt(p) + _fmt(qty) for p in sorted(bids, reverse=True)[:10] for qty in bids[p].values()
+            _fmt(p) + _fmt(qty) for p in sorted(bids, reverse=True)[:10] for _, _, _, qty in bids[p]
         )
         return zlib.crc32(text.encode()) & 0xFFFFFFFF
 
@@ -209,15 +239,19 @@ class KrakenSpotHandler(Handler):
 
     def _check_book(self, run: ConnRun, stream: Stream, text: str, snapshot: bool) -> None:
         data = _decimal_json(text)["data"][0]
-        if snapshot:
-            depth = self.spec.options["depth"][stream.feed]
-            book = self.books[stream.key] = L3Book(depth) if stream.feed == "l3" else L2Book(depth)
-            book.apply(data, snapshot=True)
-        else:
-            book = self.books.get(stream.key)
-            if book is None:
-                return
-            book.apply(data, snapshot=False)
+        try:
+            if snapshot:
+                depth = self.spec.options["depth"][stream.feed]
+                book = self.books[stream.key] = L3Book(depth) if stream.feed == "l3" else L2Book(depth)
+                book.apply(data, snapshot=True)
+            else:
+                book = self.books.get(stream.key)
+                if book is None:
+                    return
+                book.apply(data, snapshot=False)
+        except L3TimestampError:
+            run.gap(stream, "book_anomaly", {"error": "invalid_l3_timestamp", "snapshot": snapshot})
+            return
         got = book.checksum()
         expected = int(data["checksum"])
         if got != expected:
