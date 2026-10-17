@@ -10,10 +10,6 @@ from collectors.common.config import Stream
 
 SCHEMA_VERSION = 1
 
-KINDS = {"snapshot", "update", "trade", "control"}
-CONTROL_EVENTS = {"start", "stop", "drop"}
-DROP_REASONS = {"disconnect", "sequence_gap", "checksum_mismatch", "kafka_unavailable", "collector_crash"}
-
 
 def data_record(stream: Stream, kind: str, conn: str, seq: int, recv_ns: int, payload: str) -> bytes:
     return orjson.dumps(

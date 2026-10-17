@@ -13,8 +13,9 @@ Exits 1 if any error is found.
 """
 
 import argparse
+import os
 import sys
-from collections import Counter, defaultdict
+from collections import Counter, deque
 from pathlib import Path
 
 import orjson
@@ -23,7 +24,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from archiver.record_raw import OPEN, stream_path  # noqa: E402
 from collectors.binance import PerpDepthSync, SpotDepthSync  # noqa: E402
-from collectors.common.config import Stream, all_streams, data_dir, load_config  # noqa: E402
+from collectors.common.config import Stream, all_streams, connections, data_dir, load_config  # noqa: E402
 from collectors.kraken import L2Book, L3Book, _decimal_json  # noqa: E402
 from collectors.okx import BookSeq  # noqa: E402
 
@@ -46,7 +47,6 @@ class BookCheck:
         self.stream = stream
         self.depth = depth
         self.state = None
-        self.verify = True
 
     def feed(self, kind: str, payload_text: str) -> str | None:
         s = self.stream
@@ -80,13 +80,11 @@ class BookCheck:
         if kind == "snapshot":
             self.state = L3Book(self.depth) if s.feed == "l3" else L2Book(self.depth)
             self.state.apply(data, snapshot=True)
-            self.verify = self.state.checksum() == int(data["checksum"])
-            return None if self.verify else "checksum fails on snapshot (verification off)"
+            return None if self.state.checksum() == int(data["checksum"]) else "checksum fails on snapshot"
         if self.state is None:
             return None
         self.state.apply(data, snapshot=False)
-        if self.verify and self.state.checksum() != int(data["checksum"]):
-            self.verify = False
+        if self.state.checksum() != int(data["checksum"]):
             return "checksum mismatch"
         return None
 
@@ -103,8 +101,11 @@ def check_stream(stream: Stream, paths: list[Path], depth: int | None, deep: boo
     r = {"records": 0, "files": len(paths), "conns": set(), "events": Counter(), "errors": [], "overlap_dup_trades": 0}
     last_offset = None
     books: dict[str, BookCheck] = {}
+    started: set[str] = set()
     broken: set[str] = set()
-    seen_trades: dict[object, str] = {}
+    pending: dict[str, str] = {}
+    seen_trades: dict[str, set] = {}
+    recent: deque[str] = deque()
     for path in paths:
         with open(path, "rb") as f:
             for raw in f:
@@ -118,29 +119,49 @@ def check_stream(stream: Stream, paths: list[Path], depth: int | None, deep: boo
                 last_offset = off
                 conn = rec["conn"]
                 r["conns"].add(conn)
+                if conn in pending:
+                    err = pending.pop(conn)
+                    if rec["kind"] == "control" and rec["event"] == "drop":
+                        r["events"]["explained_breaks"] += 1
+                    else:
+                        r["errors"].append(err)
                 if rec["kind"] == "control":
                     ev = rec["event"]
                     r["events"][f"{ev}:{rec.get('reason')}" if ev == "drop" else ev] += 1
                     if ev in ("drop", "stop"):
                         broken.add(conn)
+                        started.discard(conn)
+                        books.pop(conn, None)
+                        if conn in recent:
+                            recent.remove(conn)
+                        recent.append(conn)
+                        if len(recent) > 2:
+                            seen_trades.pop(recent.popleft(), None)
+                    elif ev == "start":
+                        started.add(conn)
                     continue
                 if not deep:
                     continue
                 if stream.is_book and conn not in broken:
-                    check = books.setdefault(conn, BookCheck(stream, depth))
-                    err = check.feed(rec["kind"], rec["payload"])
+                    check = books.get(conn)
+                    if check is None:
+                        check = books[conn] = BookCheck(stream, depth)
+                    if conn in started and check.state is None and rec["kind"] != "snapshot" and stream.exchange != "binance":
+                        err = "book update before first snapshot"
+                    else:
+                        err = check.feed(rec["kind"], rec["payload"])
                     if err:
-                        r["errors"].append(f"{err} (conn {conn}, offset {off}) not marked by a drop")
+                        pending[conn] = f"{err} (conn {conn}, offset {off}) not marked by a drop"
                         broken.add(conn)
                 if stream.feed in ("trades", "trades_agg"):
+                    seen = seen_trades.setdefault(conn, set())
                     for tid in trade_ids(stream, orjson.loads(rec["payload"])):
-                        prev = seen_trades.get(tid)
-                        if prev is None:
-                            seen_trades[tid] = conn
-                        elif prev == conn and rec["kind"] != "snapshot":
+                        if tid in seen and rec["kind"] != "snapshot":
                             r["errors"].append(f"duplicate trade id {tid} within conn {conn}")
-                        else:
+                        if any(tid in ids for other, ids in seen_trades.items() if other != conn):
                             r["overlap_dup_trades"] += 1
+                        seen.add(tid)
+    r["errors"].extend(pending.values())
     r["conns"] = len(r["conns"])
     return r
 
@@ -153,16 +174,24 @@ def main() -> None:
 
     cfg = load_config()
     root = data_dir()
+    auth_streams = {
+        s.key for exchange in cfg["exchanges"] for spec in connections(cfg, exchange)
+        if spec.options.get("auth") for s in spec.streams
+    }
     total_errors = 0
     print(f"{'stream':38} {'files':>5} {'records':>9} {'conns':>5}  events / errors")
     for stream in all_streams(cfg):
+        name = f"{stream.exchange}.{stream.market}.{stream.feed}.{stream.symbol}"
         paths = files_for(root, stream, args.date)
         if not paths:
-            print(f"{stream.exchange}.{stream.market}.{stream.feed}.{stream.symbol:<20} no files")
+            if stream.key in auth_streams and "KRAKEN_API_KEY" not in os.environ:
+                print(f"{name:38} skipped (no API key)")
+            else:
+                print(f"{name:38} MISSING")
+                total_errors += 1
             continue
         depth = cfg["exchanges"][stream.exchange][stream.market].get("depth", {}).get(stream.feed)
         r = check_stream(stream, paths, depth, deep=not args.quick)
-        name = f"{stream.exchange}.{stream.market}.{stream.feed}.{stream.symbol}"
         events = " ".join(f"{k}={v}" for k, v in sorted(r["events"].items()))
         if r["overlap_dup_trades"]:
             events += f" overlap_dup_trades={r['overlap_dup_trades']}"

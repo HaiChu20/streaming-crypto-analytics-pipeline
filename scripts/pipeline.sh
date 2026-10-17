@@ -22,19 +22,32 @@ alive() { [[ -f "data/state/$1.pid" ]] && kill -0 "$(cat "data/state/$1.pid")" 2
 
 case "${1:-}" in
   start)
+    failed=0
     for name in "${NAMES[@]}"; do
       if alive "$name"; then echo "$name already running"; continue; fi
       nohup $(cmd_for "$name") >> "data/logs/$name.log" 2>&1 &
       echo $! > "data/state/$name.pid"
       echo "started $name (pid $!)"
       sleep 1
+      if ! alive "$name"; then echo "FAILED to start $name, see data/logs/$name.log"; failed=1; fi
     done
+    if [[ "$failed" -ne 0 ]]; then exit 1; fi
     nohup caffeinate -s -w "$(cat data/state/recorder.pid)" >/dev/null 2>&1 &
     ;;
   stop)
     for name in "${NAMES[@]}"; do
-      if alive "$name"; then kill -TERM "$(cat "data/state/$name.pid")"; echo "stopping $name"; fi
+      if alive "$name"; then kill -TERM "$(cat "data/state/$name.pid")" || true; echo "stopping $name"; fi
     done
+    for attempt in {0..120}; do
+      live=""
+      for name in "${NAMES[@]}"; do
+        if alive "$name"; then live+="$name "; fi
+      done
+      if [[ -z "$live" ]]; then exit 0; fi
+      if [[ "$attempt" -lt 120 ]]; then sleep 0.5; fi
+    done
+    echo "still alive after 60s: $live" >&2
+    exit 1
     ;;
   status)
     for name in "${NAMES[@]}"; do

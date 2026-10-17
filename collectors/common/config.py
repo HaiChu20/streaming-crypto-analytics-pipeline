@@ -13,7 +13,6 @@ CONFIG_PATH = ROOT / "config" / "markets.yaml"
 load_dotenv(ROOT / ".env")
 
 BOOK_FEEDS = {"l2", "l3"}
-TRADE_FEEDS = {"trades", "trades_agg"}
 
 
 @dataclass(frozen=True)
