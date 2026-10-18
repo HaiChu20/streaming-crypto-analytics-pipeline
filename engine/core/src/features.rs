@@ -329,6 +329,9 @@ impl Instrument {
                 self.oi = number(&payload["openInterest"]);
             }
             "liquidations" => {
+                if !self.remember(format!("liq:{}", payload["data"]["o"])) {
+                    return Ok(());
+                }
                 let bucket = self
                     .buckets
                     .entry(window_tick(r.recv_ns, current_tick)?)

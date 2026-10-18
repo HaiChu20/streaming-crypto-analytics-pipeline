@@ -199,6 +199,44 @@ fn trade_overlap_dedup_switches_only_on_first_trade() {
     assert_eq!(r.taker_buy_base, Some(1.0));
     assert_eq!(r.taker_sell_base, Some(0.5));
 }
+fn liquidation(time: i64, conn: &str, quantity: &str) -> Value {
+    let mut v = envelope(
+        "binance",
+        "perp",
+        "liquidations",
+        "update",
+        time,
+        json!({"data":{"e":"forceOrder","E":time / 1_000_000,"o":{"s":"BTCUSDT","S":"SELL","T":1000,"q":"10","z":quantity,"p":"100","ap":"100","X":"FILLED"}}}),
+    );
+    v["conn"] = json!(conn);
+    v
+}
+#[test]
+fn liquidation_overlap_dedup_ignores_envelope_times() {
+    let mut e = Engine::default();
+    for (time, conn) in [(1_000_000, "A"), (2_000_000, "B")] {
+        let mut start = control("liquidations", "start", time, conn);
+        start["market"] = json!("perp");
+        start["topic"] = json!("raw.binance.perp.liquidations.v1");
+        e.consume(&rec(start)).unwrap();
+        e.consume(&rec(liquidation(time, conn, "0.5"))).unwrap();
+    }
+    e.consume(&rec(liquidation(3_000_000, "B", "1.25")))
+        .unwrap();
+    let r = row(&mut e, SECOND);
+    assert_eq!(r.liq_count_1s, Some(2));
+    assert_eq!(r.liq_base_1s, Some(1.75));
+}
+#[test]
+fn liquidations_with_same_order_time_and_different_quantities_both_count() {
+    let mut e = Engine::default();
+    for quantity in ["0.5", "1.25"] {
+        e.consume(&rec(liquidation(SECOND, "A", quantity))).unwrap();
+    }
+    let r = row(&mut e, SECOND);
+    assert_eq!(r.liq_count_1s, Some(2));
+    assert_eq!(r.liq_base_1s, Some(1.75));
+}
 #[test]
 fn okx_ctval_scales_book_and_canonical_trades_per_connection() {
     let mut start = envelope("okx", "perp", "l2", "control", SECOND, Value::Null);
