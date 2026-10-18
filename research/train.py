@@ -11,7 +11,11 @@ import numpy as np
 import polars as pl
 
 from research.dataset import build_matrix, feature_paths, read_features
-from research.labels import NS, load_spec, make_labels
+from research.labels import NS, load_spec, make_labels, reference_for, reference_present
+
+
+class InsufficientHistory(ValueError):
+    """Valid input that cannot yet support the requested walk-forward split."""
 
 
 def walk_forward_folds(tick_ns, horizon_s: int, n_folds: int = 3,
@@ -26,8 +30,10 @@ def walk_forward_folds(tick_ns, horizon_s: int, n_folds: int = 3,
     purge_s = horizon_s if purge_s is None else purge_s
     if horizon_s <= 0 or purge_s < horizon_s:
         raise ValueError("purge_s must be >= the positive label horizon")
-    if n_folds < 1 or len(ticks) < n_folds + 1 or np.any(np.diff(ticks) <= 0):
+    if n_folds < 1 or np.any(np.diff(ticks) <= 0):
         raise ValueError("Need enough strictly time-ordered unique rows for walk-forward folds")
+    if len(ticks) < n_folds + 1:
+        raise InsufficientHistory("Insufficient history for requested folds; collect more data")
     known = ticks + horizon_s * NS
     if label_available_ns is not None:
         known = np.maximum(known, np.asarray(label_available_ns, dtype=np.int64))
@@ -39,7 +45,7 @@ def walk_forward_folds(tick_ns, horizon_s: int, n_folds: int = 3,
         train = np.flatnonzero((ticks + purge_s * NS < ticks[start]) & (known < ticks[start]))
         test = np.arange(start, stop)
         if not len(train) or not len(test):
-            raise ValueError("Insufficient history for requested folds and purge; collect more data")
+            raise InsufficientHistory("Insufficient history for requested folds and purge; collect more data")
         folds.append((train, test))
     return folds
 
@@ -108,20 +114,31 @@ def train_target(rows: pl.DataFrame, target: str, horizon_s: int, output_root: s
         raise ValueError("Horizon is not in the versioned label spec")
     if rounds < 1 or not version or Path(version).name != version or version in {".", ".."}:
         raise ValueError("Need positive rounds and a single directory name for version")
+    if stride_s < 1 or n_folds < 1 or (purge_s is not None and purge_s < horizon_s):
+        raise ValueError("Need positive stride/folds and purge_s >= horizon_s")
+    skipped = {"target": target, "horizon_s": horizon_s, "version": version,
+               "status": "skipped", "reference": reference_for(target, spec)}
+    if not reference_present(rows, target, spec):
+        return dict(skipped, reason="reference instrument has no rows in input")
     matrix, features = build_matrix(rows, target, stride_s, spec)
     labeled = matrix.join(make_labels(rows, target, horizon_s, spec), on="tick_ns", how="left")
     # A delayed emission after the target endpoint cannot be a forecast.
     data = labeled.filter(pl.col("return_pct").is_not_null()
                           & (pl.col("available_ns") < pl.col("label_end_ns"))).sort("tick_ns")
     if not features or data.is_empty():
-        raise ValueError(f"No labeled training data/features for {target}/{horizon_s}")
+        return dict(skipped, reason="not enough labeled rows", matrix_rows=matrix.height,
+                    labeled_rows=data.height)
+    ticks = data["tick_ns"].to_numpy()
+    try:
+        folds = walk_forward_folds(ticks, horizon_s, n_folds, purge_s,
+                                   data["label_available_ns"].to_numpy(), data["available_ns"].to_numpy())
+    except InsufficientHistory as exc:
+        return dict(skipped, reason=f"not enough labeled rows: {exc}",
+                    matrix_rows=matrix.height, labeled_rows=data.height)
     x = data.select(features).to_numpy().astype(np.float64)
     x[~np.isfinite(x)] = np.nan
     y = data["return_pct"].to_numpy()
     directions = data["direction"].to_numpy().astype(np.int32)
-    ticks = data["tick_ns"].to_numpy()
-    folds = walk_forward_folds(ticks, horizon_s, n_folds, purge_s,
-                               data["label_available_ns"].to_numpy(), data["available_ns"].to_numpy())
     momentum = data["momentum_return_900s"].to_numpy() * (horizon_s / 900)
     results, actuals = [], []
     oof = {name: [] for name in ("regressor", "classifier", "zero", "momentum")}
@@ -161,7 +178,7 @@ def train_target(rows: pl.DataFrame, target: str, horizon_s: int, output_root: s
     data.select("asset", "tick_ns", "available_ns", "label_end_ns", "label_available_ns",
                 "engine_version", "replay_mode").write_parquet(directory / "training_rows.parquet")
     report = {
-        "target": target, "horizon_s": horizon_s, "version": version,
+        "target": target, "horizon_s": horizon_s, "version": version, "status": "trained",
         "label_spec_version": spec["version"], "label_spec": spec,
         "features": features, "engine_version": sorted(data["engine_version"].unique().to_list()),
         "replay_modes": sorted(data["replay_mode"].unique().to_list()),
@@ -221,22 +238,32 @@ def main(argv=None):
     paths = feature_paths(args.root)
     rows, spec = read_features(paths), load_spec()
     reports = []
-    for target in args.target or [f"{asset}_{market}" for asset in spec["references"] for market in ("spot", "perp")]:
+    for target in args.target or [f"{asset}_{market}" for asset, markets in spec["references"].items() for market in markets]:
         for horizon in args.horizon_s or spec["horizons_s"]:
             report = train_target(rows, target, horizon, output, args.version, args.stride_s,
                                   args.folds, args.purge_s, args.rounds, spec)
             reports.append(report)
-            print(json.dumps({k: report[k] for k in ("target", "horizon_s", "matrix_rows", "labeled_rows",
-                                                    "label_coverage_pct", "metrics")}, allow_nan=False), flush=True)
-            if args.upload:
-                upload_model(report["model_dir"], output)
-    result = {"input_files": [str(p) for p in paths], "input_rows": rows.height, "results": reports}
+            if report["status"] == "skipped":
+                print(f"Skipped {target}/{horizon}: {report['reason']}", flush=True)
+            else:
+                print(json.dumps({k: report[k] for k in ("target", "horizon_s", "status", "matrix_rows", "labeled_rows",
+                                                        "label_coverage_pct", "metrics")}, allow_nan=False), flush=True)
+                if args.upload:
+                    upload_model(report["model_dir"], output)
+    trained = sum(report["status"] == "trained" for report in reports)
+    result = {"input_files": [str(p) for p in paths], "input_rows": rows.height, "results": reports,
+              "trained": trained, "skipped": len(reports) - trained}
+    output.mkdir(parents=True, exist_ok=True)
     report_path = output / f"research_report_{args.version}.json"
     with report_path.open("x") as f:
         json.dump(result, f, indent=2, allow_nan=False)
         f.write("\n")
     print(f"Report: {report_path}", flush=True)
-    print(reports[0]["warning"], flush=True)
+    print(f"Trained {trained} target/horizon combinations; skipped {len(reports) - trained}.", flush=True)
+    if not trained:
+        print("No targets could train: see skipped reasons above. No models written (exit 0).", flush=True)
+    else:
+        print(next(report["warning"] for report in reports if report["status"] == "trained"), flush=True)
     return result
 
 

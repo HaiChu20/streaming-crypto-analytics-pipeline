@@ -14,8 +14,8 @@ def load_spec(path: str | Path = SPEC_PATH) -> dict:
 
 
 def reference_for(target: str, spec: dict | None = None) -> dict:
-    """Target names are BTC_spot, BTC_perp, ETH_spot, ETH_perp."""
-    asset, market = target.split("_")
+    """Resolve a configured <asset>_<market> reference, without a symbol fallback."""
+    asset, market = target.rsplit("_", 1)
     return (spec or load_spec())["references"][asset][market]
 
 
@@ -25,6 +25,12 @@ def reference_rows(rows: pl.DataFrame, target: str, spec: dict | None = None) ->
     if result["tick_ns"].n_unique() != result.height:
         raise ValueError(f"Duplicate reference ticks for {target}")
     return result.sort("tick_ns")
+
+
+def reference_present(rows: pl.DataFrame, target: str, spec: dict | None = None) -> bool:
+    """Availability is about instrument rows, independently of book validity."""
+    ref = reference_for(target, spec)
+    return bool(rows.select(pl.all_horizontal([pl.col(k) == v for k, v in ref.items()]).any()).item())
 
 
 def exact_return_pct(start: int, end: int) -> float:

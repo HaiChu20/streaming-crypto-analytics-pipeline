@@ -265,3 +265,77 @@ def test_matrix_uses_explicit_asset_for_generic_pairs(tmp_path):
     assert matrix['asset'].to_list() == ['USDT','USDT']
     assert matrix['binance_spot_spread_bps'].to_list() == [2.,2.]
     assert not any(f.endswith('_asset') for f in features)
+
+
+def test_missing_references_are_skipped_while_present_target_trains(tmp_path, synthetic_path):
+    result = main([str(synthetic_path), "--output-root", str(tmp_path / "skipping"),
+                   "--horizon-s", "900", "--folds", "2", "--rounds", "1", "--version", "skip"])
+    assert result["trained"] == 1 and result["skipped"] == 3
+    assert result["results"][0]["target"] == "BTC_spot"
+    assert result["results"][0]["status"] == "trained"
+    for report in result["results"][1:]:
+        assert report["status"] == "skipped"
+        assert report["reason"] == "reference instrument has no rows in input"
+        assert "model_dir" not in report
+
+
+def test_no_targets_or_too_few_labels_is_a_reported_success(tmp_path, capsys):
+    path = write_parquet(tmp_path, [row(0), row(900)])
+    output = tmp_path / "no-labels"
+    result = main([str(path), "--output-root", str(output), "--version", "tiny"])
+    assert result["trained"] == 0 and result["skipped"] == 8
+    assert all(report["status"] == "skipped" for report in result["results"])
+    assert "not enough labeled rows" in result["results"][0]["reason"]
+    assert not (output / "models").exists()
+    assert (output / "research_report_tiny.json").is_file()
+    assert "No targets could train" in capsys.readouterr().out
+    only_perp = read_features([write_parquet(tmp_path, [row(0, exchange="kraken", market="perp",
+                                                             symbol="PF_XBTUSD")], name="perp.parquet")])
+    report = train_target(only_perp, "BTC_spot", 900, output, "absent")
+    assert report["reference"] == dict(exchange="binance", market="spot", symbol="BTCUSDT")
+    assert report["reason"] == "reference instrument has no rows in input"
+    with pytest.raises(ValueError, match="stride/folds"):
+        train_target(only_perp, "BTC_spot", 900, output, "bad", n_folds=0)
+
+
+def test_context_assets_same_tick_premium_missing_nulls_and_no_future_leakage(tmp_path):
+    data = [row(0), row(10), row(20)]
+    data += [row(0, 1_000_250_000, symbol="USDTUSD", asset="USDT", spread_bps=1.,
+                 available_ns=700_000_000),
+             row(0, 999_900_000, exchange="okx", symbol="USDT-USD", asset="USDT"),
+             row(11, 1_100_000_000, symbol="USDTUSD", asset="USDT", spread_bps=9999.)]
+    frame = read_features([write_parquet(tmp_path, data)])
+    matrix, features = build_matrix(frame, "BTC_spot")
+    assert matrix["ctx_usdt_binance_spot_premium_bps"].to_list() == [2.5, None, None]
+    assert matrix["ctx_usdt_okx_spot_premium_bps"].to_list() == [-1., None, None]
+    assert matrix["ctx_usdt_binance_spot_spread_bps"].to_list() == [1., None, None]
+    assert matrix["available_ns"].to_list() == [700_000_000, 10 * NS + 250_000_000, 20 * NS + 250_000_000]
+    assert "ctx_usdt_binance_spot_premium_bps" in features
+    assert not any(c.endswith("_mid_e9") or c.endswith("_available_ns") for c in features)
+    future = frame.with_columns(pl.when(pl.col("tick_ns") == 11 * NS).then(1e20)
+                                .otherwise(pl.col("spread_bps")).alias("spread_bps"))
+    assert matrix.equals(build_matrix(future, "BTC_spot")[0])
+    disabled = dict(load_spec(), context_assets=[])
+    no_context, columns = build_matrix(frame, "BTC_spot", spec=disabled)
+    assert not any(c.startswith("ctx_") for c in columns)
+    assert no_context["available_ns"][0] == 250_000_000
+    absent, _ = build_matrix(frame.filter(pl.col("symbol") == "BTCUSDT"), "BTC_spot")
+    assert absent["ctx_usdt_binance_spot_premium_bps"].null_count() == 3
+
+
+def test_context_assets_apply_mode_version_and_availability_guards(tmp_path):
+    frame = read_features([write_parquet(tmp_path, [row(0), row(900),
+        row(0, 1_000_000_000, symbol="USDTUSD", available_ns=901 * NS)])])
+    matrix, _ = build_matrix(frame, "BTC_spot")
+    assert matrix["available_ns"][0] == 901 * NS
+    report = train_target(frame, "BTC_spot", 900, tmp_path, "late-context")
+    assert report["status"] == "skipped" and report["labeled_rows"] == 0
+    for column, value in [("replay_mode", "as_live"), ("engine_version", "other-version")]:
+        conflicting = frame.with_columns(pl.when(pl.col("symbol") == "USDTUSD").then(pl.lit(value))
+                                         .otherwise(pl.col(column)).alias(column))
+        with pytest.raises(ValueError, match="Cannot mix"):
+            build_matrix(conflicting, "BTC_spot")
+    # Warm/invalid context books cannot supply a stale price premium.
+    invalid = frame.with_columns(pl.when(pl.col("symbol") == "USDTUSD").then(False)
+                                 .otherwise(pl.col("book_valid")).alias("book_valid"))
+    assert build_matrix(invalid, "BTC_spot")[0]["ctx_usdt_binance_spot_premium_bps"].null_count() == 2

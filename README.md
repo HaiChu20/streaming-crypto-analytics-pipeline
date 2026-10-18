@@ -180,3 +180,50 @@ uses up to 8,192 byte-spaced frames per stream, with missing clocks excluded.
 Prices come from exported `S3_PRICE_GB_MONTH` / `S3_PRICE_PUT_PER_1000` or the defaults
 in `.env.example`; the report never loads `.env` or contacts AWS/Kafka. Local archive
 retention does not expire S3 objects, so the report shows growing S3 monthly run-rate.
+
+## Train on another machine (GPU server)
+
+Clone this repository, install [uv](https://docs.astral.sh/uv/getting-started/installation/)
+and [Rust via rustup](https://rustup.rs), then run:
+
+```bash
+git clone <repository-url>
+cd streaming-crypto-analytics-pipeline
+uv sync
+scripts/train_offline.sh /path/to/archive /path/to/work --jobs 2 --version btc-spot-v1
+```
+
+The command builds release replay, discovers closed v3 days, and publishes
+`work/features/date=D/features.parquet` atomically. It resumes completed days;
+interrupted staging stays unpublished and is redone. Per-day logs/JSON reports
+are in `work/logs/`; models are in `work/models/`. `--jobs` defaults to half the
+CPU count; `--from YYYY-MM-DD` / `--to YYYY-MM-DD` filter discovered dates.
+Failed replay days stop training unless explicitly allowed with
+`--allow-missing-days`. Training uses all completed days in the work directory;
+use a separate work directory for a separate date selection, and a new version
+for each training run.
+
+`BTC_spot` keeps Binance BTCUSDT spot as its reference. Missing Binance/OKX perps
+or ETH do not cause fallback to another instrument: absent references are reported
+as skipped. `context_assets: [USDT]` in `research/targets.yaml` adds same-tick,
+`ctx_usdt_<exchange>_<market>_*` predictors, including USDT/USD `premium_bps =
+10000*(mid-1)`. Missing context is null; its emission time participates in every
+availability and purge check. No labeled history (including these two-minute
+excerpts) yields an explicit “not enough labeled rows” report, no models, and exit
+0; invalid inputs/configuration still fail. LightGBM uses two CPU threads for this
+baseline; a GPU is not required.
+
+Local Mac measurements on the two-minute excerpts, **not full-day input**, were
+33,511 spot/L3 records → 691,160 full-day output rows in 0.657 s (51,016 records/s,
+29.9 MiB peak RSS), and 75,235 futures records → 172,794 rows in 0.243 s (310,109
+records/s, 21.1 MiB RSS). These are release replay's JSON timings plus
+`/usr/bin/time -l` RSS, excluding build and Python training. Ingestion-only warm
+medians were 286,586 and 656,071 records/s respectively (see
+[replay measurement method](engine/replay/README.md#v3-fixture-checks-and-throughput)).
+Estimate a full day's ingestion time as its record count divided by the applicable
+measured ingestion rate, then add tick/Parquet work; full days will take longer
+and depend on L3 activity, storage and server speed. Replay streams input, so RAM
+is driven by books and pending buffers rather than day length; parallel jobs
+multiply worker memory. Measure representative full days before choosing job
+counts. Python training additionally holds all input features and wide matrices
+in RAM; the replay RSS figures do not estimate training memory.

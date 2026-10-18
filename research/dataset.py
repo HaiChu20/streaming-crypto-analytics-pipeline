@@ -47,8 +47,12 @@ def read_features(paths: list[Path]) -> pl.DataFrame:
 
 def asset_expr() -> pl.Expr:
     symbol = pl.col("symbol").str.to_uppercase()
-    return (pl.when(symbol.str.contains("BTC|XBT")).then(pl.lit("BTC"))
-            .when(symbol.str.contains("ETH")).then(pl.lit("ETH")))
+    base = pl.coalesce(
+        symbol.str.extract(r"^([^/-]+)[/-]", 1),
+        symbol.str.extract(r"^(?:PF_)?(.+?)(?:FDUSD|USDT|USDC|USD|BTC|ETH|EUR)$", 1),
+        symbol,
+    )
+    return pl.when(base == "XBT").then(pl.lit("BTC")).otherwise(base)
 
 
 def build_matrix(rows: pl.DataFrame, target: str, stride_s: int = 10,
@@ -56,7 +60,8 @@ def build_matrix(rows: pl.DataFrame, target: str, stride_s: int = 10,
     if stride_s <= 0:
         raise ValueError("stride_s must be positive")
     spec = spec or load_spec()
-    asset = target.split("_")[0]
+    asset = target.rsplit("_", 1)[0]
+    context_assets = sorted(set(spec.get("context_assets", [])) - {asset})
     reference_for(target, spec)  # validate the versioned reference
     ref = reference_rows(rows, target, spec)
     matrix = ref.filter(
@@ -65,11 +70,11 @@ def build_matrix(rows: pl.DataFrame, target: str, stride_s: int = 10,
     ).select("tick_ns")
     asset_column = asset_expr()
     if "asset" in rows.columns:
-        # New engine rows declare their base currency; old rows use the original
-        # BTC/ETH symbol fallback, including empty serde-default asset strings.
+        # Older rows can omit the asset or contain an empty serde default.
         asset_column = pl.when(pl.col("asset").is_not_null() & (pl.col("asset") != "")).then(pl.col("asset")).otherwise(asset_column)
     selected = rows.with_columns(asset_column.alias("asset")).filter(
-        (pl.col("asset") == asset) & (pl.col("tick_ns") % (stride_s * NS) == 0)
+        pl.col("asset").is_in([asset, *context_assets])
+        & (pl.col("tick_ns") % (stride_s * NS) == 0)
     ).join(matrix, on="tick_ns", how="semi")
     conflicts = selected.group_by("tick_ns").agg(
         pl.col("replay_mode").n_unique().alias("modes"),
@@ -87,21 +92,42 @@ def build_matrix(rows: pl.DataFrame, target: str, stride_s: int = 10,
     matrix = matrix.join(provenance, on="tick_ns", how="left")
     feature_cols = [c for c, dtype in rows.schema.items()
                     if c not in IDENTITY | PRICES and (dtype.is_numeric() or dtype == pl.Boolean)]
-    # At most one native symbol per exchange/market/asset: fail rather than silently mix.
-    instruments = selected.select("exchange", "market", "symbol").unique().sort(
-        "exchange", "market", "symbol"
+    # One symbol per venue/market/asset; context and target have separate namespaces.
+    instruments = selected.select("asset", "exchange", "market", "symbol").unique().sort(
+        "asset", "exchange", "market", "symbol"
     )
     prefixes = set()
-    for exchange, market, symbol in instruments.iter_rows():
-        prefix = f"{exchange}_{market}_"
+    for base, exchange, market, symbol in instruments.iter_rows():
+        context = base != asset
+        prefix = (f"ctx_{base.lower()}_" if context else "") + f"{exchange}_{market}_"
         if prefix in prefixes:
-            raise ValueError(f"Multiple symbols map to {prefix}{asset}")
+            raise ValueError(f"Multiple symbols map to {prefix}{base}")
         prefixes.add(prefix)
-        part = selected.filter((pl.col("exchange") == exchange)
+        part = selected.filter((pl.col("asset") == base) & (pl.col("exchange") == exchange)
                                & (pl.col("market") == market) & (pl.col("symbol") == symbol))
-        matrix = matrix.join(part.select("tick_ns", *[
-            pl.col(c).alias(prefix + c) for c in feature_cols
-        ]), on="tick_ns", how="left")
+        expressions = [pl.col(c).alias(prefix + c) for c in feature_cols]
+        if context and base == "USDT":
+            # USDT/USD price is stationary around one and supplies the USD/USDT
+            # premium, while absolute BTC prices remain excluded from predictors.
+            dollar_pair = symbol.upper() in {"USDTUSD", "USDT-USD", "USDT/USD"}
+            premium = (pl.when(pl.lit(dollar_pair) & pl.col("book_valid")
+                               & ~pl.col("warmup") & (pl.col("mid_e9") > 0))
+                       .then((pl.col("mid_e9") - NS) / NS * 10_000)
+                       .otherwise(None).alias(prefix + "premium_bps"))
+            expressions.append(premium)
+        matrix = matrix.join(part.select("tick_ns", *expressions), on="tick_ns", how="left")
+    # Entirely absent context venues still have null predictors, including when
+    # the context asset is absent from every file. Match the observed venue set.
+    venues = selected.select("exchange", "market").unique().sort("exchange", "market").iter_rows()
+    for exchange, market in venues:
+        for base in context_assets:
+            prefix = f"ctx_{base.lower()}_{exchange}_{market}_"
+            if prefix not in prefixes:
+                expressions = [pl.lit(None, dtype=rows.schema[c]).alias(prefix + c)
+                               for c in feature_cols]
+                if base == "USDT":
+                    expressions.append(pl.lit(None, dtype=pl.Float64).alias(prefix + "premium_bps"))
+                matrix = matrix.with_columns(expressions)
     matrix = matrix.join(momentum_900s(rows, target, spec), on="tick_ns", how="left")
     matrix = matrix.with_columns(pl.lit(asset).alias("asset")).sort("tick_ns")
     features = sorted(c for c in matrix.columns if c not in NON_FEATURES)

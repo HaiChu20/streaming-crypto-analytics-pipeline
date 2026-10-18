@@ -1,5 +1,7 @@
 version: "v1"
 horizons_s: [900, 1800]
+# Stablecoin context for the BTC_spot baseline; missing rows remain null.
+context_assets: [USDT]
 references:
   BTC:
     spot: {exchange: binance, market: spot, symbol: BTCUSDT}
