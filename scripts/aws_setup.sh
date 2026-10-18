@@ -6,11 +6,20 @@ for cmd in terraform aws; do
     echo "Install Terraform and AWS CLI: brew install terraform awscli" >&2; exit 1
   fi
 done
+if [[ ! -x .venv/bin/python ]]; then
+  echo "Create the project environment first: uv sync" >&2; exit 1
+fi
+if [[ ! -f .env ]]; then
+  echo "Copy .env.example to .env and fill in the AWS archive settings first" >&2; exit 1
+fi
 set -a
 source .env
 set +a
 : "${AWS_ADMIN_PROFILE:?set AWS_ADMIN_PROFILE to an existing admin profile}"
 export AWS_PROFILE="${AWS_PROFILE:-crypto-archiver}"
+if [[ "$AWS_PROFILE" == "$AWS_ADMIN_PROFILE" ]]; then
+  echo "AWS_PROFILE must differ from AWS_ADMIN_PROFILE so the archive job uses its own limited profile" >&2; exit 1
+fi
 : "${AWS_REGION:?set AWS_REGION}"
 : "${S3_BUCKET:?set S3_BUCKET}"
 : "${TF_VAR_bucket_name:?set TF_VAR_bucket_name}"
