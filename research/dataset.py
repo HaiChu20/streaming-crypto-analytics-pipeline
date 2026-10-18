@@ -112,7 +112,9 @@ def build_matrix(rows: pl.DataFrame, target: str, stride_s: int = 10,
             dollar_pair = symbol.upper() in {"USDTUSD", "USDT-USD", "USDT/USD"}
             premium = (pl.when(pl.lit(dollar_pair) & pl.col("book_valid")
                                & ~pl.col("warmup") & (pl.col("mid_e9") > 0))
-                       .then((pl.col("mid_e9") - NS) / NS * 10_000)
+                       # One floating multiply keeps scalar/live and vector/training
+                       # execution identical (a divide then multiply can differ by 1 ULP).
+                       .then((pl.col("mid_e9") - NS) * (10_000 / NS))
                        .otherwise(None).alias(prefix + "premium_bps"))
             expressions.append(premium)
         matrix = matrix.join(part.select("tick_ns", *expressions), on="tick_ns", how="left")

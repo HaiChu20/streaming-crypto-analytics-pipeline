@@ -18,7 +18,7 @@ import numpy as np
 import polars as pl
 
 from collectors.common.config import kafka_bootstrap
-from research.dataset import IDENTITY, PRICES, build_matrix
+from research.dataset import build_matrix
 from research.labels import NS, load_spec, reference_for
 
 LOG = logging.getLogger(__name__)
@@ -32,8 +32,28 @@ basis_bps_kraken spot_dev_bps_okx spot_dev_bps_kraken""".split()
 SCHEMA = {**dict.fromkeys(STRINGS, pl.String), **dict.fromkeys(BOOLS, pl.Boolean),
           **dict.fromkeys(INTS, pl.Int64), **dict.fromkeys(FLOATS, pl.Float64),
           "replay_mode": pl.String}
-PREFIXES = [f"{e}_{m}_" for e in ("binance", "okx", "kraken") for m in ("spot", "perp")] + ["cross_cross_"]
-POSSIBLE = {p + c for p in PREFIXES for c in SCHEMA if c not in IDENTITY | PRICES} | {"momentum_return_900s"}
+VENUES = [(e, m) for e in ("binance", "okx", "kraken") for m in ("spot", "perp")] + [("cross", "cross")]
+
+
+def _supported_features(meta):
+    """Ask the training builder which predictors this raw schema can produce.
+
+    One typed row per configured asset/venue exposes all possible column names,
+    including absent-venue nulls. Context naming and premium logic stay in research.
+    """
+    spec = meta["label_spec"]
+    asset = meta["target"].rsplit("_", 1)[0]
+    ref = reference_for(meta["target"], spec)
+    rows = []
+    for base in sorted({asset, *spec.get("context_assets", [])}):
+        for exchange, market in VENUES:
+            symbol = (ref["symbol"] if base == asset and (exchange, market) == (ref["exchange"], ref["market"])
+                      else base)
+            rows.append(dict(exchange=exchange, market=market, symbol=symbol, asset=base,
+                             tick_ns=0, available_ns=0, engine_version="schema", replay_mode="as_live",
+                             book_valid=True, warmup=False, mid_e9=NS))
+    _, features = build_matrix(pl.DataFrame(rows, schema=SCHEMA), meta["target"], meta["stride_s"], spec)
+    return set(features)
 
 
 @dataclass
@@ -80,8 +100,9 @@ def load_models(root, version, targets=None, horizons=None):
                 or not 0 < horizon <= 65535 or type(meta["stride_s"]) is not int or meta["stride_s"] <= 0):
             raise ValueError(f"Invalid model identity/stride: {path}")
         features = meta["features"]
-        if not features or len(set(features)) != len(features) or set(features) - POSSIBLE:
-            raise ValueError(f"Features the live schema cannot produce: {set(features) - POSSIBLE}")
+        possible = _supported_features(meta)
+        if not features or len(set(features)) != len(features) or set(features) - possible:
+            raise ValueError(f"Features the live schema cannot produce: {set(features) - possible}")
         reg, clf = [lgb.Booster(model_file=str(path / name)) for name in ("regressor.txt", "classifier.txt")]
         if reg.feature_name() != features or clf.feature_name() != features or clf.num_model_per_iteration() != 3:
             raise ValueError(f"Model feature/class order disagrees with metadata: {path}")
@@ -186,7 +207,7 @@ class Service:
                     LOG.warning("Model %s/%s/%s engine_version/replay_mode differs from live rows",
                                 meta["target"], meta["horizon_s"], meta["version"])
                     model.warned = True
-                key = (meta["target"], meta["stride_s"], meta["label_spec"]["version"])
+                key = (meta["target"], meta["stride_s"], json.dumps(meta["label_spec"], sort_keys=True))
                 if key not in matrices:
                     matrices[key] = _matrix_for(rows, self.history, meta)
                 x = _reindex(matrices[key], meta["features"])

@@ -12,7 +12,7 @@ import pytest
 from inference.service import Model, SCHEMA, Service, load_models, vector_for
 from research.dataset import build_matrix
 from research.labels import NS, load_spec
-from research.train import fit_models
+from research.train import fit_models, train_target
 
 
 def row(second, **updates):
@@ -330,3 +330,70 @@ def test_asset_field_matches_rust_and_clickhouse():
     feed(svc, old)
     assert next(iter(svc.rows.values()))['asset'] == ''
     assert svc.counts['malformed'] == 0
+
+
+def test_context_trained_models_match_live_vectors_and_missing_context_nulls(tmp_path):
+    spec = {**load_spec(), "context_assets": ["USDT"]}
+    rows = []
+    for second in range(0, 7201, 10):
+        rows.append(row(second, asset="BTC", mid_e9=100 * NS + int(200_000_000 * np.sin(second / 170)),
+                        spread_bps=2. + second % 30 / 100))
+        if second != 910:
+            for exchange, symbol in [("binance", "USDTUSD"), ("okx", "USDT-USD")]:
+                rows.append(row(second, exchange=exchange, symbol=symbol, asset="USDT",
+                                mid_e9=NS + (second % 100 - 50) * 10_000,
+                                spread_bps=1. + second % 40 / 100,
+                                available_ns=second * NS + 700_000_000))
+    frame = pl.DataFrame(rows, schema=SCHEMA)
+    report = train_target(frame, "BTC_spot", 900, tmp_path, "context",
+                          n_folds=2, rounds=2, spec=spec)
+    assert report["status"] == "trained"
+    models = load_models(tmp_path, "context")
+    features = models[0].metadata["features"]
+    assert "ctx_usdt_binance_spot_premium_bps" in features
+    assert "ctx_usdt_okx_spot_spread_bps" in features
+    matrix, _ = build_matrix(frame, "BTC_spot", spec=spec)
+    native = models[0].regressor
+    captured = {}
+    svc = Service(models, Producer())
+
+    def predict(x, **kwargs):
+        captured[svc.tick] = x.copy()
+        return native.predict(x, **kwargs)
+
+    models[0].regressor = SimpleNamespace(predict=predict)
+    feed(svc, *[r for r in rows if r["tick_ns"] <= 920 * NS], row(921))
+    predictions = {json.loads(message["value"])["tick_ns"]: json.loads(message["value"])
+                   for _, message in svc.producer.messages}
+    for second in [900, 910, 920]:
+        tick = second * NS
+        expected = matrix.filter(pl.col("tick_ns") == tick).select(features).to_numpy().astype(float)
+        current = [r for r in rows if r["tick_ns"] == tick]
+        history = [r for r in rows if 0 <= r["tick_ns"] < tick and r["symbol"] == "BTCUSDT"]
+        np.testing.assert_array_equal(vector_for(current, history, models[0].metadata), expected)
+        np.testing.assert_array_equal(captured[tick], expected)
+        assert predictions[tick]["pred_return_pct"] == native.predict(expected, num_threads=1)[0]
+    context_indices = [i for i, name in enumerate(features) if name.startswith("ctx_")]
+    assert np.isnan(captured[910 * NS][0, context_indices]).all()
+    assert captured[900 * NS][0, features.index("ctx_usdt_binance_spot_premium_bps")] == -5.
+    assert svc.counts["malformed"] == svc.skipped["inference_error"] == 0
+    # Context names must still belong to this model's frozen configuration.
+    path = Path(report["model_dir"]) / "metadata.json"
+    meta = json.loads(path.read_text())
+    meta["features"] = ["ctx_usdc_binance_spot_spread_bps"]
+    path.write_text(json.dumps(meta))
+    with pytest.raises(ValueError, match="cannot produce"):
+        load_models(tmp_path, "context")
+
+
+def test_matrix_cache_separates_context_settings_with_same_spec_version():
+    plain = service().models[0]
+    plain.metadata["label_spec"] = {**load_spec(), "context_assets": []}
+    context = service().models[0]
+    context.metadata["features"] = ["ctx_usdt_binance_spot_premium_bps"]
+    captured = []
+    context.regressor = SimpleNamespace(predict=lambda x, **kw: (captured.append(x.copy()) or np.array([.2])))
+    svc = Service([plain, context], Producer())
+    feed(svc, row(10), row(10, symbol="USDTUSD", asset="USDT", mid_e9=1_000_250_000), row(11))
+    np.testing.assert_array_equal(captured[0], [[2.5]])
+    assert svc.counts["predictions"] == 2
