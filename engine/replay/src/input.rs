@@ -15,7 +15,7 @@ pub struct Snapshot {
     pub path: PathBuf,
     pub bytes: u64,
 }
-/// Path metadata follows config/markets.yaml's native symbols and asset partitions.
+/// Native pair and canonical exchange/market/feed inferred from a v3 path.
 #[derive(Debug, Clone)]
 pub struct StreamPath {
     pub exchange: String,
@@ -23,23 +23,28 @@ pub struct StreamPath {
     pub feed: String,
     pub symbol: String,
     pub partition: i32,
+    file: String,
+    channel: String,
 }
 impl StreamPath {
     pub fn new(path: &Path) -> Result<Self> {
-        let name = path
-            .file_name()
-            .and_then(|s| s.to_str())
-            .ok_or_else(|| error("invalid raw filename"))?;
+        let component = |p: &Path| {
+            p.file_name()
+                .and_then(|s| s.to_str())
+                .map(str::to_owned)
+                .ok_or_else(|| error("invalid raw path"))
+        };
+        let name = component(path)?;
         let stem = name
             .strip_suffix(".jsonl")
             .or_else(|| name.strip_suffix(".jsonl.gz"))
             .or_else(|| name.strip_suffix(".jsonl.open"))
-            .ok_or_else(|| error("expected v2 .jsonl[.gz|.open] file"))?;
-        let (date, feed) = stem
+            .ok_or_else(|| error("expected v3 .jsonl[.gz|.open] file"))?;
+        let (date, channel) = stem
             .split_once('_')
-            .ok_or_else(|| error("expected YYYYMMDD_feed filename"))?;
-        if date.len() != 8 || !date.bytes().all(|b| b.is_ascii_digit()) || !known_feed(feed) {
-            return Err(error("invalid v2 date/feed"));
+            .ok_or_else(|| error("expected YYYYMMDD_channel filename"))?;
+        if date.len() != 8 || !date.bytes().all(|b| b.is_ascii_digit()) {
+            return Err(error("invalid v3 date"));
         }
         let symbol_dir = path
             .parent()
@@ -50,84 +55,95 @@ impl StreamPath {
         let exchange_dir = market_dir
             .parent()
             .ok_or_else(|| error("missing exchange directory"))?;
-        let component = |p: &Path| {
-            p.file_name()
-                .and_then(|s| s.to_str())
-                .map(str::to_owned)
-                .ok_or_else(|| error("invalid raw path"))
-        };
-        let exchange = component(exchange_dir)?;
-        let market = component(market_dir)?;
+        let exchange = canonical_exchange(&component(exchange_dir)?)
+            .ok_or_else(|| error("unknown exchange directory"))?
+            .to_owned();
+        let market = canonical_market(&component(market_dir)?)
+            .ok_or_else(|| error("unknown market directory"))?
+            .to_owned();
+        let feed = channel_feed(&exchange, &market, channel)
+            .ok_or_else(|| error("unknown v3 channel"))?
+            .to_owned();
         let disk_symbol = component(symbol_dir)?;
         let symbol = if exchange == "kraken" && market == "spot" {
             disk_symbol.replace('-', "/")
         } else {
             disk_symbol
         };
-        let partition = match (exchange.as_str(), market.as_str(), symbol.as_str()) {
-            ("binance", "spot" | "perp", "BTCUSDT")
-            | ("okx", "spot", "BTC-USDT")
-            | ("okx", "perp", "BTC-USDT-SWAP")
-            | ("kraken", "spot", "BTC/USD")
-            | ("kraken", "perp", "PF_XBTUSD") => 0,
-            ("binance", "spot" | "perp", "ETHUSDT")
-            | ("okx", "spot", "ETH-USDT")
-            | ("okx", "perp", "ETH-USDT-SWAP")
-            | ("kraken", "spot", "ETH/USD")
-            | ("kraken", "perp", "PF_ETHUSD") => 1,
-            _ => {
-                return Err(error(format!(
-                    "unknown configured stream {}",
-                    path.display()
-                )));
-            }
-        };
         Ok(Self {
             exchange,
             market,
-            feed: feed.into(),
+            feed,
             symbol,
-            partition,
+            partition: 0,
+            file: path.to_string_lossy().into_owned(),
+            channel: channel.into(),
         })
     }
-    /// The payload is the native line itself; exchange decoders ignore archive keys.
+    /// Stateless convenience for explicit coordinates; Source maintains synthetic epochs.
     pub fn parse(&self, line: &str) -> Result<Option<Record>> {
+        self.parse_at(line, 0, &mut 0, &mut None)
+    }
+    fn parse_at(
+        &self,
+        line: &str,
+        index: i64,
+        epochs: &mut u64,
+        epoch: &mut Option<String>,
+    ) -> Result<Option<Record>> {
         #[derive(Deserialize)]
         struct Meta<'a> {
             marker: Option<&'a str>,
             event: Option<&'a str>,
-            #[serde(rename = "type")]
-            kind: Option<&'a str>,
-            action: Option<&'a str>,
-            feed: Option<&'a str>,
-            conn: Option<String>,
+            conn: Option<&'a str>,
             offset: Option<i64>,
             recv_time_ns: Option<i128>,
+            timestamp: Option<&'a str>,
             reason: Option<String>,
-            raw: Option<String>,
+            raw: Option<&'a str>,
+            #[serde(borrow)]
+            data: Option<&'a serde_json::value::RawValue>,
         }
         let meta: Meta<'_> = serde_json::from_str(line)?;
         if matches!(meta.marker, Some("rollover" | "gap")) || meta.event == Some("gap") {
             return Ok(None);
         }
-        let (kind, event, reason, detail) = if meta.raw.is_some() && meta.marker.is_none() {
-            // The recorder could not store a native JSON object. Keep its offset,
-            // and make the uncertainty visible to the same core path used by a
-            // malformed Kafka envelope.
+        // A user's marker conn is a recorder label reused on reconnect. Explicit
+        // conn+offset coordinates are our globally unique connection epochs.
+        if meta.marker == Some("ws_event") && meta.event == Some("connected") {
+            *epochs += 1;
+            *epoch = Some(if meta.offset.is_some() {
+                meta.conn
+                    .map(str::to_owned)
+                    .unwrap_or_else(|| format!("{}#{}", self.file, epochs))
+            } else {
+                format!("{}#{}", meta.conn.unwrap_or(&self.file), epochs)
+            });
+        }
+        let conn = if meta.marker.is_some() && meta.offset.is_none() {
+            epoch.clone()
+        } else {
+            meta.conn.map(str::to_owned).or_else(|| epoch.clone())
+        }
+        .unwrap_or_else(|| format!("{}#pre", self.file));
+        let (kind, event, reason, detail, payload) = if meta.raw.is_some() && meta.marker.is_none()
+        {
             (
                 Kind::Control,
                 Some("drop".into()),
                 Some("malformed_envelope".into()),
                 None,
+                String::new(),
             )
         } else if let Some(marker) = meta.marker {
             let event = match (marker, meta.event) {
                 ("ws_event", Some("connected")) => "start",
-                ("ws_event", Some("disconnected")) => "stop",
+                ("ws_event", Some("disconnected" | "rotating" | "shutdown")) => "stop",
                 ("ws_event", Some("connection_error")) => "drop",
+                ("ws_event", Some("corrupt_message")) => "corrupt_message",
                 _ => {
                     return Err(error(format!(
-                        "unknown v2 marker/event {marker}/{:?}",
+                        "unknown v3 marker/event {marker}/{:?}",
                         meta.event
                     )));
                 }
@@ -136,11 +152,33 @@ impl StreamPath {
             if let Some(nested) = detail.get("detail").and_then(|v| v.as_object()).cloned() {
                 detail.as_object_mut().unwrap().extend(nested);
             }
-            (Kind::Control, Some(event.into()), meta.reason, Some(detail))
+            (
+                Kind::Control,
+                Some(event.into()),
+                meta.reason,
+                Some(detail),
+                String::new(),
+            )
         } else {
-            let snapshot = meta.kind == Some("snapshot")
-                || meta.action == Some("snapshot")
-                || meta.feed.is_some_and(|f| f.ends_with("_snapshot"));
+            let native = if self.exchange == "kraken" && self.market == "spot" {
+                line
+            } else {
+                meta.data
+                    .ok_or_else(|| error("wrapped v3 line missing data"))?
+                    .get()
+            };
+            #[derive(Deserialize)]
+            struct Shape<'a> {
+                #[serde(rename = "type")]
+                kind: Option<&'a str>,
+                action: Option<&'a str>,
+                feed: Option<&'a str>,
+            }
+            let shape: Shape<'_> = serde_json::from_str(native)?;
+            let snapshot = self.channel == "snapshot"
+                || shape.kind == Some("snapshot")
+                || shape.action == Some("snapshot")
+                || shape.feed.is_some_and(|f| f.ends_with("_snapshot"));
             let kind = if snapshot {
                 Kind::Snapshot
             } else if matches!(self.feed.as_str(), "trades" | "trades_agg") {
@@ -148,25 +186,25 @@ impl StreamPath {
             } else {
                 Kind::Update
             };
-            (kind, None, None, None)
+            let detail = (self.exchange == "binance" && self.channel == "snapshot")
+                .then(|| serde_json::json!({"archive_snapshot":true}));
+            (kind, None, None, detail, native.to_owned())
         };
+        let recv_ns = meta
+            .recv_time_ns
+            .or_else(|| meta.timestamp.and_then(|t| iso_ns(t).ok()))
+            .ok_or_else(|| error("v3 line missing receive time or valid marker timestamp"))?;
         Ok(Some(Record {
             exchange: self.exchange.clone(),
             market: self.market.clone(),
             feed: self.feed.clone(),
             symbol: self.symbol.clone(),
             kind,
-            conn: meta.conn.ok_or_else(|| error("v2 line missing conn"))?,
-            offset: Some(meta.offset.ok_or_else(|| error("v2 line missing offset"))?),
-            recv_ns: meta
-                .recv_time_ns
-                .ok_or_else(|| error("v2 line missing recv_time_ns"))?,
+            conn,
+            offset: Some(meta.offset.unwrap_or(index)),
+            recv_ns,
             seq: 0,
-            payload: if meta.raw.is_some() {
-                String::new()
-            } else {
-                line.to_owned()
-            },
+            payload,
             event,
             reason,
             detail,
@@ -178,11 +216,66 @@ impl StreamPath {
         }))
     }
 }
-fn known_feed(feed: &str) -> bool {
-    matches!(
-        feed,
-        "l1" | "l2" | "l3" | "trades" | "trades_agg" | "mark" | "liquidations" | "ticker"
-    )
+fn canonical_exchange(value: &str) -> Option<&'static str> {
+    let value = value.to_ascii_lowercase();
+    ["binance", "kraken", "okx"]
+        .into_iter()
+        .find(|prefix| value.starts_with(prefix))
+}
+fn canonical_market(value: &str) -> Option<&'static str> {
+    let value = value.to_ascii_lowercase();
+    if value.starts_with("spot") {
+        Some("spot")
+    } else if ["fut", "perp", "swap"].iter().any(|p| value.starts_with(p)) {
+        Some("perp")
+    } else {
+        None
+    }
+}
+fn channel_feed(exchange: &str, market: &str, channel: &str) -> Option<&'static str> {
+    match (exchange, market, channel) {
+        ("binance", _, "depth" | "snapshot") | ("okx" | "kraken", _, "book") => Some("l2"),
+        ("binance", _, "bookticker") | ("okx", _, "bbo") => Some("l1"),
+        ("okx", _, "trades") | ("binance", "perp", "aggtrades") => Some("trades_agg"),
+        ("binance" | "kraken", _, "trades") | ("okx", _, "tradesall") => Some("trades"),
+        ("binance", "perp", "markprice") => Some("mark"),
+        ("binance", "perp", "forceorder") => Some("liquidations"),
+        ("kraken", "spot", "level3") => Some("l3"),
+        ("kraken", "perp", "ticker") => Some("ticker"),
+        _ => None,
+    }
+}
+fn iso_ns(text: &str) -> Result<i128> {
+    let utc = text
+        .strip_suffix('Z')
+        .or_else(|| text.strip_suffix("+00:00"))
+        .ok_or_else(|| error("marker timestamp must be UTC"))?;
+    let (date, time) = utc
+        .split_once('T')
+        .ok_or_else(|| error("invalid ISO timestamp"))?;
+    let (start, _) = day_bounds(date)?;
+    let (hms, fraction) = time.split_once('.').unwrap_or((time, ""));
+    let fields = hms
+        .split(':')
+        .map(str::parse::<u32>)
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    if fields.len() != 3
+        || fields[0] > 23
+        || fields[1] > 59
+        || fields[2] > 59
+        || fraction.len() > 9
+        || !fraction.bytes().all(|b| b.is_ascii_digit())
+    {
+        return Err(error("invalid ISO timestamp"));
+    }
+    let nanos = if fraction.is_empty() {
+        0
+    } else {
+        fraction.parse::<i128>()? * 10i128.pow(9 - fraction.len() as u32)
+    };
+    Ok(i128::from(start)
+        + i128::from(fields[0] * 3600 + fields[1] * 60 + fields[2]) * i128::from(SECOND)
+        + nanos)
 }
 
 pub(crate) struct Source {
@@ -192,6 +285,8 @@ pub(crate) struct Source {
     open: bool,
     line: u64,
     previous_offset: Option<i64>,
+    epochs: u64,
+    epoch: Option<String>,
     pub bytes: u64,
 }
 impl Source {
@@ -212,6 +307,8 @@ impl Source {
             open: path.to_string_lossy().ends_with(".open"),
             line: 0,
             previous_offset: None,
+            epochs: 0,
+            epoch: None,
             bytes,
         })
     }
@@ -228,7 +325,12 @@ impl Source {
             }
             let record = self
                 .stream
-                .parse(&text)
+                .parse_at(
+                    &text,
+                    (self.line - 1) as i64,
+                    &mut self.epochs,
+                    &mut self.epoch,
+                )
                 .map_err(|e| error(format!("{}:{}: {e}", self.path.display(), self.line)))?;
             let Some(record) = record else {
                 continue;
@@ -318,28 +420,25 @@ pub struct Merge {
 impl Merge {
     pub fn new(mut paths: Vec<PathBuf>) -> Result<Self> {
         paths.sort();
-        let mut grouped = BTreeMap::<_, VecDeque<Source>>::new();
         let mut snapshots = Vec::new();
-        for path in paths {
-            let source = Source::new(&path)?;
-            let stream = &source.stream;
-            let key = (
-                stream.exchange.clone(),
-                stream.market.clone(),
-                stream.feed.clone(),
-                stream.partition,
-            );
-            snapshots.push(Snapshot {
-                path,
-                bytes: source.bytes,
-            });
-            grouped.entry(key).or_default().push_back(source);
-        }
         let mut sources = Vec::new();
         let mut heap = BinaryHeap::new();
-        for files in grouped.into_values() {
+        let mut partitions = BTreeMap::<String, i32>::new();
+        for path in paths {
+            let mut file = Source::new(&path)?;
+            let topic = format!(
+                "raw.{}.{}.{}.v1",
+                file.stream.exchange, file.stream.market, file.stream.feed
+            );
+            let partition = partitions.entry(topic).or_default();
+            file.stream.partition = *partition;
+            *partition += 1;
+            snapshots.push(Snapshot {
+                path,
+                bytes: file.bytes,
+            });
             let mut source = PartitionSource {
-                files,
+                files: VecDeque::from([file]),
                 previous_ns: None,
                 previous_offset: None,
                 clock_steps: 0,
@@ -415,24 +514,10 @@ pub fn recover_archived(line: &str, coordinates: Option<(&str, i32, i64)>) -> Re
         ));
     }
     let (exchange, market, feed) = (parts[1], parts[2], parts[3]);
-    let asset = match partition {
-        0 => "BTC",
-        1 => "ETH",
-        _ => return Err(error("unknown asset partition")),
-    };
-    let symbol = match (exchange, market, asset) {
-        ("binance", _, "BTC") => "BTCUSDT",
-        ("binance", _, _) => "ETHUSDT",
-        ("okx", "spot", "BTC") => "BTC-USDT",
-        ("okx", "spot", _) => "ETH-USDT",
-        ("okx", "perp", "BTC") => "BTC-USDT-SWAP",
-        ("okx", "perp", _) => "ETH-USDT-SWAP",
-        ("kraken", "spot", "BTC") => "BTC/USD",
-        ("kraken", "spot", _) => "ETH/USD",
-        ("kraken", "perp", "BTC") => "PF_XBTUSD",
-        ("kraken", "perp", _) => "PF_ETHUSD",
-        _ => return Err(error("unknown raw stream in malformed archive")),
-    };
+    // Kafka partition numbers are transport coordinates, never asset identities.
+    // Truly non-JSON bytes have no recoverable instrument; Engine handles the
+    // resulting unknown-symbol control conservatively for the whole feed.
+    let symbol = outer["symbol"].as_str().unwrap_or("__unknown__");
     Ok(Record {
         exchange: exchange.into(),
         market: market.into(),
@@ -515,11 +600,13 @@ pub fn discover_filtered(
         } else {
             continue;
         };
-        if !known_feed(&stem[prefix.len()..]) {
-            eprintln!("warning: skipping unknown feed {}", path.display());
-            continue;
-        }
-        let stream = StreamPath::new(&path)?;
+        let stream = match StreamPath::new(&path) {
+            Ok(stream) => stream,
+            Err(_) => {
+                eprintln!("warning: skipping unknown v3 stream {}", path.display());
+                continue;
+            }
+        };
         if exchange.is_some_and(|e| e != stream.exchange)
             || market.is_some_and(|m| m != stream.market)
         {
@@ -533,7 +620,7 @@ pub fn discover_filtered(
     let paths = chosen.into_values().map(|(_, p)| p).collect::<Vec<_>>();
     if paths.is_empty() {
         return Err(error(
-            "no v2 input streams found (use --allow-open for .jsonl.open)",
+            "no v3 input streams found (use --allow-open for .jsonl.open)",
         ));
     }
     Ok(paths)

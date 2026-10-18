@@ -15,6 +15,8 @@ from collectors.common.runner import ConnRun, Handler
 
 log = logging.getLogger(__name__)
 
+SNAPSHOT_INTERVAL_S = 7 * 60
+
 TRADE_LIKE = {"trades", "trades_agg"}
 
 
@@ -129,11 +131,12 @@ class BinanceHandler(Handler):
             if stream.feed == "l2":
                 self.sync[stream.key] = PerpDepthSync() if self.perp else SpotDepthSync()
                 self.tasks.append(asyncio.create_task(self._snapshot(run, stream)))
+                self.tasks.append(asyncio.create_task(self._periodic_snapshots(run, stream)))
 
-    async def _snapshot(self, run: ConnRun, stream: Stream) -> None:
+    async def _snapshot(self, run: ConnRun, stream: Stream, *, periodic=False) -> None:
         try:
             path = "/fapi/v1/depth" if self.perp else "/api/v3/depth"
-            await asyncio.sleep(1.5)  # let deltas buffer first, per the documented procedure
+            await asyncio.sleep(0 if periodic else 1.5)  # let deltas buffer first, per the documented procedure
             for attempt in range(10):
                 resp = await self.http.get(
                     self.spec.options["rest"] + path,
@@ -144,17 +147,26 @@ class BinanceHandler(Handler):
                     log.warning("%s snapshot HTTP %s: %s", stream.key, resp.status_code, resp.text[:200])
                     await asyncio.sleep(2 + attempt)
                     continue
-                run.emit(stream, "snapshot", resp.text, recv_ns)
+                run.emit(stream, "snapshot", resp.text, recv_ns, event="periodic" if periodic else "anchor")
+                if periodic:
+                    return  # archival only: never reset the collector sync state
                 last_id = orjson.loads(resp.content)["lastUpdateId"]
                 if self.sync[stream.key].on_snapshot(last_id) == "synced":
                     run.stream_synced(stream)
                     return
                 log.info("%s snapshot %s older than buffered deltas; refetching", stream.key, last_id)
                 await asyncio.sleep(1)
-            run.gap(stream, "sequence_gap", {"error": "could not sync REST snapshot"})
+            if not periodic:
+                run.gap(stream, "sequence_gap", {"error": "could not sync REST snapshot"})
         except Exception as e:
             log.exception("%s snapshot failed", stream.key)
-            run.gap(stream, "sequence_gap", {"error": f"snapshot failed: {e!r}"})
+            if not periodic:
+                run.gap(stream, "sequence_gap", {"error": f"snapshot failed: {e!r}"})
+
+    async def _periodic_snapshots(self, run: ConnRun, stream: Stream) -> None:
+        while True:
+            await asyncio.sleep(SNAPSHOT_INTERVAL_S)
+            await self._snapshot(run, stream, periodic=True)
 
     def on_frame(self, run: ConnRun, text: str, recv_ns: int) -> None:
         msg = orjson.loads(text)

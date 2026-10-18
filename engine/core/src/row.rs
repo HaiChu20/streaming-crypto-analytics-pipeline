@@ -5,6 +5,8 @@ pub struct Row {
     pub exchange: String,
     pub market: String,
     pub symbol: String,
+    #[serde(default)]
+    pub asset: String,
     pub tick_ns: i64,
     pub available_ns: i64,
     pub engine_version: String,

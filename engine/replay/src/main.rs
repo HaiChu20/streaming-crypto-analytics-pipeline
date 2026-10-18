@@ -130,6 +130,7 @@ fn run() -> Result<()> {
     let mut writer = Writer::new(&out)?;
     let mut engine = Engine::default();
     let mut coverage = BTreeMap::<String, (u64, u64)>::new();
+    let mut row_counts = BTreeMap::<String, u64>::new();
     let mut max_cross = BTreeMap::<String, f64>::new();
     let mut first_ns = None;
     let mut last_ns = None;
@@ -147,6 +148,9 @@ fn run() -> Result<()> {
             engine.consume_at_tick(&r, tick)?;
         }
         for row in engine.tick(tick)? {
+            *row_counts
+                .entry(format!("{}/{}/{}", row.exchange, row.market, row.symbol))
+                .or_default() += 1;
             if row.exchange != "cross" {
                 let count = coverage
                     .entry(format!("{}/{}/{}", row.exchange, row.market, row.symbol))
@@ -178,7 +182,7 @@ fn run() -> Result<()> {
     println!(
         "{}",
         serde_json::to_string_pretty(
-            &serde_json::json!({"output":out,"records":engine.records,"rows":rows,"wall_s":seconds,"records_per_s":engine.records as f64/seconds,"first_recv_ns":first_ns,"last_recv_ns":last_ns,"book_breaks":engine.book_breaks,"book_break_reasons":engine.book_break_reasons,"data_anomalies":engine.data_anomalies,"clock_steps":merge.clock_steps(),"foreign_before_day":foreign,"coverage":coverage,"max_abs_cross_bps":max_cross,"inputs":merge.snapshots})
+            &serde_json::json!({"output":out,"records":engine.records,"rows":rows,"wall_s":seconds,"records_per_s":engine.records as f64/seconds,"first_recv_ns":first_ns,"last_recv_ns":last_ns,"book_breaks":engine.book_breaks,"book_break_reasons":engine.book_break_reasons,"data_anomalies":engine.data_anomalies,"clock_steps":merge.clock_steps(),"foreign_before_day":foreign,"coverage":coverage,"max_abs_cross_bps":max_cross,"inputs":merge.snapshots,"books":engine.book_reports(),"row_counts":row_counts})
         )?
     );
     Ok(())

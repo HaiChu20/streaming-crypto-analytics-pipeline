@@ -19,7 +19,7 @@ def test_v1_preserves_offsets_connection_open_and_tail(tmp_path):
     source.write_bytes(original)
     out = tmp_path / 'v2'
     report = convert(tmp_path / 'v1', out)
-    target = out / 'kraken/spot/BTC-USD/20261016_l2.jsonl.open'
+    target = out / 'Kraken/Spot/BTC-USD/20261016_book.jsonl.open'
     r = json.loads(target.read_bytes())
     assert not target.with_name(target.name + '.meta.json').exists()
     assert r['offset'] == 42 and r['conn'] == 'original'
@@ -40,7 +40,7 @@ def test_closed_v1_rollover_and_no_clobber_meta(tmp_path):
     report = convert(tmp_path/'v1', tmp_path/'v2')
     target = Path(report[0]['output'])
     assert json.loads(target.read_bytes().splitlines()[-1])['marker'] == 'rollover'
-    assert json.loads(target.with_name(target.name+'.meta.json').read_bytes())['format'] == 'v2'
+    assert json.loads(target.with_name(target.name+'.meta.json').read_bytes())['format'] == 'v3'
 
 
 def test_legacy_gzip_epochs_metadata_crc(tmp_path):
@@ -67,7 +67,7 @@ def test_legacy_gzip_epochs_metadata_crc(tmp_path):
         assert error['reason'] == 'disconnect' and error['exc_type'] == 'ConnectionClosedError'
         meta = json.loads(path.with_name(path.name+'.meta.json').read_bytes())
         assert meta['synthetic_offsets'] is True
-        feed = path.name.split('_')[1].split('.')[0]
+        feed = {'book': 'l2', 'level3': 'l3', 'trades': 'trades'}[path.name.split('_')[1].split('.')[0]]
         stream = next(s for s in streams if s.exchange=='kraken' and s.market=='spot' and s.asset=='BTC' and s.feed==feed)
         result = check_stream(stream, [path], 100, True)
         assert not result['errors']
@@ -116,3 +116,34 @@ def test_legacy_open_has_no_metadata(tmp_path):
     target = Path(report[0]['output'])
     assert target.name.endswith('.open')
     assert not target.with_name(target.name + '.meta.json').exists()
+
+
+@pytest.mark.parametrize('compressed', [False, True])
+def test_v2_binance_split_conversion_and_exclusive_outputs(tmp_path, compressed):
+    source = tmp_path/'v2/binance/spot/BTCUSDT/20261016_l2.jsonl'
+    if compressed:
+        source = source.with_name(source.name + '.gz')
+    source.parent.mkdir(parents=True)
+    rows = [dict(marker='ws_event', event='connected', channel='depth@100ms', conn='c',
+                 recv_time_ns=1792108800000000000, offset=0, instrument={'tick':'0.1'}),
+            dict(type='snapshot', lastUpdateId=100, recv_time_ns=1792108800000000001, conn='c', offset=1, bids=[], asks=[]),
+            dict(stream='btcusdt@depth@100ms', recv_time_ns=1792108800000000002, conn='c', offset=2,
+                 data={'e':'depthUpdate','U':101,'u':102,'b':[['1.20','3.400']],'a':[]})]
+    original = b''.join(rawfmt.dumps(row)+b'\n' for row in rows)
+    source.write_bytes(gzip.compress(original) if compressed else original)
+    before = source.read_bytes()
+    reports = convert(tmp_path/'v2', tmp_path/'v3')
+    assert len(reports) == 2
+    converted = []
+    for report in reports:
+        target = Path(report['output'])
+        with (gzip.open(target, 'rb') if compressed else target.open('rb')) as f:
+            converted.extend(json.loads(row) for row in f if json.loads(row).get('marker') != 'rollover')
+    assert sorted(r['offset'] for r in converted) == [0,1,2]
+    snap = next(r for r in converted if r.get('channel') == 'snapshot')
+    assert snap['event'] == 'anchor' and snap['symbol'] == 'BTCUSDT' and 'type' not in snap['data']
+    delta = next(r for r in converted if r.get('offset') == 2)
+    assert delta['channel'] == 'depth' and delta['data']['b'] == [['1.20','3.400']]
+    assert source.read_bytes() == before
+    with pytest.raises(FileExistsError):
+        convert(tmp_path/'v2', tmp_path/'v3')

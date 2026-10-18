@@ -11,7 +11,7 @@ from collectors.common.config import Stream
 SCHEMA_VERSION = 1
 
 
-def data_record(stream: Stream, kind: str, conn: str, seq: int, recv_ns: int, payload: str) -> bytes:
+def data_record(stream: Stream, kind: str, conn: str, seq: int, recv_ns: int, payload: str, event: str | None = None) -> bytes:
     return orjson.dumps(
         {
             "v": SCHEMA_VERSION,
@@ -24,6 +24,7 @@ def data_record(stream: Stream, kind: str, conn: str, seq: int, recv_ns: int, pa
             "seq": seq,
             "recv_ns": recv_ns,
             "payload": payload,
+            **({"event": event} if event is not None else {}),
         }
     )
 

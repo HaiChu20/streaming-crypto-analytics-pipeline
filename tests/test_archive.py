@@ -271,9 +271,28 @@ def test_verify_cli_exits_one_on_corruption(tmp_path, monkeypatch):
     assert exc.value.code == 1
 
 
-def test_archive_uses_v2_s3_key(tmp_path):
+def test_archive_uses_v3_s3_key(tmp_path):
     s3 = FakeS3()
     day_file(tmp_path, all_streams(CFG)[0])
     manifest = DailyArchive(tmp_path, CFG, s3, 'bucket').archive_day(DAY, NOW)
-    assert manifest['files'][0]['key'] == 'raw/kraken/spot/BTC-USD/20261016_l2.jsonl.gz'
-    assert manifest['files'][0]['format'] == 'v2'
+    assert manifest['files'][0]['key'] == 'raw/Kraken/Spot/BTC-USD/20261016_book.jsonl.gz'
+    assert manifest['files'][0]['format'] == 'v3'
+
+
+def test_binance_archive_includes_depth_and_snapshot(tmp_path):
+    from archiver.record_raw import Recorder
+    cfg = deepcopy(CFG)
+    cfg['exchanges'] = {'binance': {'spot': {'symbols': {'BTC': 'BTCUSDT'},
+        'connections': {'spot': {'url': 'ws://unused', 'feeds': {'l2': 'depth@100ms'}}}}}}
+    stream = all_streams(cfg)[0]
+    key = stream.topic, stream.partition
+    rec = Recorder(tmp_path, {key: stream})
+    for offset, kind, day in [(0, 'update', 16), (1, 'snapshot', 16), (2, 'update', 17)]:
+        payload = '{"lastUpdateId":100}' if kind == 'snapshot' else '{"U":101,"u":102}'
+        rec.handle(*key, offset, data_record(stream, kind, 'c', offset, int(NOW.replace(day=day).timestamp())*10**9, payload))
+    rec.shutdown()
+    manifest = DailyArchive(tmp_path, cfg, FakeS3(), 'bucket').archive_day(DAY, NOW)
+    assert manifest['status'] == 'complete'
+    assert {f['key'] for f in manifest['files']} == {
+        'raw/Binance/Spot/BTCUSDT/20261016_depth.jsonl.gz',
+        'raw/Binance/Spot/BTCUSDT/20261016_snapshot.jsonl.gz'}

@@ -1,10 +1,15 @@
 use crate::{Book, Outcome, Result, integer};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::collections::VecDeque;
+
+/// At most 100,000 deltas per unsynced connection; evict oldest, then let
+/// lastUpdateId continuity reject an anchor that predates retained history.
+const MAX_PENDING: usize = 100_000;
 
 #[derive(Serialize, Deserialize, Debug, Default)]
 pub(crate) struct Sync {
-    pending: Vec<Value>,
+    pending: VecDeque<Value>,
     last: Option<i64>,
     prev: Option<i64>,
     waiting: bool,
@@ -17,8 +22,13 @@ impl Sync {
         data: &Value,
         snapshot: bool,
         perp: bool,
+        counters: &mut crate::Counters,
     ) -> Result<Outcome> {
         if snapshot {
+            if self.last.is_some() {
+                counters.snapshots_ignored += 1;
+                return Ok(Outcome::Ignored);
+            }
             let last = integer(data, "lastUpdateId")?;
             let events = std::mem::take(&mut self.pending)
                 .into_iter()
@@ -66,7 +76,11 @@ impl Sync {
             if perp {
                 integer(data, "pu")?;
             }
-            self.pending.push(data.clone());
+            if self.pending.len() == MAX_PENDING {
+                self.pending.pop_front();
+                counters.pending_evicted += 1;
+            }
+            self.pending.push_back(data.clone());
             Ok(Outcome::Buffered)
         } else {
             let outcome = self.delta(book, data, perp)?;
@@ -120,5 +134,46 @@ impl Sync {
         }
         book.arrays(data, "b", "a")?;
         Ok(Outcome::Applied)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::Counters;
+    use serde_json::json;
+    #[test]
+    fn pending_is_bounded_and_snapshot_ignores_obsolete_buffered_deltas() {
+        let mut sync = Sync::default();
+        let mut book = Book::default();
+        let mut counters = Counters::default();
+        for id in 1..=MAX_PENDING + 1 {
+            let delta = json!({"U":id,"u":id,"b":[],"a":[]});
+            assert_eq!(
+                sync.apply(&mut book, &delta, false, false, &mut counters)
+                    .unwrap(),
+                Outcome::Buffered
+            );
+        }
+        assert_eq!(sync.pending.len(), MAX_PENDING);
+        assert_eq!(sync.pending.front().unwrap()["u"], 2);
+        assert_eq!(counters.pending_evicted, 1);
+        let anchor = json!({"lastUpdateId":MAX_PENDING,"bids":[["10","1"]],"asks":[["11","1"]]});
+        assert_eq!(
+            sync.apply(&mut book, &anchor, true, false, &mut counters)
+                .unwrap(),
+            Outcome::Snapshot {
+                buffered_updates: 1
+            }
+        );
+        assert!(sync.pending.is_empty());
+        let periodic = json!({"lastUpdateId":0,"bids":[],"asks":[]});
+        assert_eq!(
+            sync.apply(&mut book, &periodic, true, false, &mut counters)
+                .unwrap(),
+            Outcome::Ignored
+        );
+        assert_eq!(counters.snapshots_ignored, 1);
+        assert!(book.best_bid().is_some());
     }
 }

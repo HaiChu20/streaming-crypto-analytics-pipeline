@@ -7,6 +7,7 @@ size and incomplete tails are ignored. Memory is capped independently of data vo
 
 import argparse
 import gzip
+import heapq
 import math
 import os
 import re
@@ -23,6 +24,9 @@ import orjson
 import yaml
 
 REPO = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(REPO))
+from archiver import rawfmt
+
 NS = 1_000_000_000
 DAY = 86400 * NS
 GIB = 1024**3
@@ -33,8 +37,8 @@ FRESH_SAMPLES = 8192  # at most this many data records per stream
 EVENT_LIMIT = 10000  # fail explicitly, never silently truncate incident output
 PRICE_SOURCE = "https://pricing.us-east-1.amazonaws.com/offers/v1.0/aws/AmazonS3/current/eu-north-1/index.json"
 PRICE_FETCHED = "2026-10-17"
-# Recorder-owned v2 header: matching the entire triplet prevents native nested keys
-# from being mistaken for recorder timestamps/offsets. Both orders occur in v2.
+# Recorder-owned v3 header: matching the entire triplet prevents native nested keys
+# from being mistaken for recorder timestamps/offsets. Archive files can omit conn/offset.
 HEADER = re.compile(rb'"recv_time_ns"\s*:\s*(\d+)\s*,\s*"conn"\s*:\s*"([^"\\]*)"\s*,\s*"offset"\s*:\s*(\d+)')
 MARKER = re.compile(rb'^\s*\{\s*"marker"\s*:')
 
@@ -61,6 +65,8 @@ def event_time_ns(exchange, market, rec):
             return None
     if not isinstance(rec, dict):
         return None
+    if exchange in ('okx', 'kraken') and isinstance(rec.get('data'), dict):
+        rec = rec['data']
     data = rec.get('data', rec)
     if exchange == 'binance':
         if not isinstance(data, dict):
@@ -114,24 +120,26 @@ def lines(path, size):
 def last_record(path):
     """Bounded tail context; gzip needs a sequential read, ordinary files seek."""
     size = path.stat().st_size
-    if path.suffix == '.gz':
-        last = None
-        for _, line in lines(path, size):
-            if b'"recv_time_ns"' in line:
-                last = line
-        return orjson.loads(last) if last else None
-    with path.open('rb') as f:
-        f.seek(max(0, size - MAX_LINE - 1))
-        block = f.read(MAX_LINE + 1)
-    rows = block.split(b'\n')[:-1]
-    if size > MAX_LINE + 1:
-        rows = rows[1:]
-    for row in reversed(rows):
-        if HEADER.search(row) or MARKER.match(row):
-            rec = orjson.loads(row)
-            if 'offset' in rec and 'recv_time_ns' in rec:
-                return rec
-    return None
+    if path.suffix != '.gz':
+        with path.open('rb') as f:
+            f.seek(max(0, size - MAX_LINE - 1))
+            block = f.read(MAX_LINE + 1)
+        rows = block.split(b'\n')[:-1]
+        if size > MAX_LINE + 1:
+            rows = rows[1:]
+        for row in reversed(rows):
+            if HEADER.search(row) or MARKER.match(row):
+                rec = orjson.loads(row)
+                if 'offset' in rec and 'recv_time_ns' in rec:
+                    return rec
+    # Archive-only headers need the file's marker history for synthetic epochs.
+    last = None
+    headers = rawfmt.Headers(path)
+    for index, (_, line) in enumerate(lines(path, size)):
+        rec = orjson.loads(line)
+        if rec.get('marker') != 'rollover':
+            last = headers.read(rec, index)
+    return last
 
 
 def union_seconds(intervals, start, end):
@@ -162,8 +170,8 @@ def chosen_files(directory, feed):
 def scan_stream(path, day, previous=None, following=None, *, sample_bytes=SAMPLE_BYTES):
     start = int(datetime.combine(day, datetime.min.time(), timezone.utc).timestamp()) * NS
     end = start + DAY
-    exchange, market, symbol = path.parts[-4:-1]
-    feed = path.name.split('_', 1)[1].split('.', 1)[0]
+    exchange, market, symbol, channel = rawfmt.archive_identity(path)
+    feed = next((f for f,(c,_) in rawfmt.CHANNELS[exchange].items() if c == channel), channel)
     size = path.stat().st_size
     is_open = path.name.endswith('.open')
     meta_path = path.with_name(path.name + '.meta.json')
@@ -199,6 +207,9 @@ def scan_stream(path, day, previous=None, following=None, *, sample_bytes=SAMPLE
     offset_gaps, first_ns, first_offset = [], None, None
     byte_count, line_count, data_count, foreign = 0, 0, 0, 0
     boundary_gap = None
+    headers = rawfmt.Headers(path)
+    synthetic = False
+    split = exchange == "binance" and channel in ("depth", "snapshot")
     for pos, line in lines(path, size):
         line_count += 1
         byte_count += len(line)
@@ -214,21 +225,22 @@ def scan_stream(path, day, previous=None, following=None, *, sample_bytes=SAMPLE
                 compressed_bytes += len(compressor.compress(piece))
             j += 1
         marker = bool(MARKER.match(line))
-        if marker:
+        match = HEADER.search(line)
+        if marker or not match:
             rec = orjson.loads(line)
             if rec.get('marker') == 'rollover':
                 continue
+            synthetic = 'offset' not in rec
+            rec = headers.read(rec, line_count - 1)
             ns, conn, offset = rec['recv_time_ns'], rec['conn'], rec['offset']
         else:
-            match = HEADER.search(line)
-            if not match:
-                raise ValueError(f'not a recorder v2 header: {path}:{line_count}')
+            synthetic = False
             ns, conn, offset = int(match[1]), match[2].decode(), int(match[3])
         if first_ns is None:
             first_ns, first_offset = ns, offset
-            if previous_file_offset is not None and not (meta or {}).get('synthetic_offsets') and offset != previous_file_offset + 1:
+            if not synthetic and not split and previous_file_offset is not None and not (meta or {}).get('synthetic_offsets') and offset != previous_file_offset + 1:
                 boundary_gap = [previous_file_offset + 1, offset]
-        if not meta and prev_offset is not None and offset != prev_offset + 1:
+        if not synthetic and not split and not meta and prev_offset is not None and offset != prev_offset + 1:
             offset_gaps.append([prev_offset+1, offset])
             if len(offset_gaps) > EVENT_LIMIT:
                 raise ValueError(f'too many offset gaps (> {EVENT_LIMIT}): {path}')
@@ -243,7 +255,7 @@ def scan_stream(path, day, previous=None, following=None, *, sample_bytes=SAMPLE
                     outage['end_ns'] = ns
                     outages.append(outage)
                 pending.clear()
-            elif event in ('connection_error', 'disconnected'):
+            elif event in ('connection_error', 'disconnected', 'rotating', 'shutdown'):
                 if conn in active:
                     covered.append((active.pop(conn), ns))
                 if event == 'connection_error':
@@ -284,7 +296,7 @@ def scan_stream(path, day, previous=None, following=None, *, sample_bytes=SAMPLE
     if pending and following:
         for _, line in lines(following, following.stat().st_size):
             if MARKER.match(line):
-                rec = orjson.loads(line)
+                rec = rawfmt.Headers(following).read(orjson.loads(line), 0)
                 if rec.get('event') == 'connected':
                     for outage in pending:
                         outage['end_ns'] = rec['recv_time_ns']
@@ -302,7 +314,7 @@ def scan_stream(path, day, previous=None, following=None, *, sample_bytes=SAMPLE
     if meta:
         if meta['bytes'] != byte_count or meta['lines'] != line_count:
             raise ValueError(f'closed metadata count mismatch: {path}')
-        offset_gaps = list(meta.get('offset_gaps', []))
+        offset_gaps = [] if split else list(meta.get('offset_gaps', []))
         if boundary_gap:
             offset_gaps.insert(0, boundary_gap)
     gz = path if path.suffix == '.gz' else path.with_name(path.name.removesuffix('.open') + '.gz')
@@ -323,7 +335,7 @@ def scan_stream(path, day, previous=None, following=None, *, sample_bytes=SAMPLE
                   coverage_pct=coverage/864, active_seconds=coverage,
                   uncertain_intervals=[dict(start_ns=a,end_ns=b) for a,b in uncertain],
                   uncertain_seconds=union_seconds(uncertain,start,end), outages=outages,
-                  offset_gaps=offset_gaps, foreign_day_records=foreign,
+                  offset_gaps=offset_gaps, offset_gaps_scope='partition union' if split else 'file', foreign_day_records=foreign,
                   first_recv_ns=first_ns, last_recv_ns=last_ns if first_ns is not None else None,
                   first_offset=first_offset, last_offset=prev_offset,
                   rate_per_minute=quantiles(minute_counts), freshness_ms=quantiles(fresh),
@@ -410,11 +422,37 @@ def exchange_summary(streams, samples, labels, start, end):
     return output
 
 
+def partition_gaps(paths):
+    def offsets(path):
+        for _, line in lines(path, path.stat().st_size):
+            match = HEADER.search(line)
+            if match:
+                yield int(match[3])
+            elif MARKER.match(line):
+                rec = orjson.loads(line)
+                if 'offset' in rec:
+                    yield rec['offset']
+    gaps, previous = [], None
+    for offset in heapq.merge(*(offsets(p) for p in paths)):
+        if previous is not None and offset != previous + 1:
+            gaps.append([previous + 1, offset])
+            if len(gaps) > EVENT_LIMIT:
+                raise ValueError('too many partition offset gaps')
+        previous = offset
+    return gaps
+
+
 def build_report(day, root, allow_open=False, *, env=None):
     env = os.environ if env is None else env
     cfg = yaml.safe_load((REPO/'config/markets.yaml').read_text())
     token = day.strftime('%Y%m%d')
     paths, missing, labels, missing_gaps = [], [], {}, []
+    tree = root / 'raw' if (root / 'raw').exists() else root
+    groups = {}
+    for p in rawfmt.archive_files(tree):
+        exchange, market, symbol, channel = rawfmt.archive_identity(p)
+        groups.setdefault((exchange, market, symbol, channel), {})[p.name[:8]] = p
+    selected = set()
     for exchange, markets in cfg['exchanges'].items():
         for market, spec in markets.items():
             for conn_name, conn in spec['connections'].items():
@@ -423,10 +461,12 @@ def build_report(day, root, allow_open=False, *, env=None):
                         symbol = symbol.replace('/', '-')
                         key = f'{exchange}.{market}.{feed}.{symbol}'
                         labels[key] = f'{exchange}.{market}.{conn_name}'
-                        found = chosen_files(root/'raw'/exchange/market/symbol, feed)
+                        channel = rawfmt.channel(exchange, market, feed)[0]
+                        found = groups.get((exchange, market, symbol, channel), {})
                         if token in found:
                             older, newer = sorted(d for d in found if d < token), sorted(d for d in found if d > token)
                             paths.append((found[token], found[older[-1]] if older else None, found[newer[0]] if newer else None))
+                            selected.add(found[token])
                         else:
                             missing.append(key)
                             older = sorted(d for d in found if d < token)
@@ -438,15 +478,19 @@ def build_report(day, root, allow_open=False, *, env=None):
                                     if newer:
                                         for _, line in lines(found[newer[0]], found[newer[0]].stat().st_size):
                                             if MARKER.match(line):
-                                                rec = orjson.loads(line)
+                                                rec = rawfmt.Headers(found[newer[0]]).read(orjson.loads(line), 0)
                                                 if rec.get('event') == 'connected':
                                                     next_start = rec['recv_time_ns']
                                                     break
                                     missing_gaps.append(dict(stream=key, previous_record_ns=prior['recv_time_ns'],
                                         next_connected_ns=next_start,
                                         status='disconnect' if prior.get('event') == 'connection_error' else 'uncertain'))
+    for found in groups.values():
+        if token in found and found[token] not in selected:
+            older, newer = sorted(d for d in found if d < token), sorted(d for d in found if d > token)
+            paths.append((found[token], found[older[-1]] if older else None, found[newer[0]] if newer else None))
     if not paths:
-        raise ValueError(f'no v2 streams for {day}')
+        raise ValueError(f'no v3 streams for {day}')
     if not allow_open and any(p.name.endswith('.open') for p,_,_ in paths):
         raise ValueError('open files present; use --allow-open for a provisional report')
     streams, samples = [], defaultdict(list)
@@ -455,6 +499,15 @@ def build_report(day, root, allow_open=False, *, env=None):
         streams.append(result)
         samples[result['exchange']].extend(fresh)
         print(f"{result['stream']}: {result['lines']:,} lines, {result['bytes']/1e9:.3f} GB",file=sys.stderr,flush=True)
+    # Binance l2 offsets interleave across depth + snapshot. Validate the union,
+    # then attribute any loss once, to depth, rather than flagging sparse files.
+    split_groups = defaultdict(list)
+    for result in streams:
+        if result['exchange'] == 'binance' and result['feed'] in ('l2', 'snapshot'):
+            split_groups[result['market'], result['symbol']].append(result)
+    for group in split_groups.values():
+        gaps = partition_gaps([Path(r['path']) for r in group])
+        group[0]['offset_gaps'] = gaps
     start = int(datetime.combine(day,datetime.min.time(),timezone.utc).timestamp())*NS
     end = start+DAY
     first = min(s['first_recv_ns'] for s in streams if s['first_recv_ns'] is not None)

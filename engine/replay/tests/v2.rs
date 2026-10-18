@@ -1,11 +1,17 @@
+//! V3 tests; historical fixtures/v2 remains on disk, unused.
 use engine_core::{Kind, Outcome, Side, StreamBook};
 use engine_replay::input::{Merge, StreamPath, discover_filtered};
+use serde_json::json;
 use std::path::PathBuf;
-
 fn fixtures(variant: &str) -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(format!("tests/fixtures/v2/{variant}"))
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(format!("tests/fixtures/v3/{variant}"))
 }
-
+fn scratch(name: &str) -> PathBuf {
+    PathBuf::from(
+        std::env::var_os("ENGINE_TEST_SCRATCH").unwrap_or_else(|| std::env::temp_dir().into()),
+    )
+    .join(format!("v3-{name}-{}", std::process::id()))
+}
 #[test]
 fn exact_decimal_strings_and_number_tokens_produce_identical_books_and_crcs() {
     let mut books = Vec::new();
@@ -49,184 +55,322 @@ fn exact_decimal_strings_and_number_tokens_produce_identical_books_and_crcs() {
     }
     assert_eq!(books[0], books[1]);
 }
-
 #[test]
-fn path_metadata_markers_kind_inference_and_v1_rejection() {
-    let path = StreamPath::new(&PathBuf::from(
-        "raw/okx/perp/ETH-USDT-SWAP/20261016_l2.jsonl",
-    ))
-    .unwrap();
-    let record = path.parse(r#"{"marker":"ws_event","event":"connected","conn":"A","offset":0,"recv_time_ns":1,"instrument":{"ctVal":"0.01"},"ack":{"result":{"depth":10}}}"#).unwrap().unwrap();
-    assert_eq!(record.kind, Kind::Control);
-    assert_eq!(record.event.as_deref(), Some("start"));
-    assert_eq!(record.partition, Some(1));
-    assert_eq!(record.symbol, "ETH-USDT-SWAP");
-    assert_eq!(record.topic.as_deref(), Some("raw.okx.perp.l2.v1"));
-    assert_eq!(record.detail.unwrap()["instrument"]["ctVal"], "0.01");
-    for (event, expected, reason) in [
-        ("disconnected", "stop", None),
-        ("connection_error", "drop", Some("disconnect")),
-    ] {
-        let mut v = serde_json::json!({"marker":"ws_event","event":event,"conn":"A","offset":1,"recv_time_ns":2});
-        if event == "connection_error" {
-            v["reason"] = serde_json::json!("disconnect");
-        }
-        let r = path.parse(&v.to_string()).unwrap().unwrap();
-        assert_eq!(r.event.as_deref(), Some(expected));
-        assert_eq!(r.reason.as_deref(), reason);
-    }
-    assert!(
-        path.parse(r#"{"marker":"rollover","new_period":"20261017"}"#)
-            .unwrap()
-            .is_none()
-    );
-    assert!(
-        path.parse(r#"{"marker":"gap","offset":2,"recv_time_ns":2}"#)
-            .unwrap()
-            .is_none()
-    );
-    assert!(
-        path.parse(r#"{"exchange":"okx","recv_ns":1,"payload":"{}"}"#)
-            .is_err()
-    );
-    assert!(
-        path.parse(r#"{"_recv_time_ns":1,"_conn":"A","_offset":0,"data":[]}"#)
-            .is_err()
-    );
-    let bad = path
-        .parse(r#"{"recv_time_ns":1,"conn":"A","offset":2,"raw":"not JSON"}"#)
-        .unwrap()
-        .unwrap();
-    assert_eq!(bad.kind, Kind::Control);
-    assert_eq!(bad.event.as_deref(), Some("drop"));
-    assert_eq!(bad.reason.as_deref(), Some("malformed_envelope"));
-    assert_eq!(bad.offset, Some(2));
-    assert_eq!(bad.payload, "");
-    let spot =
-        StreamPath::new(&PathBuf::from("raw/kraken/spot/BTC-USD/20261016_l2.jsonl")).unwrap();
-    let fixture_text =
-        std::fs::read_to_string(fixtures("strings").join("kraken/spot/BTC-USD/20261016_l2.jsonl"))
-            .unwrap();
-    let mut fixture = fixture_text.lines();
-    let start = spot.parse(fixture.next().unwrap()).unwrap().unwrap();
-    let snapshot = spot.parse(fixture.next().unwrap()).unwrap().unwrap();
-    let mut book = StreamBook::new(&start).unwrap();
-    book.consume(&start).unwrap();
-    book.consume(&snapshot).unwrap();
-    assert!(book.valid());
-    let bad = spot
-        .parse(r#"{"recv_time_ns":3,"conn":"A","offset":3,"raw":"[truncated"}"#)
-        .unwrap()
-        .unwrap();
-    let mut engine = engine_replay::features::Engine::default();
-    engine.consume(&start).unwrap();
-    engine.consume(&snapshot).unwrap();
-    engine.consume(&bad).unwrap();
-    assert_eq!(engine.book_break_reasons["malformed"], 1);
-    for (ex, market, symbol, feed, native, expected) in [
+fn native_shapes_channel_mapping_and_lenient_paths() {
+    for (ex, market, symbol, channel, native, kind, feed) in [
         (
-            "kraken",
-            "spot",
-            "BTC-USD",
+            "BiNaNcERaw",
+            "Spotv6",
+            "USDTUSD",
+            "depth",
+            json!({"U":1,"u":2}),
+            Kind::Update,
             "l2",
-            r#""type":"snapshot""#,
+        ),
+        (
+            "Binance",
+            "Futures",
+            "SOLFDUSD",
+            "snapshot",
+            json!({"lastUpdateId":2}),
             Kind::Snapshot,
+            "l2",
         ),
         (
-            "kraken",
-            "spot",
-            "BTC-USD",
-            "trades",
-            r#""type":"update""#,
+            "Binance",
+            "Perpetual",
+            "SOLUSDC",
+            "bookticker",
+            json!({}),
+            Kind::Update,
+            "l1",
+        ),
+        (
+            "Binance",
+            "Swap",
+            "SOLUSD",
+            "aggtrades",
+            json!({}),
             Kind::Trade,
+            "trades_agg",
         ),
         (
-            "kraken",
-            "perp",
+            "Binance",
+            "Futures",
+            "SOLBTC",
+            "markprice",
+            json!({}),
+            Kind::Update,
+            "mark",
+        ),
+        (
+            "Binance",
+            "Futures",
+            "SOLETH",
+            "forceorder",
+            json!({}),
+            Kind::Update,
+            "liquidations",
+        ),
+        (
+            "OKX",
+            "Spot",
+            "USDT-USD",
+            "book",
+            json!({"action":"snapshot","data":[]}),
+            Kind::Snapshot,
+            "l2",
+        ),
+        (
+            "OKX",
+            "Spot",
+            "USDT-USD",
+            "bbo",
+            json!({"data":[]}),
+            Kind::Update,
+            "l1",
+        ),
+        (
+            "OKX",
+            "Spot",
+            "USDT-USD",
+            "trades",
+            json!({"data":[]}),
+            Kind::Trade,
+            "trades_agg",
+        ),
+        (
+            "OKX",
+            "Spot",
+            "USDT-USD",
+            "tradesall",
+            json!({"data":[]}),
+            Kind::Trade,
+            "trades",
+        ),
+        (
+            "Kraken",
+            "Spotv6",
+            "USDT-USD",
+            "book",
+            json!({"channel":"book","type":"snapshot","data":[]}),
+            Kind::Snapshot,
+            "l2",
+        ),
+        (
+            "Kraken",
+            "Spotv6",
+            "USDT-USD",
+            "level3",
+            json!({"channel":"level3","type":"snapshot","data":[]}),
+            Kind::Snapshot,
+            "l3",
+        ),
+        (
+            "Kraken",
+            "Spotv6",
+            "USDT-USD",
+            "trades",
+            json!({"channel":"trade","type":"update","data":[]}),
+            Kind::Trade,
+            "trades",
+        ),
+        (
+            "KrakenRaw",
+            "Futurev6",
+            "PF_XBTUSD",
+            "book",
+            json!({"feed":"book_snapshot"}),
+            Kind::Snapshot,
+            "l2",
+        ),
+        (
+            "KrakenRaw",
+            "Futurev6",
             "PF_XBTUSD",
             "trades",
-            r#""feed":"trade_snapshot""#,
+            json!({"feed":"trade_snapshot"}),
             Kind::Snapshot,
+            "trades",
         ),
         (
-            "kraken",
-            "perp",
+            "KrakenRaw",
+            "Futurev6",
             "PF_XBTUSD",
             "ticker",
-            r#""feed":"ticker""#,
+            json!({"feed":"ticker"}),
             Kind::Update,
-        ),
-        (
-            "binance",
-            "spot",
-            "BTCUSDT",
-            "l2",
-            r#""data":{"e":"depthUpdate"}"#,
-            Kind::Update,
-        ),
-        (
-            "binance",
-            "spot",
-            "BTCUSDT",
-            "l2",
-            r#""type":"snapshot""#,
-            Kind::Snapshot,
-        ),
-        (
-            "okx",
-            "spot",
-            "BTC-USDT",
-            "l2",
-            r#""action":"snapshot""#,
-            Kind::Snapshot,
+            "ticker",
         ),
     ] {
         let path = StreamPath::new(&PathBuf::from(format!(
-            "raw/{ex}/{market}/{symbol}/20261016_{feed}.jsonl"
+            "raw/{ex}/{market}/{symbol}/20261016_{channel}.jsonl"
         )))
         .unwrap();
-        let line = format!("{{{native},\"conn\":\"A\",\"offset\":0,\"recv_time_ns\":1}}");
-        let r = path.parse(&line).unwrap().unwrap();
-        assert_eq!(r.kind, expected);
-        assert_eq!(r.payload, line); // Archive keys do not require payload serialization.
+        let spot = path.exchange == "kraken" && path.market == "spot";
+        let mut line = if spot {
+            native.clone()
+        } else {
+            json!({"data":native})
+        };
+        line["recv_time_ns"] = json!(1);
+        line["conn"] = json!("explicit");
+        line["offset"] = json!(7);
+        let r = path.parse(&line.to_string()).unwrap().unwrap();
+        assert_eq!(r.kind, kind);
+        assert_eq!(r.feed, feed);
+        assert_eq!(r.conn, "explicit");
+        assert_eq!(r.offset, Some(7));
+        let payload: serde_json::Value = serde_json::from_str(&r.payload).unwrap();
+        if spot {
+            assert_eq!(payload, line);
+        } else {
+            assert_eq!(payload, native);
+        }
+    }
+    let path = StreamPath::new(&PathBuf::from(
+        "raw/OKX/Swap/ETH-USDT-SWAP/20261016_book.jsonl",
+    ))
+    .unwrap();
+    for (event, expected) in [
+        ("connected", "start"),
+        ("disconnected", "stop"),
+        ("rotating", "stop"),
+        ("shutdown", "stop"),
+        ("connection_error", "drop"),
+        ("corrupt_message", "corrupt_message"),
+    ] {
+        let line = json!({"marker":"ws_event","event":event,"conn":"A","offset":0,"timestamp":"2026-10-16T00:00:01.123456789Z","instrument":{"ctVal":"0.01"}});
+        let r = path.parse(&line.to_string()).unwrap().unwrap();
+        assert_eq!(r.event.as_deref(), Some(expected));
+        assert_eq!(
+            r.recv_ns,
+            i128::from(engine_replay::input::day_bounds("2026-10-16").unwrap().0) + 1_123_456_789
+        );
+        assert_eq!(r.detail.unwrap()["instrument"]["ctVal"], "0.01");
+    }
+    for line in [r#"{"marker":"rollover"}"#, r#"{"marker":"gap"}"#] {
+        assert!(path.parse(line).unwrap().is_none());
+    }
+    let raw = path
+        .parse(r#"{"recv_time_ns":1,"raw":"broken"}"#)
+        .unwrap()
+        .unwrap();
+    assert_eq!(raw.reason.as_deref(), Some("malformed_envelope"));
+    for line in [
+        r#"{"exchange":"okx","recv_ns":1,"payload":"{}"}"#,
+        r#"{"_recv_time_ns":1,"data":[]}"#,
+    ] {
+        assert!(path.parse(line).is_err());
+    }
+}
+#[test]
+fn synthetic_epochs_line_offsets_marker_times_and_head_only_order() {
+    let root = scratch("epochs");
+    let parent = root.join("Kraken/Spotv6/USDT-USD");
+    std::fs::create_dir_all(&parent).unwrap();
+    let file = parent.join("20261016_trades.jsonl");
+    let data = |time| json!({"recv_time_ns":time,"channel":"trade","data":[]}).to_string();
+    let start = r#"{"marker":"ws_event","event":"connected","conn":"label","timestamp":"1970-01-01T00:00:00.000000020+00:00"}"#;
+    std::fs::write(
+        &file,
+        format!(
+            "{}\n{}\n{}\n{{\"marker\":\"gap\"}}\n{}\n{}\n",
+            data(10),
+            start,
+            data(5),
+            start,
+            data(30)
+        ),
+    )
+    .unwrap();
+    let mut merge = Merge::new(vec![file.clone()]).unwrap();
+    let mut records = Vec::new();
+    while let Some(r) = merge.pop().unwrap() {
+        records.push(r);
     }
     assert_eq!(
-        discover_filtered(
-            &fixtures("strings"),
-            "2026-10-16",
-            false,
-            Some("kraken"),
-            Some("spot")
-        )
-        .unwrap()
-        .len(),
-        2
+        records
+            .iter()
+            .map(|r| r.offset.unwrap())
+            .collect::<Vec<_>>(),
+        [0, 1, 2, 4, 5]
     );
+    assert_eq!(records[0].conn, format!("{}#pre", file.display()));
+    assert_eq!(records[1].conn, "label#1");
+    assert_eq!(records[2].conn, "label#1");
+    assert_eq!(records[3].conn, "label#2");
+    assert_eq!(records[4].conn, "label#2");
+    assert_eq!(
+        records.iter().map(|r| r.recv_ns).collect::<Vec<_>>(),
+        [10, 20, 5, 20, 30]
+    );
+    assert_eq!(merge.clock_steps(), 1);
+    let second = parent.join("20261017_trades.jsonl");
+    std::fs::write(&second, format!("{}\n", data(1))).unwrap();
+    let mut merge = Merge::new(vec![file, second]).unwrap();
+    assert_eq!(merge.pop().unwrap().unwrap().recv_ns, 1);
+}
+#[test]
+fn assets_are_parsed_without_instrument_tables() {
+    for (pair, base) in [
+        ("USDTUSD", "USDT"),
+        ("SOLUSDT", "SOL"),
+        ("ADAUSDC", "ADA"),
+        ("SOLFDUSD", "SOL"),
+        ("ADABTC", "ADA"),
+        ("SOLETH", "SOL"),
+        ("XRPEUR", "XRP"),
+        ("SOL-USDT-SWAP", "SOL"),
+        ("USDT/USD", "USDT"),
+        ("PF_XBTUSD", "BTC"),
+        ("PF_SOLUSD", "SOL"),
+    ] {
+        assert_eq!(engine_core::features::asset(pair), Some(base));
+    }
 }
 
 #[test]
-fn backward_step_across_files_keeps_one_partition_in_offset_order() {
-    let root = PathBuf::from(
-        std::env::var_os("ENGINE_TEST_SCRATCH").unwrap_or_else(|| std::env::temp_dir().into()),
-    )
-    .join(format!("v2-multiday-{}", std::process::id()));
-    let parent = root.join("raw/binance/spot/BTCUSDT");
-    std::fs::create_dir_all(&parent).unwrap();
-    let first = parent.join("20261016_trades.jsonl");
-    let second = parent.join("20261017_trades.jsonl");
-    std::fs::write(
-        &first,
-        "{\"conn\":\"A\",\"recv_time_ns\":20,\"offset\":0}\n",
+fn every_ending_marker_requires_a_new_epoch_and_corrupt_message_is_counted() {
+    let text = std::fs::read_to_string(
+        fixtures("strings").join("kraken/spot/BTC-USD/20261016_book.jsonl"),
     )
     .unwrap();
-    std::fs::write(
-        &second,
-        "{\"conn\":\"A\",\"recv_time_ns\":5,\"offset\":1}\n",
-    )
-    .unwrap();
-    let mut merge = Merge::new(vec![second, first]).unwrap();
-    assert_eq!(merge.pop().unwrap().unwrap().offset, Some(0));
-    assert_eq!(merge.pop().unwrap().unwrap().offset, Some(1));
-    assert!(merge.pop().unwrap().is_none());
-    assert_eq!(merge.clock_steps(), 1);
+    let mut snapshot: serde_json::Value =
+        serde_json::from_str(text.lines().nth(1).unwrap()).unwrap();
+    snapshot.as_object_mut().unwrap().remove("conn");
+    snapshot.as_object_mut().unwrap().remove("offset");
+    for end in ["connection_error", "disconnected", "rotating", "shutdown"] {
+        let dir = scratch(end).join("Kraken/Spot/BTC-USD");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("20261016_book.jsonl");
+        let marker =
+            |event| json!({"marker":"ws_event","event":event,"conn":"same-label","recv_time_ns":1});
+        let lines = [
+            marker("connected"),
+            snapshot.clone(),
+            marker("corrupt_message"),
+            marker(end),
+            snapshot.clone(),
+            marker("connected"),
+            snapshot.clone(),
+        ];
+        std::fs::write(
+            &path,
+            lines.iter().map(|v| format!("{v}\n")).collect::<String>(),
+        )
+        .unwrap();
+        let mut merge = Merge::new(vec![path]).unwrap();
+        let mut book = None;
+        let mut engine = engine_replay::features::Engine::default();
+        for expected in [false, true, true, false, false, false, true] {
+            let record = merge.pop().unwrap().unwrap();
+            let state = book.get_or_insert_with(|| StreamBook::new(&record).unwrap());
+            state.consume(&record).unwrap();
+            engine.consume(&record).unwrap();
+            assert_eq!(state.valid(), expected, "{end}: {record:?}");
+        }
+        assert_eq!(book.unwrap().counters().corrupt_messages, 1);
+        assert_eq!(engine.data_anomalies.values().sum::<u64>(), 1);
+    }
 }

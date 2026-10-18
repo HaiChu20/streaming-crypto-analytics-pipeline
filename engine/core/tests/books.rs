@@ -943,3 +943,69 @@ fn collector_crash_retires_previous_source_but_keeps_carrier_eligible() {
         assert_eq!(stream.connection_count(), 0);
     }
 }
+
+#[test]
+fn archive_anchor_uses_buffered_depth_epoch_and_resyncs_after_break_or_disconnect() {
+    let mut stream = StreamBook::new(&snapshot(0)).unwrap();
+    consume(&mut stream, &control("start", "A"));
+    consume(&mut stream, &spot_delta(1, 2));
+    let mut anchor = snapshot(1);
+    anchor.conn = "snapshot-file#pre".into();
+    anchor.detail = Some(json!({"archive_snapshot":true}));
+    assert_eq!(
+        consume(&mut stream, &anchor),
+        Outcome::Snapshot {
+            buffered_updates: 1
+        }
+    );
+    assert_eq!(stream.active_connection(), Some("A"));
+    assert!(stream.valid());
+    anchor.payload = json!({"lastUpdateId":1000,"bids":[],"asks":[]}).to_string();
+    assert_eq!(consume(&mut stream, &anchor), Outcome::Ignored);
+    assert_eq!(stream.counters().snapshots_ignored, 1);
+    assert!(stream.book().unwrap().best_bid().is_some());
+    assert!(matches!(
+        consume(&mut stream, &spot_delta(10, 10)),
+        Outcome::Break(_)
+    ));
+    assert!(!stream.valid());
+    assert_eq!(consume(&mut stream, &spot_delta(11, 12)), Outcome::Buffered);
+    anchor.payload.clone_from(&snapshot(11).payload);
+    assert!(matches!(
+        consume(&mut stream, &anchor),
+        Outcome::Snapshot {
+            buffered_updates: 1
+        }
+    ));
+    assert!(stream.valid());
+    consume(&mut stream, &control("stop", "A"));
+    assert!(!stream.valid());
+    assert_eq!(consume(&mut stream, &anchor), Outcome::Ignored);
+    consume(&mut stream, &control("start", "B"));
+    let mut delta = spot_delta(20, 21);
+    delta.conn = "B".into();
+    assert_eq!(consume(&mut stream, &delta), Outcome::Buffered);
+    anchor.payload.clone_from(&snapshot(20).payload);
+    assert!(matches!(
+        consume(&mut stream, &anchor),
+        Outcome::Snapshot {
+            buffered_updates: 1
+        }
+    ));
+    assert_eq!(stream.active_connection(), Some("B"));
+    assert!(stream.valid());
+}
+
+#[test]
+fn archive_anchor_before_first_depth_record_keeps_its_book() {
+    let mut anchor = snapshot(1);
+    anchor.conn = "snapshot-file#pre".into();
+    anchor.detail = Some(json!({"archive_snapshot":true}));
+    let mut stream = StreamBook::new(&anchor).unwrap();
+    consume(&mut stream, &anchor);
+    consume(&mut stream, &control("start", "A"));
+    assert_eq!(stream.active_connection(), Some("A"));
+    assert_eq!(consume(&mut stream, &spot_delta(2, 3)), Outcome::Applied);
+    assert!(stream.valid());
+    assert_eq!(stream.connection_count(), 1);
+}

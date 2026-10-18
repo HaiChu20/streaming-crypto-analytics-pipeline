@@ -1,0 +1,4 @@
+{"marker":"ws_event","event":"connected","recv_time_ns":1,"conn":"A","offset":0,"ack":{"result":{"depth":10}},"instrument":{"tick_size":"0.1"}}
+{"channel":"book","type":"snapshot","recv_time_ns":2,"conn":"A","offset":1,"data":[{"bids":[{"price":100.10,"qty":0.00060000}],"asks":[{"price":102.20,"qty":1.23000000}],"checksum":454524676}]}
+{"channel":"book","type":"update","recv_time_ns":3,"conn":"A","offset":2,"data":[{"bids":[{"price":100.10,"qty":0.00060000}],"asks":[],"checksum":454524676}]}
+{"marker":"rollover","new_period":"20261017"}

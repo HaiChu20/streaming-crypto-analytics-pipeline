@@ -63,7 +63,12 @@ def build_matrix(rows: pl.DataFrame, target: str, stride_s: int = 10,
         pl.col("book_valid") & ~pl.col("warmup") & (pl.col("mid_e9") > 0)
         & (pl.col("tick_ns") % (stride_s * NS) == 0)
     ).select("tick_ns")
-    selected = rows.with_columns(asset_expr().alias("asset")).filter(
+    asset_column = asset_expr()
+    if "asset" in rows.columns:
+        # New engine rows declare their base currency; old rows use the original
+        # BTC/ETH symbol fallback, including empty serde-default asset strings.
+        asset_column = pl.when(pl.col("asset").is_not_null() & (pl.col("asset") != "")).then(pl.col("asset")).otherwise(asset_column)
+    selected = rows.with_columns(asset_column.alias("asset")).filter(
         (pl.col("asset") == asset) & (pl.col("tick_ns") % (stride_s * NS) == 0)
     ).join(matrix, on="tick_ns", how="semi")
     conflicts = selected.group_by("tick_ns").agg(

@@ -8,12 +8,27 @@ fn error(message: impl Into<String>) -> crate::Error {
     crate::Error(message.into())
 }
 
-pub fn asset(symbol: &str) -> Option<&'static str> {
-    match symbol {
-        "BTCUSDT" | "BTC-USDT" | "BTC-USDT-SWAP" | "BTC/USD" | "PF_XBTUSD" => Some("BTC"),
-        "ETHUSDT" | "ETH-USDT" | "ETH-USDT-SWAP" | "ETH/USD" | "PF_ETHUSD" => Some("ETH"),
-        _ => None,
+/// Base currency from native Binance, OKX, Kraken spot or PF futures symbols.
+pub fn asset(symbol: &str) -> Option<&str> {
+    let base = if let Some(pair) = symbol.strip_prefix("PF_") {
+        strip_quote(pair)?
+    } else if let Some((base, _)) = symbol.split_once(['/', '-']) {
+        base
+    } else {
+        strip_quote(symbol)?
+    };
+    if base.is_empty() {
+        None
+    } else if base == "XBT" {
+        Some("BTC")
+    } else {
+        Some(base)
     }
+}
+fn strip_quote(pair: &str) -> Option<&str> {
+    ["FDUSD", "USDT", "USDC", "USD", "BTC", "ETH", "EUR"]
+        .into_iter()
+        .find_map(|quote| pair.strip_suffix(quote).filter(|base| !base.is_empty()))
 }
 
 type Key = (String, String, String);
@@ -209,9 +224,9 @@ impl Instrument {
             let outcome = state.consume(r)?;
             let gate = self.gates.entry(r.feed.clone()).or_default();
             if r.kind == Kind::Snapshot && !matches!(outcome, Outcome::Ignored) {
-                gate.accept(&r.conn);
+                gate.accept(state.active_connection().unwrap_or(&r.conn));
             }
-            if matches!(outcome, Outcome::Break(_)) && !crash {
+            if matches!(outcome, Outcome::Break(_)) && !crash && r.exchange != "binance" {
                 gate.end(&r.conn);
             }
             if r.feed == "l3" && outcome == Outcome::Applied {
@@ -238,7 +253,7 @@ impl Instrument {
         match r.feed.as_str() {
             "trades" => {
                 let trades: Vec<&Value> = match (r.exchange.as_str(), r.market.as_str()) {
-                    ("binance", _) => vec![&payload["data"]],
+                    ("binance", _) => vec![payload.get("data").unwrap_or(&payload)],
                     ("okx", _) | ("kraken", "spot") => payload["data"]
                         .as_array()
                         .ok_or_else(|| error("missing trade data"))?
@@ -318,7 +333,7 @@ impl Instrument {
             }
             "mark" => {
                 self.extras_source = Some("mark".into());
-                let data = &payload["data"];
+                let data = payload.get("data").unwrap_or(&payload);
                 self.funding = number(&data["r"]);
                 self.mark = number(&data["p"]);
             }
@@ -329,7 +344,8 @@ impl Instrument {
                 self.oi = number(&payload["openInterest"]);
             }
             "liquidations" => {
-                if !self.remember(format!("liq:{}", payload["data"]["o"])) {
+                let data = payload.get("data").unwrap_or(&payload);
+                if !self.remember(format!("liq:{}", data["o"])) {
                     return Ok(());
                 }
                 let bucket = self
@@ -338,7 +354,7 @@ impl Instrument {
                     .or_default();
                 bucket.liq_count += 1;
                 // forceOrder is sampled; z is cumulative filled quantity of the pushed order.
-                let quantity = i128::from(fixed(&payload["data"]["o"]["z"])?) * i128::from(UNIT);
+                let quantity = i128::from(fixed(&data["o"]["z"])?) * i128::from(UNIT);
                 bucket.liq = bucket
                     .liq
                     .checked_add(quantity)
@@ -353,6 +369,7 @@ impl Instrument {
             exchange: key.0.clone(),
             market: key.1.clone(),
             symbol: key.2.clone(),
+            asset: asset(&key.2).unwrap_or_default().into(),
             tick_ns: tick,
             available_ns: tick + 250_000_000,
             engine_version: ENGINE_VERSION.into(),
@@ -531,6 +548,27 @@ pub struct Engine {
     pub data_anomalies: BTreeMap<String, u64>,
 }
 impl Engine {
+    /// Per-stream continuity and checksum diagnostics, independent of freshness.
+    pub fn book_reports(&self) -> BTreeMap<String, crate::BookReport> {
+        self.instruments
+            .iter()
+            .flat_map(|(key, state)| {
+                [("l2", &state.l2), ("l3", &state.l3)]
+                    .into_iter()
+                    .filter_map(move |(feed, book)| {
+                        book.as_ref().map(|book| {
+                            (
+                                format!("{}/{}/{}/{}", key.0, key.1, key.2, feed),
+                                crate::BookReport {
+                                    valid: book.valid(),
+                                    counters: book.counters(),
+                                },
+                            )
+                        })
+                    })
+            })
+            .collect()
+    }
     /// Active L2 source and validity for reporting overlap handovers.
     pub fn book_sources(&self) -> BTreeMap<(String, String, String), (String, bool)> {
         self.instruments
@@ -552,6 +590,46 @@ impl Engine {
     }
     fn consume_inner(&mut self, r: &Record, current_tick: Option<i64>) -> Result<()> {
         let key = (r.exchange.clone(), r.market.clone(), r.symbol.clone());
+        if r.event.as_deref() == Some("corrupt_message") {
+            *self
+                .data_anomalies
+                .entry(format!(
+                    "{}/{}/{}/{}: corrupt_message",
+                    r.exchange, r.market, r.symbol, r.feed
+                ))
+                .or_default() += 1;
+            self.records += 1;
+            return Ok(());
+        }
+        if r.symbol == "__unknown__" {
+            // No pair can be inferred from a Kafka partition. Invalidate all
+            // observed instruments on this feed rather than guessing a symbol.
+            let symbols = self
+                .instruments
+                .keys()
+                .filter(|key| key.0 == r.exchange && key.1 == r.market)
+                .map(|key| key.2.clone())
+                .collect::<Vec<_>>();
+            if !symbols.is_empty() {
+                let count = symbols.len() as u64;
+                for symbol in symbols {
+                    let mut targeted = r.clone();
+                    targeted.symbol = symbol;
+                    self.consume_inner(&targeted, current_tick)?;
+                }
+                self.records -= count - 1;
+            } else {
+                *self
+                    .data_anomalies
+                    .entry(format!(
+                        "{}/{}/{}: malformed_envelope without symbol",
+                        r.exchange, r.market, r.feed
+                    ))
+                    .or_default() += 1;
+                self.records += 1;
+            }
+            return Ok(());
+        }
         if r.kind == Kind::Control
             && r.event.as_deref() == Some("drop")
             && r.reason.as_deref() == Some("malformed_envelope")
@@ -685,7 +763,10 @@ impl Engine {
         let mid = |ex: &str, market: &str, asset_: &str| {
             rows.iter()
                 .find(|r| {
-                    r.exchange == ex && r.market == market && asset(&r.symbol) == Some(asset_)
+                    r.exchange == ex
+                        && r.market == market
+                        && asset(&r.symbol) == Some(asset_)
+                        && r.mid.is_some()
                 })
                 .and_then(|r| r.mid)
         };
@@ -695,6 +776,7 @@ impl Engine {
                 exchange: "cross".into(),
                 market: "cross".into(),
                 symbol: asset_.into(),
+                asset: asset_.into(),
                 tick_ns: tick,
                 available_ns: tick + 250_000_000,
                 engine_version: ENGINE_VERSION.into(),

@@ -40,17 +40,14 @@ fn malformed_outer_envelope_keeps_offset_and_invalidates_without_exiting() {
 fn non_json_outer_envelope_still_advances_kafka_offset() {
     let queued = engine_live::archived(b"broken}", "raw.binance.spot.trades.v1", 1, 8).unwrap();
     assert_eq!(queued.record.reason.as_deref(), Some("malformed_envelope"));
-    assert_eq!(queued.record.symbol, "ETHUSDT");
+    assert_eq!(queued.record.symbol, "__unknown__");
     assert_eq!(queued.record.offset, Some(8));
     let recovered = engine_replay::input::recover_archived(&queued.line, None).unwrap();
     assert_eq!(recovered.offset, queued.record.offset);
     let mut engine = engine_core::features::Engine::default();
     engine.consume(&recovered).unwrap();
-    let row = engine
-        .tick(engine_core::SECOND)
-        .unwrap()
-        .into_iter()
-        .find(|r| r.exchange == "binance")
-        .unwrap();
-    assert_eq!((row.trade_count, row.volume_base), (None, None));
+    assert!(engine.tick(engine_core::SECOND).unwrap().is_empty());
+    // Repeated corrupt records cannot invent a symbol or recursively target one.
+    engine.consume(&recovered).unwrap();
+    assert_eq!(engine.records, 2);
 }

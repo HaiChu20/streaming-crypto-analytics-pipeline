@@ -10,8 +10,9 @@ use std::{
     path::PathBuf,
     sync::atomic::{AtomicU64, Ordering},
 };
-fn v2(r: &Record) -> String {
-    let mut payload: serde_json::Value = serde_json::from_str(&r.payload).unwrap();
+fn v3(r: &Record) -> String {
+    let native: serde_json::Value = serde_json::from_str(&r.payload).unwrap();
+    let mut payload = json!({"channel":"trade", "data":native.get("data").unwrap_or(&native)});
     payload["recv_time_ns"] = json!(r.recv_ns);
     payload["offset"] = json!(r.offset);
     payload["conn"] = json!(r.conn);
@@ -50,7 +51,7 @@ fn synthetic_live_session_replays_cutoffs_carry_and_late_records_exactly() {
     fs::create_dir_all(&raw).unwrap();
     fs::write(
         raw.join("20261017_trades.jsonl"),
-        format!("{}\n{}\n", v2(&late), v2(&future)),
+        format!("{}\n{}\n", v3(&late), v3(&future)),
     )
     .unwrap();
     let c0 = Cutoff {

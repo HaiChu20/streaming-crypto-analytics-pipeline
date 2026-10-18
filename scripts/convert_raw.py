@@ -1,4 +1,4 @@
-"""Stream v1 envelopes or legacy Kraken recordings into new raw v2 files.
+"""Stream v1 envelopes or v2 raw trees into new raw v3 files.
 
 uv run python scripts/convert_raw.py data/raw --output-root /new/raw
 uv run python scripts/convert_raw.py data/Test/BTC-USD --legacy --exchange kraken --market spot --output-root /new/raw
@@ -129,6 +129,8 @@ def destination(source: Path, output: Path, legacy: bool, exchange: str | None, 
 
 def convert(root: Path, output: Path, *, legacy=False, exchange=None, market=None,
             instrument_root: Path = Path("data/raw")) -> list[dict]:
+    if not legacy:
+        return convert_tree(root, output)
     if legacy and (exchange != "kraken" or market != "spot"):
         raise ValueError("legacy recordings require --exchange kraken --market spot")
     sources = inputs(root)
@@ -180,6 +182,97 @@ def convert(root: Path, output: Path, *, legacy=False, exchange=None, market=Non
                     **({"orphan_records": state.orphan_records} if legacy else {}))
         results.append(info)
         print(json.dumps(info), flush=True)
+    return results
+
+
+def source_stream(source):
+    parts = {p.split("=", 1)[0]: p.split("=", 1)[1] for p in source.parts if "=" in p}
+    if "exchange" in parts:
+        return parts["exchange"], parts["market"], source.name.split(".", 1)[0], parts["date"], parts["feed"]
+    exchange, market, pair = source.parts[-4:-1]
+    day, feed = source.name.split("_", 1)
+    feed = feed.split(".", 1)[0]
+    if exchange not in rawfmt.CHANNELS or market not in ("spot", "perp") or feed not in rawfmt.CHANNELS[exchange]:
+        raise ValueError(f"not a v1/v2 source: {source}")
+    return exchange, market, pair, day, feed
+
+
+def v2_envelope(rec, exchange, market, pair, feed):
+    base = dict(exchange=exchange, market=market, symbol=pair, feed=feed,
+                recv_ns=rec["recv_time_ns"], conn=rec["conn"])
+    if rec.get("marker") == "ws_event":
+        event = {v: k for k, v in rawfmt.EVENTS.items()}.get(rec["event"], rec["event"])
+        detail = {k: v for k, v in rec.items() if k not in
+                  ("marker", "event", "conn", "recv_time_ns", "offset", "timestamp", "reason")}
+        return base | dict(kind="control", event=event, detail=detail,
+                           **({"reason": rec["reason"]} if "reason" in rec else {}))
+    native = {k: v for k, v in rec.items() if k not in ("recv_time_ns", "conn", "offset")}
+    snapshot = native.get("type") == "snapshot" or native.get("action") == "snapshot" or native.get("feed") in ("book_snapshot", "trade_snapshot")
+    if exchange == "binance" and "lastUpdateId" in native:
+        native.pop("type", None)  # v2 recorder's injected snapshot discriminator
+        snapshot = True
+    return base | dict(kind="snapshot" if snapshot else "update",
+                       payload=rec.get("raw", rawfmt.dumps(native).decode()))
+
+
+def convert_tree(root, output):
+    jobs, reserved = [], set()
+    for source in inputs(root):
+        exchange, market, pair, day, feed = identity = source_stream(source)
+        kinds = [None, "snapshot"] if exchange == "binance" and feed == "l2" else [None]
+        targets = {}
+        for kind in kinds:
+            target = rawfmt.path(output, exchange, market, pair, day, feed, kind)
+            suffix = ".open" if source.name.endswith(".open") else ".gz" if source.suffix == ".gz" else ""
+            target = target.with_name(target.name + suffix)
+            if target in reserved or target.exists() or target.with_name(target.name + ".meta.json").exists():
+                raise FileExistsError(target)
+            reserved.add(target)
+            targets[kind] = target
+        jobs.append((source, identity, targets))
+    results = []
+    for source, (exchange, market, pair, day, feed), targets in jobs:
+        start = time.perf_counter()
+        handles, counts = {}, dict.fromkeys(targets, 0)
+        partial_bytes = 0
+        try:
+            for kind, target in targets.items():
+                target.parent.mkdir(parents=True, exist_ok=True)
+                handles[kind] = gzip.open(target, "xb", compresslevel=6) if target.suffix == ".gz" else target.open("xb")
+            with open_input(source) as src:
+                for raw in src:
+                    if not raw.endswith(b"\n"):
+                        if not source.name.endswith(".open"):
+                            raise ValueError(f"incomplete line: {source}")
+                        partial_bytes = len(raw)
+                        break
+                    rec = rawfmt.loads(raw.decode())
+                    if rec.get("marker") == "rollover":
+                        continue
+                    if "payload" in rec or rec.get("kind") == "control":
+                        e = dict(exchange=exchange, market=market, symbol=pair, feed=feed) | rec
+                    else:
+                        e = v2_envelope(rec, exchange, market, pair, feed)
+                    rendered = rawfmt.line(e, rec["offset"])
+                    kind = "snapshot" if "snapshot" in handles and rendered.startswith(b'{"channel":"snapshot"') else None
+                    handles[kind].write(rendered)
+                    counts[kind] += 1
+            if not source.name.endswith(".open"):
+                dt = datetime.strptime(day.replace("-", ""), "%Y%m%d")
+                for kind, handle in handles.items():
+                    handle.write(rawfmt.rollover((dt + timedelta(days=1)).strftime("%Y%m%d")))
+                    counts[kind] += 1
+        finally:
+            for handle in handles.values():
+                handle.close()
+        for kind, target in targets.items():
+            if not target.name.endswith(".open"):
+                write_meta(target, exclusive=True)
+            info = dict(source=str(source), output=str(target), rows=counts[kind], bytes_in=source.stat().st_size,
+                        bytes_out=target.stat().st_size, partial_bytes=partial_bytes,
+                        seconds=round(time.perf_counter() - start, 3))
+            results.append(info)
+            print(json.dumps(info), flush=True)
     return results
 
 

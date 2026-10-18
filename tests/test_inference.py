@@ -17,7 +17,7 @@ from research.train import fit_models
 
 def row(second, **updates):
     result = dict.fromkeys(SCHEMA)
-    result.update(exchange="binance", market="spot", symbol="BTCUSDT", engine_version="test",
+    result.update(exchange="binance", market="spot", symbol="BTCUSDT", asset="", engine_version="test",
                   replay_mode="as_live", tick_ns=second * NS, available_ns=second * NS + 250_000_000,
                   book_valid=True, warmup=False, mid_e9=100_000_000_005 + second * 100,
                   spread_bps=2., ret_60s=0.01)
@@ -315,3 +315,18 @@ def test_matrix_cache_separates_target_stride_and_spec_version(monkeypatch, chan
     feed(svc, row(20), row(20, market='perp'), row(21))
     assert len(builds) == 2 and builds[0] != builds[1]
     assert svc.counts['predictions'] == 2
+
+
+def test_asset_field_matches_rust_and_clickhouse():
+    assert SCHEMA['asset'] == pl.String
+    assert list(SCHEMA).index('asset') == list(SCHEMA).index('symbol') + 1
+    sql = Path('docker/dashboard/clickhouse/init/001-crypto.sql').read_text()
+    assert sql.count('symbol LowCardinality(String),\n    asset LowCardinality(String),') == 2
+    svc = service()
+    feed(svc, row(0, asset='BTC'))
+    assert next(iter(svc.rows.values()))['asset'] == 'BTC'
+    old = row(10)
+    old.pop('asset')
+    feed(svc, old)
+    assert next(iter(svc.rows.values()))['asset'] == ''
+    assert svc.counts['malformed'] == 0

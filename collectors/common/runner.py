@@ -88,10 +88,10 @@ class ConnRun:
         self.seq += 1
         return self.seq
 
-    def emit(self, stream: Stream, kind: str, payload: str, recv_ns: int) -> None:
+    def emit(self, stream: Stream, kind: str, payload: str, recv_ns: int, *, event: str | None = None) -> None:
         if stream.key not in self.started:
             self.start_stream(stream)
-        value = data_record(stream, kind, self.conn, self._next_seq(), stamp(recv_ns), payload)
+        value = data_record(stream, kind, self.conn, self._next_seq(), stamp(recv_ns), payload, event)
         if self.sink.send(stream, value):
             self.sup.stats.add(stream, len(value))
         if stream.key not in self.received:

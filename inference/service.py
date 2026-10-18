@@ -22,7 +22,7 @@ from research.dataset import IDENTITY, PRICES, build_matrix
 from research.labels import NS, load_spec, reference_for
 
 LOG = logging.getLogger(__name__)
-STRINGS = "exchange market symbol engine_version".split()
+STRINGS = "exchange market symbol asset engine_version".split()
 BOOLS = "book_valid warmup".split()
 INTS = "tick_ns available_ns mid_e9 trade_count liq_count_1s l3_adds_1s l3_modifies_1s l3_deletes_1s".split()
 FLOATS = """book_age_ms best_bid best_ask mid microprice spread_bps bid_depth10 ask_depth10
@@ -128,6 +128,7 @@ class Service:
             row = json.loads(payload)
             if not isinstance(row, dict) or set(row) - SCHEMA.keys():
                 raise ValueError("unexpected fields/shape")
+            row.setdefault("asset", "")  # Rust Row.asset has serde(default).
             if any(type(row.get(c)) is not str for c in STRINGS) or any(type(row.get(c)) is not bool for c in BOOLS):
                 raise ValueError("missing identity/flags")
             for c in INTS:

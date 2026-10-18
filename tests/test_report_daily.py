@@ -1,4 +1,4 @@
-"""Offline v2 report tests; all inputs and outputs are synthetic tmp_path trees."""
+"""Offline v3 report tests; all inputs and outputs are synthetic tmp_path trees."""
 import gzip
 from datetime import date
 from pathlib import Path
@@ -30,7 +30,9 @@ def data(sec, conn='a', **extra):
 
 def write(root, rows, *, token='20261017', exchange='binance', market='spot',
           feed='l1', symbol='BTCUSDT', suffix='', offset=0):
-    p = root/'raw'/exchange/market/symbol/f'{token}_{feed}.jsonl{suffix}'
+    from archiver import rawfmt
+    p = rawfmt.path(root/'raw', exchange, market, symbol, token, feed)
+    p = p.with_name(p.name + suffix)
     p.parent.mkdir(parents=True, exist_ok=True)
     raw = b''.join(orjson.dumps(dict(r, offset=i+offset))+b'\n' for i,r in enumerate(rows))
     if suffix == '.gz':
@@ -218,3 +220,24 @@ def test_small_compression_windows_do_not_overlap(tmp_path):
     r,_=scan_stream(p,D)
     assert r['gzip_sample_bytes']==p.stat().st_size
     assert r['gz_bytes']==len(gzip.compress(p.read_bytes(),compresslevel=6))
+
+
+@pytest.mark.parametrize('day', [date(2026,9,15), date(2026,10,8)])
+def test_user_archive_report_optional_metadata(day):
+    root = Path('tests/fixtures/archive')
+    report = build_report(day, root, env={})
+    assert report['streams']
+    assert report['spool']['offset_gaps'] == 0
+    assert all(s['foreign_day_records'] == 0 for s in report['streams'])
+    assert all(s['connections'] >= 0 for s in report['streams'])
+    assert any(s['freshness_ms']['n'] > 0 for s in report['streams'])
+
+
+def test_report_binance_l2_partition_offset_union(tmp_path):
+    write(tmp_path, [data(1), data(2)], feed='l2', offset=0)
+    # Replace offset 1 with 2, leaving offset 1 in snapshot.
+    depth = tmp_path/'raw/Binance/Spot/BTCUSDT/20261017_depth.jsonl'
+    depth.write_bytes(depth.read_bytes().replace(b'"offset":1', b'"offset":2'))
+    write(tmp_path, [data(1.5)], feed='snapshot', offset=1)
+    report = build_report(D, tmp_path, env={})
+    assert report['spool']['offset_gaps'] == 0

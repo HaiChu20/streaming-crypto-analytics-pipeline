@@ -21,6 +21,7 @@ import orjson
 from botocore.exceptions import ClientError
 
 from archiver.record_raw import OPEN, stream_path
+from archiver import rawfmt
 from collectors.common.config import all_streams, connections, data_dir, load_config
 from collectors.common.lock import single_instance
 
@@ -84,6 +85,8 @@ class DailyArchive:
         meta = orjson.loads(path.with_name(path.name + ".meta.json").read_bytes())
         info = {k: meta[k] for k in ("lines", "bytes", "sha256", "offset_gaps", "foreign_day_records")}
         info["format"] = meta["format"]
+        if "offset_gaps_scope" in meta:
+            info["offset_gaps_scope"] = meta["offset_gaps_scope"]
         info.update(first_offset=meta.get("first_offset"), last_offset=meta.get("last_offset"))
         key = path.relative_to(self.root).as_posix() + ".gz"
         info["key"] = key
@@ -114,8 +117,10 @@ class DailyArchive:
         manifest = {"date": day, "status": "provisional", "files": [], "pending": [], "skipped": []}
         with ThreadPoolExecutor(max_workers=4, thread_name_prefix="gzip") as pool:
             tasks = {}
-            for stream in self.streams:
-                path = stream_path(self.root, stream, day)
+            jobs = [(stream, kind) for stream in self.streams
+                    for kind in ([None, "snapshot"] if stream.exchange == "binance" and stream.feed == "l2" else [None])]
+            for stream, kind in jobs:
+                path = stream_path(self.root, stream, day, kind)
                 open_path = path.with_name(path.name + OPEN)
                 key = path.relative_to(self.root).as_posix() + ".gz"
                 if stream.key in self.skipped and not path.exists() and not open_path.exists():
@@ -143,6 +148,8 @@ class DailyArchive:
         manifest["files"].sort(key=lambda f: f["key"])
         manifest["pending"].sort(key=lambda f: f["key"])
         manifest["has_offset_gaps"] = any(f["offset_gaps"] for f in manifest["files"])
+        if any("offset_gaps_scope" in f for f in manifest["files"]):
+            manifest["offset_gaps_scope"] = "per file; Binance l2 depth/snapshot share a partition (see file scopes)"
         if not manifest["pending"]:
             manifest["status"] = "complete"
             manifest["completed_at"] = now.isoformat()

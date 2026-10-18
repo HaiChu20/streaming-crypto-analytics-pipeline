@@ -1,6 +1,6 @@
 # BTC/ETH market data pipeline
 
-Collects BTC and ETH **spot + perpetual** market data from Kraken, Binance and OKX. Every message passes through Kafka to a replayable raw archive on local disk: one JSONL file per feed per symbol per UTC day. Later phases add an S3 daily archive, a Rust feature engine, a dashboard, and 15/30-minute return models.
+Collects BTC and ETH **spot + perpetual** market data from Kraken, Binance and OKX. Every message passes through Kafka to a replayable raw archive on local disk: one JSONL file per channel per symbol per UTC day. Later phases add an S3 daily archive, a Rust feature engine, a dashboard, and 15/30-minute return models.
 
 - **Plan / architecture:** [plan.md](plan.md), the only plan.
 - **Progress:** [STATUS.md](STATUS.md).
@@ -32,26 +32,26 @@ uv run python scripts/check_raw.py                       # data-quality report o
 - `uv run python scripts/probe_feeds.py --seconds 60`: subscribes to every feed without Kafka, saves test fixtures, and prints rates and GiB/day.
 - `uv run pytest`: unit tests.
 
-Raw disk files use **v2**: native JSON with exact decimal tokens stored as strings,
-plus `recv_time_ns`, `conn`, and Kafka `offset`. Non-object payloads and native
-key collisions carry the exact original text in `raw`. In-band connection markers delimit
-epochs; closed day files end with a rollover marker. Kafka envelopes and probe fixtures
-remain v1. Symbols replace `/` with `-`; `.jsonl.open` files are still being written.
+Raw disk files use **v3**, matching the user's archive:
+`data/raw/<Exchange>/<Spot|Futures>/<Pair>/<YYYYMMDD>_<channel>.jsonl`.
+Binance, OKX and Kraken Futures wrap the native message in `data`; Kraken spot
+inserts metadata into the native message. Decimals are exact strings. Our files
+add `conn` and Kafka `offset`; readers also accept archive files without them and
+case-insensitive directory prefixes such as `KrakenRaw/Futurev6`.
+Binance l2 splits into `depth` and `snapshot` files (anchor on sync, periodic every
+7 minutes); recovery uses the maximum offset across both. Invalid JSON or metadata
+collisions retain exact text in `raw`. Connection markers delimit epochs, closed
+files end with a rollover, and `.jsonl.open` files are still being written.
 
-Convert originals into a new tree (existing outputs are refused):
+Convert v1 or v2 into a new tree (exclusive-create; originals stay untouched):
 
 ```bash
 PYTHON_DOTENV_DISABLED=1 uv run python scripts/convert_raw.py data/raw --output-root /path/to/new-raw
-PYTHON_DOTENV_DISABLED=1 uv run python scripts/convert_raw.py data/Test/BTC-USD --legacy --exchange kraken --market spot --output-root /path/to/new-raw
 PYTHON_DOTENV_DISABLED=1 uv run python scripts/check_raw.py --root /path/to/new-raw --present-only
 ```
 
-Legacy gzip recordings stay gzip. Their offsets are synthetic zero-based source line
-indices per file (flagged in metadata); connections receive a new `#n` epoch at each
-`connected`. Data outside an active connection gets a separate `#pre<n>` carrier
-and is counted as `orphan_records`. Public Kraken instrument metadata is copied from matching recorded v1
-starts when available, with `instrument_source: "copied"`. Conversion streams input,
-leaves originals untouched, and skips incomplete tails only for `.open` files.
+The user's v3 archive needs no conversion. Gzip inputs stay gzip; incomplete tails
+are skipped only for `.open` files. Kafka envelopes and probe fixtures remain v1.
 `check_raw --json` includes per-file line/CRC counts, connection counts, and trade ID
 duplicates and observed gaps. Trade ID gaps are informational. Use
 `scripts/pipeline.sh restart <name>` to restart just one service.
@@ -112,7 +112,7 @@ terraform -chdir=infra/terraform test
 
 ```text
 collectors/        exchange collectors: binance.py, okx.py, kraken.py; common/ (config, envelope, sinks, runner)
-archiver/          record_raw.py + rawfmt.py: Kafka → data/raw/<exchange>/<market>/<SYMBOL>/<YYYYMMDD>_<feed>.jsonl
+archiver/          record_raw.py + rawfmt.py: Kafka → data/raw/<Exchange>/<Market>/<Pair>/<YYYYMMDD>_<channel>.jsonl
 config/            markets.yaml: exchanges, symbols, feeds, partitions, rotation
 scripts/           create_topics.py, probe_feeds.py, convert_raw.py, check_raw.py, pipeline.sh
 docker/kafka/      single KRaft broker + kafka-ui

@@ -12,11 +12,21 @@ record/row counts, clock steps, break reasons, coverage and cross-price maxima.
 
 ## Input and ordering
 
-Only v2 files under `raw/<exchange>/<market>/<SYMBOL>/YYYYMMDD_<feed>.jsonl`
-define the streams (the root may be either the data directory or `raw` itself).
-`--exchange NAME` and `--market NAME` filter ideal replay. Missing streams are
-absent; cross features requiring them are null. Native symbols and BTC/ETH
-partitions follow `config/markets.yaml`; no YAML parser is required. Known feeds are l1, l2, l3, trades, trades_agg, mark, liquidations and ticker.
+V3 files under `<Exchange>/<Market>/<Pair>/YYYYMMDD_<channel>.jsonl` define
+streams; the root may also contain a `raw` directory. Exchange directories match
+case-insensitive `binance*`, `kraken*`, `okx*`; `spot*` means spot and
+`fut*`/`perp*`/`swap*` means perp. `--exchange` and `--market` filter canonical
+names. Every native pair is accepted. Kraken spot directory hyphens become `/`
+in the native output symbol; other symbols retain their native spelling.
+
+| Exchange | File channels → engine feeds |
+| --- | --- |
+| Binance | depth/snapshot → l2; bookticker → l1; trades → trades |
+| Binance perp | aggtrades → trades_agg; markprice → mark; forceorder → liquidations |
+| OKX | book → l2; bbo → l1; trades → trades_agg; tradesall → trades |
+| Kraken spot | book → l2; level3 → l3; trades → trades |
+| Kraken futures | book → l2; trades → trades; ticker → ticker |
+
 Unknown feeds are skipped with a warning. If several representations of the same
 stream exist, prefer `.jsonl`, then `.jsonl.gz`, then `.jsonl.open`. Open files
 require `--allow-open`. Every reader is capped at the file's size when opened;
@@ -26,20 +36,41 @@ an append-only archive without stopping collection.
 
 A min-heap contains one head per buffered reader and compares
 `(recv_ns, topic, partition, offset, file_index)`. The final file index only breaks
-otherwise identical coordinates. Archive lines require `recv_time_ns`, `conn` and `offset`; paths supply topic,
-partition, exchange, market, symbol and feed. Marker events map back to controls,
-including start metadata; gap and rollover markers are ignored. Native payload text is
-retained without reserialization, preserving exact decimal tokens for CRC32.
-Files of a partition are read sequentially, and each partition is advanced only
-after popping its previous head. Thus a receive
-clock step-back cannot move a later line before its predecessor: its older time
-is exposed only after that predecessor. This preserves file order even when a
+otherwise identical coordinates. Each file is an independent input partition,
+including separate Binance depth and snapshot files feeding one book. Partition
+numbers are deterministic, assigned in sorted path order within each engine topic;
+they carry no asset identity. Only the current head participates in the merge.
+
+Wrapped lines supply their exact inner `data` text to the core. Kraken spot keeps
+its native line, including inserted archive metadata. No decimal reserialization
+occurs. The shared Binance decoder also accepts live combined-stream payloads.
+Missing offsets use the zero-based physical line index, including ignored markers.
+Missing data connection IDs use `<marker conn>#<connected count>` (per file), or
+`<file>#pre` before the first connected marker. Explicit recorder conn/offset
+coordinates are retained. Marker time uses `recv_time_ns`, otherwise ISO UTC
+`timestamp` (Z or +00:00, up to nine fractional digits).
+
+Connected markers start epochs. Connection errors, disconnected, rotating and
+shutdown end them; corrupt_message is counted without changing state. Gap and
+rollover markers are ignored. A receive clock step-back cannot move a later line
+before its predecessor: its older time is exposed only after that predecessor.
+This preserves file order even when a
 globally increasing timestamp order is impossible. Older hidden records become
 eligible at that later tick. Live queues and checkpoint/as_live batches use the
 same head-only ordering rule. Flow attribution uses one shared helper:
 `max(ceil_to_second(recv_ns), current_tick)`. Thus a late record's trade,
 liquidation or L3 event flow appears in the tick that processes it, never a
 closed bucket. No-step input produces the same order as the former global sort.
+
+Binance archive anchors initialize the current depth epoch, including deltas
+buffered for minutes before the anchor arrives. A snapshot is applied only while
+that connection is unsynced; later periodic snapshots increment `snapshots_ignored`
+and leave the book unchanged. Sequence breaks discard its book/sync state without
+retiring the epoch, allowing buffering and a later anchor to resync it. Ended epochs
+remain retired until a new connected epoch. Each unsynced connection retains at
+most 100,000 pending deltas in a FIFO. Evicting the oldest increments
+`pending_evicted`; an anchor older than retained contiguous history stays stale
+until a usable anchor arrives. Snapshot `lastUpdateId` filters obsolete deltas.
 
 ## Feature contract
 
@@ -65,6 +96,18 @@ L3 event flow keep their existing zero-activity semantics. Reported coverage cou
 emitted instrument ticks. The audit separately reports observed stale percentages
 and asserts all book/extras/cross fields are null in the tail after the grace period.
 
+The schema appends required UTF8 `asset`; existing columns, types and order are
+unchanged. JSON rows also expose `asset` (old row JSON can omit it). The base is
+parsed from Binance's quote suffix (FDUSD, USDT, USDC, USD, BTC, ETH, EUR), OKX's
+first dash component, Kraken spot's first slash/dash component, or Kraken futures
+`PF_<BASE><QUOTE>`; XBT normalizes to BTC. Cross rows are emitted per observed
+asset, and their symbol and asset both contain the base. If multiple pairs share
+an asset on one venue/market, the lexicographically first currently valid native
+symbol supplies the midpoint. Missing instruments or stale books produce null
+cross fields. Kafka partitions never imply a pair: malformed envelopes with a
+recoverable symbol use it; wholly corrupt envelopes invalidate the observed feed's
+instruments conservatively.
+
 Rows are sorted by `(tick_ns, exchange, market, symbol, engine_version)`. The
 version is the shared `engine_core::ENGINE_VERSION`.
 
@@ -72,7 +115,7 @@ version is the shared `engine_core::ENGINE_VERSION`.
   Midpoint source values remain exact fixed point. `mid_e9` is an exact i64
   with nine implied decimals, so half of a 1e-8 atom is represented without
   rounding. Returns use `mid_e9`. Extreme values outside its i64 range produce an
-  explicit error; these BTC/ETH prices fit comfortably. There is no decimal-text
+  explicit error; ordinary market prices fit comfortably. There is no decimal-text
   midpoint column.
 - Sizes use base units. OKX linear swaps multiply each connection's native size
   by its own start metadata `ctVal`; missing swap metadata is never replaced with
@@ -154,3 +197,30 @@ invalid-book nulls, cross math, native extras/trade snapshots, sequential L3 ran
 gzip/open partial lines, atomic nullable Parquet output and a synthetic day CLI.
 
 The measured archive replay and independent Python results are in [VALIDATION.md](VALIDATION.md).
+
+## V3 fixture checks and throughput
+
+`cargo test --workspace` includes CLI replay with `--root ../tests/fixtures/archive`
+for 2026-09-15 and 2026-10-08, checking every pair, book validity, Kraken L2/L3
+CRCs, sequence breaks, per-asset rows and the appended Parquet column. Original
+`tests/fixtures/v2` files remain on disk, unused; `fixtures/v3` replaces them.
+Set `ENGINE_TEST_SCRATCH` to a repository-local target directory to keep generated
+test reports and Parquet files in the repository.
+
+`cargo run --release -p engine-replay --example benchmark_archive -- ../tests/fixtures/archive`
+measures gzip reading, exact v3 parsing, head merging and shared core ingestion,
+including book/checksum/trade processing. It runs each fixture date four times;
+run 0 warms the cache, and runs 1–3 are the measured samples. It excludes full-day
+empty ticks and Parquet serialization: sparse excerpts still produce full-day
+rows, so the CLI's end-to-end `records_per_s` measures a different workload.
+The CLI report includes per-stream `books` counters and `row_counts` in addition
+to the existing coverage and timing fields.
+
+P16 fixture measurement (release, local machine, three warm samples): spot/L3
+33,511 records at 279,346 / 286,586 / 288,175 records/s (median 286,586);
+Kraken futures 75,235 records at 670,425 / 656,071 / 639,964 records/s
+(median 656,071). Both ingestion medians exceed the ~255k records/s reference.
+This is a fixture ingestion comparison, not a paired full-day benchmark. Full-day
+CLI output on these sparse excerpts produced 691,160 rows in 0.674 s for spot
+(49,730 records/s) and 172,794 rows in 0.251 s for futures (300,133 records/s).
+Most spot output rows follow the excerpt's end and contain stale/null values.

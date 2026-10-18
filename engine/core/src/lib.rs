@@ -100,6 +100,23 @@ pub struct Counters {
     pub breaks: u64,
     pub checksums_verified: u64,
     pub okx_checksum_absent: u64,
+    #[serde(default)]
+    pub snapshots_ignored: u64,
+    #[serde(default)]
+    pub pending_evicted: u64,
+    #[serde(default)]
+    pub corrupt_messages: u64,
+    #[serde(default)]
+    pub checksum_failures: u64,
+    #[serde(default)]
+    pub sequence_breaks: u64,
+}
+
+#[derive(Debug, Serialize)]
+pub struct BookReport {
+    pub valid: bool,
+    #[serde(flatten)]
+    pub counters: Counters,
 }
 
 #[derive(Serialize, Deserialize, Debug, Default)]
@@ -124,10 +141,10 @@ impl Connection {
         let snapshot = record.kind == Kind::Snapshot;
         let payload: Value = serde_json::from_str(&record.payload)?;
         if exchange == "binance" {
-            let data = if snapshot { &payload } else { &payload["data"] };
+            let data = payload.get("data").unwrap_or(&payload);
             return self
                 .sync
-                .apply(&mut self.book, data, snapshot, market == "perp");
+                .apply(&mut self.book, data, snapshot, market == "perp", counters);
         }
         if !snapshot && self.seq.is_none() {
             return Ok(if exchange == "okx" {
@@ -226,6 +243,10 @@ pub struct StreamBook {
     retired: BTreeSet<String>,
     counters: Counters,
     last_break: Option<BreakReason>,
+    #[serde(default)]
+    binance_depth_conn: Option<String>,
+    #[serde(default)]
+    binance_anchor_pending: bool,
 }
 impl StreamBook {
     pub fn new(record: &Record) -> Result<Self> {
@@ -251,6 +272,8 @@ impl StreamBook {
             retired: BTreeSet::new(),
             counters: Counters::default(),
             last_break: None,
+            binance_depth_conn: None,
+            binance_anchor_pending: false,
         })
     }
     pub fn valid(&self) -> bool {
@@ -314,12 +337,65 @@ impl StreamBook {
         ) {
             return Err(Error("record belongs to another stream".into()));
         }
+        // REST anchors have their own archive partition/epoch. They initialize
+        // the depth connection, including all deltas buffered before the anchor.
+        let mut anchor;
+        let archive_anchor = self.exchange == "binance"
+            && record.kind == Kind::Snapshot
+            && record
+                .detail
+                .as_ref()
+                .is_some_and(|v| v["archive_snapshot"] == true);
+        if archive_anchor && self.valid() {
+            self.counters.snapshots_ignored += 1;
+            return Ok(Outcome::Ignored);
+        }
+        let record = if archive_anchor && let Some(conn) = &self.binance_depth_conn {
+            anchor = record.clone();
+            anchor.conn.clone_from(conn);
+            &anchor
+        } else {
+            record
+        };
         if self.retired.contains(&record.conn) || record.kind == Kind::Trade {
             return Ok(Outcome::Ignored);
+        }
+        let mut adopted_anchor = false;
+        if self.exchange == "binance"
+            && (record.event.as_deref() == Some("start") || record.kind == Kind::Update)
+        {
+            // An anchor can be the first file head, before any depth marker.
+            // Move that book to its first depth epoch rather than losing it.
+            if self.binance_anchor_pending {
+                if let Some(old) = self.active.take()
+                    && let Some(connection) = self.connections.remove(&old)
+                {
+                    self.connections.insert(record.conn.clone(), connection);
+                    self.active = Some(record.conn.clone());
+                    adopted_anchor = true;
+                }
+                self.binance_anchor_pending = false;
+            }
+            if record.event.as_deref() == Some("start")
+                && record
+                    .detail
+                    .as_ref()
+                    .is_some_and(|v| v["marker"] == "ws_event")
+                && let Some(old) = self.active.clone().filter(|old| old != &record.conn)
+            {
+                self.retire(&old);
+            }
+            self.binance_depth_conn = Some(record.conn.clone());
+        }
+        if archive_anchor && self.binance_depth_conn.is_none() {
+            self.binance_anchor_pending = true;
         }
         if record.kind == Kind::Control {
             match record.event.as_deref() {
                 Some("start") => {
+                    if adopted_anchor {
+                        return Ok(Outcome::Ignored);
+                    }
                     let depth = record
                         .detail
                         .as_ref()
@@ -357,6 +433,10 @@ impl StreamBook {
                 }
                 Some("stop") => {
                     self.retire(&record.conn);
+                    return Ok(Outcome::Ignored);
+                }
+                Some("corrupt_message") => {
+                    self.counters.corrupt_messages += 1;
                     return Ok(Outcome::Ignored);
                 }
                 _ => return Err(Error("unknown control event".into())),
@@ -403,7 +483,15 @@ impl StreamBook {
                 connection.valid = false;
             }
             Outcome::Break(reason) => {
-                self.retire(&record.conn);
+                self.counters.checksum_failures +=
+                    u64::from(matches!(reason, BreakReason::ChecksumMismatch { .. }));
+                self.counters.sequence_breaks +=
+                    u64::from(matches!(reason, BreakReason::SequenceGap { .. }));
+                if self.exchange == "binance" {
+                    self.connections.remove(&record.conn);
+                } else {
+                    self.retire(&record.conn);
+                }
                 self.counters.breaks += 1;
                 self.last_break = Some(reason.clone());
             }

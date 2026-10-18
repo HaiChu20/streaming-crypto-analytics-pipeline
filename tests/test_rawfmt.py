@@ -22,8 +22,10 @@ def test_every_envelope_fixture_is_lossless():
                 actual = json.loads(rawfmt.line(e, 7), parse_float=str)
                 for key in ("recv_time_ns", "conn", "offset"):
                     actual.pop(key)
-                if e["exchange"] == "binance" and e["kind"] == "snapshot":
-                    actual.pop("type")
+                if e["exchange"] == "binance":
+                    original = original.get("data", original)
+                if e["exchange"] != "kraken" or e["market"] == "perp":
+                    actual = actual["data"]
                 assert actual == original, path
                 count += 1
     assert count > 7000
@@ -43,7 +45,7 @@ def test_large_integers_remain_integers(number):
 
 @pytest.mark.parametrize("payload", ['[]', 'null', '"hello"', 'not json', '1'])
 def test_non_object_keeps_raw_text(payload):
-    assert json.loads(rawfmt.line(envelope(payload), 3)) == dict(recv_time_ns=123, conn="c", offset=3, raw=payload)
+    assert json.loads(rawfmt.line(envelope(payload), 3)) == dict(channel=None, recv_time_ns=123, conn="c", offset=3, raw=payload)
 
 
 @pytest.mark.parametrize('native', ['recv_time_ns', 'conn', 'offset'])
@@ -55,16 +57,16 @@ def test_collision_stores_exact_payload_and_warns_once_per_stream(native, caplog
     with caplog.at_level('WARNING'):
         r = json.loads(rawfmt.line(e, 3))
         rawfmt.line(e, 4)
-    assert r == dict(recv_time_ns=123, conn='c', offset=3, raw=e['payload'])
+    assert r == dict(channel='book', recv_time_ns=123, conn='c', offset=3, raw=e['payload'])
     assert rawfmt.collisions[stream] == before + 2
     assert len([m for m in caplog.records if 'collides with raw metadata' in m.message]) == int(before == 0)
 
 
-def test_binance_snapshot_type_collision_uses_raw():
+def test_binance_snapshot_native_type_is_nested():
     text = '{"type":"snapshot","lastUpdateId":1,"bids":[]}'
     e = dict(kind='snapshot', exchange='binance', market='spot', symbol='BTCUSDT', feed='l2',
              recv_ns=123, conn='c', payload=text)
-    assert json.loads(rawfmt.line(e, 8)) == dict(recv_time_ns=123, conn='c', offset=8, raw=text)
+    assert json.loads(rawfmt.line(e, 8))['data'] == json.loads(text)
 
 
 def test_marker_detail_collision_nests_only_clashing_keys():
@@ -126,3 +128,77 @@ def test_legacy_fixture_native_data_is_lossless():
                 native = {k:v for k,v in original.items() if k not in ('recv_time_ns','conn','offset')}
                 actual = {k:v for k,v in result.items() if k not in ('recv_time_ns','conn','offset')}
                 assert actual == native, path
+
+
+@pytest.mark.parametrize("source", sorted(Path("tests/fixtures/archive").rglob("*.gz")), ids=lambda p: str(p.relative_to("tests/fixtures/archive")))
+def test_archive_data_lines_match_bytes(source):
+    import gzip
+    exchange, market, pair, file = rawfmt.archive_identity(source)
+    feed = next(f for f, (c, _) in rawfmt.CHANNELS[exchange].items() if c == file)
+    if feed == "snapshot":
+        feed = "l2"
+    shapes = set()
+    with gzip.open(source, "rb") as f:
+        for original in f:
+            rec = rawfmt.loads(original.decode())
+            if rec.get("marker"):
+                continue
+            native = ({k: v for k, v in rec.items() if k != "recv_time_ns"}
+                      if exchange == "kraken" and market == "spot" else rec["data"])
+            kind = "snapshot" if (file == "snapshot" or native.get("type") == "snapshot"
+                                    or native.get("action") == "snapshot" or native.get("feed", "").endswith("_snapshot")) else "update"
+            shape = kind, rec.get("feed"), rec.get("channel")
+            if shape in shapes:
+                continue
+            shapes.add(shape)
+            if exchange == "binance" and kind != "snapshot":
+                native = dict(stream="combined@stream", data=native)
+            e = dict(exchange=exchange, market=market, symbol=pair, feed=feed, kind=kind,
+                     payload=rawfmt.dumps(native).decode(), recv_ns=rec["recv_time_ns"], conn="ours")
+            if "event" in rec:
+                e["event"] = rec["event"]
+            result = rawfmt.loads(rawfmt.line(e, 42).decode())
+            result.pop("conn")
+            result.pop("offset")
+            assert rawfmt.dumps(result) + b"\n" == original
+    assert shapes
+
+
+@pytest.mark.parametrize('exchange,market,feed,name,file', [
+    ('binance','spot','l1','bookTicker','bookticker'),
+    ('binance','perp','trades_agg','aggTrade','aggtrades'),
+    ('binance','perp','mark','markPrice','markprice'),
+    ('binance','perp','liquidations','forceOrder','forceorder'),
+    ('okx','perp','trades','tradesAll','tradesall'),
+    ('okx','spot','trades_agg','trades','trades'),
+    ('kraken','perp','l2','book','book'),
+])
+def test_wrapped_channels_paths_decimals_and_fallback(exchange, market, feed, name, file):
+    e = envelope('{"price":1.200E-8,"quantity":0.00001000}', exchange=exchange, market=market,
+                 feed=feed, symbol='PAIR')
+    r = json.loads(rawfmt.line(e, 0))
+    assert r['feed' if exchange == 'kraken' else 'channel'] == name
+    assert r['data'] == {'price':'1.200E-8','quantity':'0.00001000'}
+    p = rawfmt.path(Path('raw'), exchange, market, 'PAIR', '2026-10-16', feed)
+    assert p.parts[-3] == ('Spot' if market == 'spot' else 'Futures')
+    assert p.name == f'20261016_{file}.jsonl'
+    r = json.loads(rawfmt.line(dict(e, payload='[1.200E-8]'), 1))
+    assert r['channel'] == name and r['raw'] == '[1.200E-8]'
+
+
+def test_archive_synthetic_headers_and_optional_offsets():
+    headers = rawfmt.Headers('file')
+    assert headers.read({'data':[]}, 0)['conn'] == 'file#pre'
+    marker = dict(marker='ws_event', event='connected', conn='native', timestamp='2026-10-16T00:00:00.123456789Z')
+    rec = headers.read(marker, 1)
+    assert rec['conn'] == 'native#1' and rec['offset'] == 1
+    assert rec['recv_time_ns'] % 10**9 == 123456789
+    assert headers.read({'data':[]}, 2)['conn'] == 'native#1'
+    assert headers.read(marker, 3)['conn'] == 'native#2'
+    explicit = headers.read({'conn':'ours', 'data':[]}, 4)
+    assert explicit['conn'] == 'ours' and explicit['offset'] == 4
+
+
+def test_control_decimal_tokens_are_exact_too():
+    e = b'{"kind":"control","event":"start","exchange":"okx","feed":"l2","recv_ns":1,"conn":"c","detail":{"instrument":{"ctVal":0.00100}}}'
+    assert json.loads(rawfmt.line(e, 0))['instrument']['ctVal'] == '0.00100'

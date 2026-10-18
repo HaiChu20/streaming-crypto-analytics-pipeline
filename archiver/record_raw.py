@@ -1,11 +1,11 @@
-"""Raw recorder: Kafka raw.* topics -> one JSONL file per (topic, partition) per UTC day (plan.md §7).
+"""Raw recorder: Kafka raw.* topics -> v3 channel files per UTC day (plan.md §7).
 
     uv run python -m archiver.record_raw
 
 - Day = UTC date of the record's recv_ns. A stream's day-D file closes when that stream delivers
   its first day-D+1 record (never force-closed; still-open old days are reported as overdue).
 - Files are the source of truth for progress: on restart each stream resumes from the last
-  offset in its newest file, so a crash creates no duplicates and no holes.
+  offset across its newest day files, so a crash creates no duplicates and no holes.
 """
 
 import argparse
@@ -47,8 +47,8 @@ def _file_date(path: Path) -> str:
     return f"{day[:4]}-{day[4:6]}-{day[6:8]}"
 
 
-def stream_path(root: Path, stream: Stream, date: str) -> Path:
-    return rawfmt.path(root / "raw", stream.exchange, stream.market, stream.symbol, date, stream.feed)
+def stream_path(root: Path, stream: Stream, date: str, kind=None) -> Path:
+    return rawfmt.path(root / "raw", stream.exchange, stream.market, stream.symbol, date, stream.feed, kind)
 
 
 def last_line(path: Path) -> bytes | None:
@@ -77,6 +77,21 @@ def last_line(path: Path) -> bytes | None:
                 rec = rawfmt.loads(buf.decode())
             if "offset" in rec:
                 return buf
+    return None
+
+
+def closing_period(path: Path) -> str | None:
+    """A crash may leave a fully written rollover before the atomic close."""
+    with path.open("rb") as f:
+        f.seek(max(0, path.stat().st_size - 512))
+        tail = f.read().splitlines()
+    if tail:
+        try:
+            rec = orjson.loads(tail[-1])
+            if rec.get("marker") == "rollover":
+                return rec["new_period"]
+        except orjson.JSONDecodeError:
+            pass
     return None
 
 
@@ -130,13 +145,17 @@ def write_meta(path: Path, *, extra: dict | None = None, exclusive: bool = False
             last_offset, last_recv_ns = offset, recv_ns
             foreign_day_records += utc_date(recv_ns) != date
     meta = {
-        "format": "v2", "file": path.name, "lines": lines, "bytes": size, "sha256": sha.hexdigest(),
+        "format": "v3", "file": path.name, "lines": lines, "bytes": size, "sha256": sha.hexdigest(),
         "offset_gaps": offset_gaps, "foreign_day_records": foreign_day_records,
     }
     if first is not None:
         meta.update(
             first_offset=first[0], last_offset=last_offset, first_recv_ns=first[1], last_recv_ns=last_recv_ns
         )
+    # Split Binance l2 files have sparse offsets by design. These are per-file
+    # gaps, not lost Kafka records; consumers must check the partition union.
+    if "binance" in str(path).lower() and any(f"_{c}.jsonl" in path.name for c in ("depth", "snapshot")):
+        meta["offset_gaps_scope"] = "file; Binance l2 offsets are shared by depth and snapshot"
     meta.update(extra or {})
     if exclusive:
         with path.with_name(path.name + ".meta.json").open("xb") as f:
@@ -153,59 +172,81 @@ class StreamWriter:
         self.stream = stream
         self.closer = closer
         self.date: str | None = None
-        self.fh = None
+        self.files = {}
+        self.last_file: Path | None = None
         self.dirty = False
         self.last_offset: int | None = None
         self.foreign_reported = False
 
+    def paths(self, date):
+        base = stream_path(self.root, self.stream, date)
+        return [base.with_name(f"{date.replace('-', '')}_{c}.jsonl")
+                for c in rawfmt.file_channels(self.stream.exchange, self.stream.market, self.stream.feed)]
+
     def open(self, date: str) -> None:
-        final = stream_path(self.root, self.stream, date)
-        final.parent.mkdir(parents=True, exist_ok=True)
-        self.fh = open(final.with_name(final.name + OPEN), "ab")
+        for final in self.paths(date):
+            final.parent.mkdir(parents=True, exist_ok=True)
+            self.files[final] = open(final.with_name(final.name + OPEN), "ab")
+        self.last_file = None
         self.date = date
         self.foreign_reported = False
 
     def close_day(self, new_period: str | None = None) -> None:
         if new_period is None:
             new_period = (datetime.fromisoformat(self.date) + timedelta(days=1)).strftime("%Y%m%d")
-        self.fh.write(rawfmt.rollover(new_period))
-        self.fh.flush()
-        os.fsync(self.fh.fileno())
-        self.fh.close()
-        self.fh = None
-        final = stream_path(self.root, self.stream, self.date)
-        os.replace(final.with_name(final.name + OPEN), final)
-        log.info("closed %s", final.relative_to(self.root))
+        # For split files, flush the partition's last data before any rollover
+        # can close the day, even when that data belongs to the second file.
+        if len(self.files) > 1 and self.last_file is not None:
+            self.files[self.last_file].flush()
+        for final, fh in self.files.items():
+            fh.write(rawfmt.rollover(new_period))
+            fh.flush()
+            os.fsync(fh.fileno())
+            fh.close()
+            os.replace(final.with_name(final.name + OPEN), final)
+            log.info("closed %s", final.relative_to(self.root))
 
-        def on_done(future):
-            error = future.exception()
-            if error is not None:
-                log.error("%s: metadata failed: %r", final, error)
+            def on_done(future, final=final):
+                error = future.exception()
+                if error is not None:
+                    log.error("%s: metadata failed: %r", final, error)
 
-        self.closer.submit(write_meta, final).add_done_callback(on_done)
+            self.closer.submit(write_meta, final).add_done_callback(on_done)
+        self.files = {}
+        self.last_file = None
 
-    def write(self, date: str, line: bytes, offset: int) -> None:
+    def write(self, date: str, line: bytes, offset: int, kind=None) -> None:
         if self.date is None:
             self.open(date)
         elif date > self.date:
             self.close_day(date)
             self.open(date)
-        # date < self.date (clock stepped back) stays in the current file: days never reopen.
-        self.fh.write(line)
+        # date < self.date (clock stepped back) stays in the current file.
+        final = stream_path(self.root, self.stream, self.date, kind)
+        # Only the last destination may retain buffered data. Flush it before
+        # switching so process-crash recovery sees a contiguous partition prefix.
+        if self.last_file is not None and self.last_file != final:
+            self.files[self.last_file].flush()
+        # BufferedWriter retries raw short writes; write/flush errors propagate
+        # before offsets can be committed, so checking write's count adds nothing.
+        self.files[final].write(line)
+        self.last_file = final
         self.dirty = True
         self.last_offset = offset
 
     def sync(self) -> None:
         if self.dirty:
-            self.fh.flush()
-            os.fsync(self.fh.fileno())
+            for fh in self.files.values():
+                fh.flush()
+                os.fsync(fh.fileno())
             self.dirty = False
 
     def shutdown(self) -> None:
-        if self.fh is not None:
-            self.sync()
-            self.fh.close()
-            self.fh = None
+        self.sync()
+        for fh in self.files.values():
+            fh.close()
+        self.files = {}
+        self.last_file = None
 
 
 class Recorder:
@@ -224,30 +265,59 @@ class Recorder:
         offset per stream (None = the stream has no file yet)."""
         resume: dict[tuple[str, int], int | None] = {}
         for key, stream in self.streams.items():
-            pattern = str(stream_path(self.root, stream, "*").relative_to(self.root))
-            closed = list(self.root.glob(pattern))
+            patterns = [str(p.relative_to(self.root)) for p in self.writers[key].paths("*")]
+            closed = [p for pattern in patterns for p in self.root.glob(pattern)]
+            opened = [p for pattern in patterns for p in self.root.glob(pattern + OPEN)]
+            for path in opened:
+                repair(path)
+            # Finishing a two-file close is idempotent even if a crash happened
+            # between rollover writes or between the two atomic renames.
+            closing = {}
+            for path in closed + opened:
+                period = closing_period(path)
+                if period is not None:
+                    closing[_file_date(path)] = period
+            for path in list(opened):
+                day = _file_date(path)
+                if day not in closing:
+                    continue
+                final = path.with_name(path.name.removesuffix(OPEN))
+                if final.exists():
+                    raise FileExistsError(final)
+                with path.open("ab") as f:
+                    if closing_period(path) is None:
+                        f.write(rawfmt.rollover(closing[day]))
+                    f.flush()
+                    os.fsync(f.fileno())
+                os.replace(path, final)
+                opened.remove(path)
+                closed.append(final)
             for path in closed:
                 if not path.with_name(path.name + ".meta.json").exists():
                     write_meta(path)
-            candidates = sorted(closed + list(self.root.glob(pattern + OPEN)), key=_file_date, reverse=True)
+            candidates = closed + opened
             resume[key] = None
-            for path in candidates:
-                if path.name.endswith(OPEN):
-                    repair(path)
-                    if path.stat().st_size == 0:
+            if not candidates:
+                continue
+            newest = max(_file_date(p) for p in candidates)
+            day_files = [p for p in candidates if _file_date(p) == newest]
+            offsets = []
+            for day in sorted({_file_date(p) for p in candidates}, reverse=True):
+                for path in candidates:
+                    if _file_date(path) != day:
                         continue
-                line = last_line(path)
-                if not line:
-                    continue
-                try:
-                    rec = orjson.loads(line)
-                except orjson.JSONDecodeError:
-                    rec = rawfmt.loads(line.decode())
-                resume[key] = rec["offset"] + 1
-                if path.name.endswith(OPEN):
-                    # keep appending to the open day so its first next-day record closes it
-                    self.writers[key].open(_file_date(path))
-                break
+                    line = last_line(path)
+                    if line:
+                        offsets.append(rawfmt.loads(line.decode())["offset"])
+                if offsets:
+                    break
+            # A partition can span depth + snapshot: its union, not either file,
+            # determines the next Kafka offset.
+            if offsets:
+                resume[key] = max(offsets) + 1
+                self.expected[key] = resume[key]
+            if any(p.name.endswith(OPEN) for p in day_files):
+                self.writers[key].open(newest)
         return resume
 
     def handle(self, topic: str, partition: int, offset: int, value: bytes) -> None:
@@ -259,14 +329,14 @@ class Recorder:
         if expected is not None and offset != expected:
             log.error("%s/%d: offset jump %d -> %d (data expired from Kafka?)", topic, partition, expected, offset)
         self.expected[key] = offset + 1
-        envelope = orjson.loads(value)
+        envelope = rawfmt.loads(value.decode())
         recv_ns = envelope["recv_ns"]
         date = utc_date(recv_ns)
         if writer.date is not None and date < writer.date and not writer.foreign_reported:
             writer.foreign_reported = True
             log.warning("%s/%d: clock stepped back to %s; keeping record in day %s", topic, partition, date, writer.date)
         line = rawfmt.line(envelope, offset)
-        writer.write(date, line, offset)
+        writer.write(date, line, offset, "snapshot" if line.startswith(b'{"channel":"snapshot"') else None)
 
     def sync(self) -> list[TopicPartition]:
         """fsync every dirty file; return the positions that are now safely on disk."""

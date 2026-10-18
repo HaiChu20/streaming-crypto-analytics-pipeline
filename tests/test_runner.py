@@ -496,3 +496,48 @@ def test_envelope_stamp_shared_between_connections_and_controls(monkeypatch):
     b.emit(stream, 'trade', '{}', 80)
     a.control(stream, 'stop', 'rotation')
     assert [r['recv_ns'] for r in sup.sink.records] == [100] * 5
+
+
+@pytest.mark.parametrize("market", ["spot", "perp"])
+def test_binance_periodic_snapshots_leave_synced_book_unchanged(monkeypatch, market):
+    from collectors.binance import PerpDepthSync
+    async def check():
+        sup = supervisor(BinanceHandler)
+        sup.spec.market = market
+        sup.request_replace = Mock()
+        run = ConnRun(sup)
+        stream = sup.spec.streams[0]
+        sync = PerpDepthSync() if market == "perp" else SpotDepthSync()
+        sync.on_snapshot(100)
+        if market == "perp":
+            assert sync.on_delta(100, 105, 99) == "applied"
+        else:
+            assert sync.on_delta(101, 105) == "applied"
+        run.handler.sync[stream.key] = sync
+        before = dict(vars(sync))
+        response = SimpleNamespace(status_code=200, text='{"lastUpdateId":9999}', content=b'{"lastUpdateId":9999}')
+        run.handler.http = SimpleNamespace(get=AsyncMock(return_value=response))
+        monkeypatch.setattr(runner.asyncio, "sleep", AsyncMock())
+        await run.handler._snapshot(run, stream, periodic=True)
+        assert vars(sync) == before
+        records = [r for r in sup.sink.records if r["kind"] == "snapshot"]
+        assert len(records) == 1 and records[0]["event"] == "periodic"
+        assert not drops(sup.sink)
+        result = sync.on_delta(106, 110, 105) if market == "perp" else sync.on_delta(106, 110)
+        assert result == "applied"
+        sup.request_replace.assert_not_called()
+    asyncio.run(check())
+
+
+def test_binance_periodic_snapshot_schedule(monkeypatch):
+    async def check():
+        sup = supervisor(BinanceHandler)
+        run = ConnRun(sup)
+        run.handler._snapshot = AsyncMock(side_effect=asyncio.CancelledError)
+        sleep = AsyncMock()
+        monkeypatch.setattr(runner.asyncio, "sleep", sleep)
+        with pytest.raises(asyncio.CancelledError):
+            await run.handler._periodic_snapshots(run, sup.spec.streams[0])
+        sleep.assert_awaited_once_with(420)
+        run.handler._snapshot.assert_awaited_once_with(run, sup.spec.streams[0], periodic=True)
+    asyncio.run(check())

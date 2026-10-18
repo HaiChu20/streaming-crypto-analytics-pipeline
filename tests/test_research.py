@@ -254,3 +254,14 @@ def test_tiny_end_to_end_cli_models_metadata_and_row_modes(tmp_path, synthetic_p
     with pytest.raises(FileExistsError):
         train_target(read_features([synthetic_path]), "BTC_spot", 900, output,
                      "test", n_folds=2, rounds=1)
+
+
+def test_matrix_uses_explicit_asset_for_generic_pairs(tmp_path):
+    rows = [row(0, symbol='USDTUSD', asset='USDT'), row(10, symbol='USDTUSD', asset='USDT')]
+    frame = read_features([write_parquet(tmp_path, rows)])
+    spec = load_spec()
+    spec['references']['USDT'] = {'spot': {'exchange':'binance','market':'spot','symbol':'USDTUSD'}}
+    matrix, features = build_matrix(frame, 'USDT_spot', spec=spec)
+    assert matrix['asset'].to_list() == ['USDT','USDT']
+    assert matrix['binance_spot_spread_bps'].to_list() == [2.,2.]
+    assert not any(f.endswith('_asset') for f in features)

@@ -90,26 +90,30 @@ fn row(engine: &mut Engine, tick: i64) -> Row {
         .unwrap()
 }
 fn raw(v: Value) -> String {
-    let mut payload: Value = serde_json::from_str(v["payload"].as_str().unwrap()).unwrap();
-    if v["kind"] == "control" {
-        payload = json!({"marker":"ws_event","event":match v["event"].as_str().unwrap() {"start" => "connected", "stop" => "disconnected", _ => "connection_error"}});
-        if let Some(detail) = v["detail"].as_object() {
-            payload.as_object_mut().unwrap().extend(detail.clone());
-        }
-    } else if v["kind"] == "snapshot" {
-        payload["type"] = json!("snapshot");
-    }
+    let payload: Value = serde_json::from_str(v["payload"].as_str().unwrap()).unwrap();
+    let mut line = if v["kind"] == "control" {
+        json!({"marker":"ws_event","event":match v["event"].as_str().unwrap() {"start" => "connected", "stop" => "disconnected", _ => "connection_error"}})
+    } else {
+        json!({"channel":if v["kind"] == "snapshot" {"snapshot"} else {"trade"},"data":payload.get("data").unwrap_or(&payload)})
+    };
     for (to, from) in [
         ("recv_time_ns", "recv_ns"),
         ("conn", "conn"),
         ("offset", "offset"),
     ] {
-        payload[to] = v[from].clone();
+        line[to] = v[from].clone();
     }
-    payload.to_string()
+    line.to_string()
 }
 fn raw_path(dir: &std::path::Path, symbol: &str, feed: &str) -> PathBuf {
-    let p = dir.join(format!("raw/binance/spot/{symbol}/20261017_{feed}.jsonl"));
+    let channel = match feed {
+        "l1" => "bookticker",
+        "l2" => "depth",
+        feed => feed,
+    };
+    let p = dir.join(format!(
+        "raw/binance/spot/{symbol}/20261017_{channel}.jsonl"
+    ));
     fs::create_dir_all(p.parent().unwrap()).unwrap();
     p
 }
@@ -130,7 +134,7 @@ fn merge_ties_topic_partition_offset_and_file_clock_steps() {
     let mut ids = Vec::new();
     while let Some(r) = merge.pop().unwrap() {
         ids.push(
-            serde_json::from_str::<Value>(&r.payload).unwrap()["data"]["t"]
+            serde_json::from_str::<Value>(&r.payload).unwrap()["t"]
                 .as_i64()
                 .unwrap(),
         );
@@ -404,7 +408,7 @@ fn end_to_end_synthetic_day_directory() {
     let day = "2026-10-17";
     let (_, end) = day_bounds(day).unwrap();
     let start = end - 3 * SECOND;
-    let book = root.join("raw/binance/spot/BTCUSDT/20261017_l2.jsonl");
+    let book = root.join("raw/binance/spot/BTCUSDT/20261017_snapshot.jsonl");
     fs::create_dir_all(book.parent().unwrap()).unwrap();
     fs::write(&book, format!("{}\n", raw(snap(start, "100", "102")))).unwrap();
     let trades = root.join("raw/binance/spot/BTCUSDT/20261017_trades.jsonl.open");

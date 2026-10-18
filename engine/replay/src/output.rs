@@ -132,6 +132,7 @@ impl Writer {
         optional!(DoubleType, spot_dev_bps_okx);
         optional!(DoubleType, spot_dev_bps_kraken);
         optional!(DoubleType, book_age_ms);
+        required!(ByteArrayType, |r: &Row| ByteArray::from(r.asset.as_str()));
         group.close()?;
         self.rows.clear();
         Ok(())
@@ -186,4 +187,5 @@ const SCHEMA: &str = r#"message features {
   OPTIONAL DOUBLE spot_dev_bps_okx;
   OPTIONAL DOUBLE spot_dev_bps_kraken;
   OPTIONAL DOUBLE book_age_ms;
+  REQUIRED BINARY asset (UTF8);
 }"#;

@@ -132,7 +132,7 @@ def test_meta_derives_integrity_from_file(tmp_path):
     write_meta(path)
     meta = orjson.loads(path.with_name(path.name + ".meta.json").read_bytes())
     assert meta == {
-        "format": "v2", "file": path.name, "lines": 4, "bytes": len(content), "sha256": hashlib.sha256(content).hexdigest(),
+        "format": "v3", "file": path.name, "lines": 4, "bytes": len(content), "sha256": hashlib.sha256(content).hexdigest(),
         "first_offset": 7, "last_offset": 5, "first_recv_ns": ns(17, 22), "last_recv_ns": ns(17, 1),
         "offset_gaps": [[8, 9], [10, 9], [10, 5]], "foreign_day_records": 1,
     }
@@ -224,7 +224,7 @@ def test_meta_empty_file(tmp_path):
     write_meta(path)
     meta = orjson.loads(path.with_name(path.name + ".meta.json").read_bytes())
     assert meta == {
-        "format": "v2", "file": path.name, "lines": 0, "bytes": 0, "sha256": hashlib.sha256(b"").hexdigest(),
+        "format": "v3", "file": path.name, "lines": 0, "bytes": 0, "sha256": hashlib.sha256(b"").hexdigest(),
         "offset_gaps": [], "foreign_day_records": 0,
     }
 
@@ -251,3 +251,118 @@ def test_empty_crashed_open_file_is_preserved(tmp_path):
     assert rec.recover()[KEY] is None
     assert opened.exists()
     rec.shutdown()
+
+
+@pytest.mark.parametrize("last_kind", ["update", "snapshot"])
+def test_binance_partition_two_file_crash_recovery(tmp_path, last_kind):
+    stream = next(s for s in all_streams(load_config()) if s.exchange == "binance" and s.feed == "l2")
+    key = stream.topic, stream.partition
+    def put(rec, offset, kind, day=17):
+        payload = '{"lastUpdateId":100,"bids":[],"asks":[]}' if kind == "snapshot" else '{"stream":"btcusdt@depth","data":{"U":101,"u":102}}'
+        rec.handle(*key, offset, data_record(stream, kind, "c", offset, ns(day), payload))
+    rec = Recorder(tmp_path, {key: stream})
+    rec.recover()
+    for offset, kind in enumerate(["update", "snapshot", "update", last_kind]):
+        put(rec, offset, kind)
+    rec.shutdown()
+    # The interrupted fifth write is in the other file: recovering just one
+    # file would replay already persisted Kafka offsets from its sibling.
+    partial_kind = "snapshot" if last_kind == "update" else "update"
+    target = stream_path(tmp_path, stream, "2026-10-17", "snapshot" if partial_kind == "snapshot" else None)
+    with target.with_name(target.name + OPEN).open("ab") as f:
+        f.write(b'{"channel":"partial"')
+    again = Recorder(tmp_path, {key: stream})
+    assert again.recover()[key] == 4
+    put(again, 4, partial_kind)
+    put(again, 5, "update", 18)
+    again.shutdown()
+    paths = [stream_path(tmp_path, stream, "2026-10-17", kind) for kind in (None, "snapshot")]
+    assert sorted(offset for path in paths for offset in offsets(path)) == list(range(5))
+    for path in paths:
+        rows = path.read_bytes().splitlines()
+        assert orjson.loads(rows[-1])["marker"] == "rollover"
+        meta = orjson.loads(path.with_name(path.name + ".meta.json").read_bytes())
+        assert meta["format"] == "v3" and "shared by depth and snapshot" in meta["offset_gaps_scope"]
+
+
+@pytest.mark.parametrize('renamed', [False, True])
+def test_binance_recovery_completes_interrupted_two_file_close(tmp_path, renamed):
+    stream = next(s for s in all_streams(load_config()) if s.exchange == 'binance' and s.feed == 'l2')
+    key = stream.topic, stream.partition
+    for offset, kind in enumerate(['update', 'snapshot']):
+        final = stream_path(tmp_path, stream, '2026-10-17', 'snapshot' if kind == 'snapshot' else None)
+        path = final if renamed and kind == 'update' else final.with_name(final.name + OPEN)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        line = rawfmt.line(data_record(stream, kind, 'c', offset, ns(17), '{}'), offset)
+        path.write_bytes(line + (rawfmt.rollover('20261018') if kind == 'update' else b''))
+    root = tmp_path
+    again = Recorder(root, {key:stream})
+    assert again.recover()[key] == 2
+    again.handle(*key, 2, data_record(stream, 'update', 'c', 2, ns(18), '{}'))
+    again.shutdown()
+    paths = [stream_path(root, stream, '2026-10-17', kind) for kind in (None,'snapshot')]
+    assert sorted(o for p in paths for o in offsets(p)) == [0,1]
+    assert all(orjson.loads(p.read_bytes().splitlines()[-1])['marker'] == 'rollover' for p in paths)
+
+
+@pytest.mark.parametrize("first_kind", ["update", "snapshot"])
+def test_binance_file_switch_flushes_previous_buffer_before_write(tmp_path, first_kind):
+    from unittest.mock import Mock
+    stream = next(s for s in all_streams(load_config()) if s.exchange == "binance" and s.feed == "l2")
+    key = stream.topic, stream.partition
+    rec = Recorder(tmp_path, {key: stream})
+    writer = rec.writers[key]
+    writer.open("2026-10-17")
+    first = stream_path(tmp_path, stream, "2026-10-17", "snapshot" if first_kind == "snapshot" else None)
+    second_kind = "snapshot" if first_kind == "update" else "update"
+    second = stream_path(tmp_path, stream, "2026-10-17", "snapshot" if second_kind == "snapshot" else None)
+    prior = writer.files[first] = Mock(wraps=writer.files[first])
+    destination = writer.files[second]
+    first_open = first.with_name(first.name + OPEN)
+    try:
+        for offset in range(2):
+            rec.handle(*key, offset, data_record(stream, first_kind, "c", offset, ns(17), "{}"))
+        # Same-file lines remain buffered; no per-line flush or write syscall.
+        assert first_open.read_bytes() == b""
+        prior.flush.assert_not_called()
+
+        def write(line):
+            # This assertion runs BEFORE writing to the new destination.
+            prior.flush.assert_called_once_with()
+            assert offsets(first_open) == [0, 1]
+            return destination.write(line)
+
+        writer.files[second] = Mock(wraps=destination)
+        writer.files[second].write.side_effect = write
+        rec.handle(*key, 2, data_record(stream, second_kind, "c", 2, ns(17), "{}"))
+        writer.files[second].write.assert_called_once()
+        assert second.with_name(second.name + OPEN).read_bytes() == b""
+    finally:
+        rec.shutdown()
+
+
+def test_binance_close_flushes_last_buffer_before_any_rollover(tmp_path):
+    from unittest.mock import Mock
+    stream = next(s for s in all_streams(load_config()) if s.exchange == "binance" and s.feed == "l2")
+    key = stream.topic, stream.partition
+    rec = Recorder(tmp_path, {key: stream})
+    rec.handle(*key, 0, data_record(stream, "update", "c", 0, ns(17), "{}"))
+    rec.handle(*key, 1, data_record(stream, "snapshot", "c", 1, ns(17), "{}"))
+    snapshot = stream_path(tmp_path, stream, "2026-10-17", "snapshot")
+    snapshot_open = snapshot.with_name(snapshot.name + OPEN)
+    depth = stream_path(tmp_path, stream, "2026-10-17")
+    writer = rec.writers[key]
+    destination = writer.files[depth]
+    assert snapshot_open.read_bytes() == b""
+
+    def write(marker):
+        # A rollover must never survive while an earlier offset stays buffered.
+        assert offsets(snapshot_open) == [1]
+        return destination.write(marker)
+
+    writer.files[depth] = Mock(wraps=destination)
+    writer.files[depth].write.side_effect = write
+    try:
+        writer.close_day("20261018")
+    finally:
+        rec.shutdown()

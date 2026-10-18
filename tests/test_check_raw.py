@@ -253,7 +253,7 @@ def test_v2_discovery_and_date_filter(tmp_path):
         p.parent.mkdir(parents=True, exist_ok=True)
         p.with_name(p.name+'.open').touch()
     found = check_raw.files_for(tmp_path, BOOK, ['2026-10-16'])
-    assert len(found) == 1 and found[0].name == '20261016_l2.jsonl.open'
+    assert len(found) == 1 and found[0].name == '20261016_book.jsonl.open'
     assert check_raw.files_for(tmp_path/'raw', BOOK, None, raw_root=True) == check_raw.files_for(tmp_path, BOOK, None)
 
 
@@ -337,3 +337,27 @@ def test_v2_raw_fallback_checks_native_collision_and_skips_invalid_text(tmp_path
     assert result['records'] == 2
     assert result['crc_pass'] == 1
     assert not result['errors']
+
+
+@pytest.mark.parametrize('feed', ['l2','l3'])
+def test_real_archive_kraken_crc(feed):
+    root = Path('tests/fixtures/archive')
+    stream = next(s for s in check_raw.discovered_streams(root) if s.exchange == 'kraken' and s.market == 'spot' and s.feed == feed and s.symbol == 'BTC/USDT')
+    result = check_raw.check_stream(stream, check_raw.files_for(root, stream, None, raw_root=True), None, True)
+    assert not result['errors'] and result['crc_pass'] > 0 and result['crc_fail'] == 0
+
+
+def test_binance_archive_snapshot_is_used_and_periodic_is_ignored(tmp_path):
+    stream = replace(BOOK, exchange='binance', symbol='BTCUSDT')
+    from archiver import rawfmt
+    paths = []
+    base = dict(exchange='binance', market='spot', feed='l2', symbol='BTCUSDT', conn='c')
+    for channel, rows in [
+        ('depth', [(0, 'update', {'U':101,'u':102}), (3, 'update', {'U':103,'u':104}), (4, 'update', {'U':107,'u':108})]),
+        ('snapshot', [(1, 'snapshot', {'lastUpdateId':101}), (2, 'snapshot', {'lastUpdateId':9999})])]:
+        p = tmp_path/f'20261016_{channel}.jsonl'
+        p.write_bytes(b''.join(rawfmt.line(base | dict(kind=kind, recv_ns=offset+1, payload=orjson.dumps(native).decode(), event='periodic' if offset == 2 else 'anchor'), offset) for offset, kind, native in rows))
+        paths.append(p)
+    result = check_raw.check_stream(stream, paths, None, True)
+    assert len(result['errors']) == 1 and 'update-id break U=107' in result['errors'][0]
+    assert not any('offset hole' in error for error in result['errors'])
