@@ -1,5 +1,6 @@
 """Offline checker verdicts and bounded trade overlap history."""
 
+import gzip
 import subprocess
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
@@ -254,6 +255,47 @@ def test_v2_discovery_and_date_filter(tmp_path):
     found = check_raw.files_for(tmp_path, BOOK, ['2026-10-16'])
     assert len(found) == 1 and found[0].name == '20261016_l2.jsonl.open'
     assert check_raw.files_for(tmp_path/'raw', BOOK, None, raw_root=True) == check_raw.files_for(tmp_path, BOOK, None)
+
+
+@pytest.mark.parametrize("v2_suffix", ["", ".open", ".gz"])
+@pytest.mark.parametrize("v1_suffix", ["", ".open", ".gz"])
+@pytest.mark.parametrize("dates", [None, ["2026-10-17"]])
+def test_v2_day_ignores_truncated_v1_copy(tmp_path, v2_suffix, v1_suffix, dates):
+    from archiver import rawfmt
+    from archiver.record_raw import stream_path
+
+    v2 = stream_path(tmp_path, TRADES, "2026-10-17")
+    v2 = v2.with_name(v2.name + v2_suffix)
+    v1 = tmp_path / "raw/date=2026-10-17/exchange=okx/market=spot/feed=trades/BTC-USDT.jsonl"
+    v1 = v1.with_name(v1.name + v1_suffix)
+    records = [dict(trade(str(i)), recv_ns=1, exchange="okx") for i in range(2)]
+    for path, content in [
+        (v2, b"".join(rawfmt.line(r, i) for i, r in enumerate(records))),
+        (v1, orjson.dumps(dict(trade("different"), offset=0)) + b"\n"),
+    ]:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(gzip.compress(content) if path.suffix == ".gz" else content)
+
+    paths = check_raw.files_for(tmp_path, TRADES, dates)
+    assert paths == [v2]
+    assert check_raw.files_for(tmp_path / "raw", TRADES, dates, raw_root=True) == paths
+    result = check_raw.check_stream(TRADES, paths, depth=None, deep=True)
+    assert result["files"] == 1
+    assert result["records"] == 2
+    assert not result["errors"]
+
+
+def test_v2_precedence_is_per_stream_and_day(tmp_path):
+    from archiver.record_raw import stream_path
+
+    v2 = stream_path(tmp_path, BOOK, "2026-10-17")
+    old_day = tmp_path / "raw/date=2026-10-16/exchange=okx/market=spot/feed=l2/BTC-USDT.jsonl"
+    other_stream = tmp_path / "raw/date=2026-10-17/exchange=okx/market=spot/feed=trades/BTC-USDT.jsonl"
+    for path in (v2, old_day, other_stream):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.touch()
+    assert check_raw.files_for(tmp_path, BOOK, None) == [old_day, v2]
+    assert check_raw.files_for(tmp_path, TRADES, ["2026-10-17"]) == [other_stream]
 
 
 def test_restart_only_targets_named_service(tmp_path):

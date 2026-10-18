@@ -100,11 +100,14 @@ def files_for(root: Path, stream: Stream, dates: list[str] | None, *, raw_root=F
     tree = root if raw_root else root / "raw"
     pattern = str(rawfmt.path(Path("."), stream.exchange, stream.market, stream.symbol, "*", stream.feed))
     old = f"date=*/exchange={stream.exchange}/market={stream.market}/feed={stream.feed}/{stream.file_symbol}.jsonl"
-    paths = [p for pat in (pattern, old) for suffix in ("", OPEN, ".gz") for p in tree.glob(pat + suffix)]
-    if dates:
-        paths = [p for p in paths if any(f"date={d}" in p.parts or p.name.startswith(d.replace("-", "") + "_") for d in dates)]
     def day(p):
         return next((x[5:].replace("-", "") for x in p.parts if x.startswith("date=")), p.name[:8])
+    paths = [p for suffix in ("", OPEN, ".gz") for p in tree.glob(pattern + suffix)]
+    v2_days = {day(p) for p in paths}
+    # Converted v2 days are authoritative; v1 files are pre-conversion copies.
+    paths.extend(p for suffix in ("", OPEN, ".gz") for p in tree.glob(old + suffix) if day(p) not in v2_days)
+    if dates:
+        paths = [p for p in paths if any(f"date={d}" in p.parts or p.name.startswith(d.replace("-", "") + "_") for d in dates)]
     return sorted(paths, key=day)
 
 
