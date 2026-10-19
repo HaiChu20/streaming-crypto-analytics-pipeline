@@ -84,14 +84,16 @@ if start and end and start > end:
 root = root / 'raw' if (root / 'raw').is_dir() else root
 days = set()
 for exchange in root.iterdir():
-    if not exchange.is_dir() or not exchange.name.lower().startswith(('binance', 'kraken', 'okx')):
+    if not exchange.is_dir() or not exchange.name.lower().startswith(('binance', 'kraken', 'okx', 'deribit')):
         continue
     name = exchange.name.lower()
     for market in exchange.iterdir():
-        if not market.is_dir() or not market.name.lower().startswith(('spot', 'fut', 'perp', 'swap')):
+        if not market.is_dir() or not market.name.lower().startswith(('spot', 'fut', 'perp', 'swap', 'index')):
             continue
         spot = market.name.lower().startswith('spot')
-        if name.startswith('binance'):
+        if name.startswith('deribit'):
+            channels = {'dvol'} if market.name.lower().startswith('index') else set()
+        elif name.startswith('binance'):
             channels = {'depth', 'snapshot', 'bookticker', 'trades'}
             if not spot:
                 channels |= {'aggtrades', 'markprice', 'forceorder'}

@@ -22,8 +22,8 @@ Requires Docker Desktop and [uv](https://docs.astral.sh/uv/); uv installs Python
 uv sync                                                  # dependencies
 cp .env.example .env                                     # add the Kraken key (only needed for L3)
 docker compose -f docker/kafka/docker-compose.yml up -d  # Kafka on localhost:9092, UI on :8080
-uv run python scripts/create_topics.py                   # 22 raw topics, 2 partitions each
-scripts/pipeline.sh start                                # 3 collectors + recorder
+uv run python scripts/create_topics.py                   # 23 raw topics, 2 partitions each
+scripts/pipeline.sh start                                # 4 collectors + recorder
 scripts/pipeline.sh status                               # stop | rotate (make-before-break reconnect)
 uv run python scripts/check_raw.py                       # data-quality report on data/raw
 ```
@@ -33,7 +33,7 @@ uv run python scripts/check_raw.py                       # data-quality report o
 - `uv run pytest`: unit tests.
 
 Raw disk files use **v3**, matching the user's archive:
-`data/raw/<Exchange>/<Spot|Futures>/<Pair>/<YYYYMMDD>_<channel>.jsonl`.
+`data/raw/<Exchange>/<Spot|Futures|Index>/<Pair>/<YYYYMMDD>_<channel>.jsonl`.
 Binance, OKX and Kraken Futures wrap the native message in `data`; Kraken spot
 inserts metadata into the native message. Decimals are exact strings. Our files
 add `conn` and Kafka `offset`; readers also accept archive files without them and
@@ -111,7 +111,7 @@ terraform -chdir=infra/terraform test
 ## Layout
 
 ```text
-collectors/        exchange collectors: binance.py, okx.py, kraken.py; common/ (config, envelope, sinks, runner)
+collectors/        exchange collectors: binance.py, okx.py, kraken.py, deribit.py; common/ (config, envelope, sinks, runner)
 archiver/          record_raw.py + rawfmt.py: Kafka → data/raw/<Exchange>/<Market>/<Pair>/<YYYYMMDD>_<channel>.jsonl
 config/            markets.yaml: exchanges, symbols, feeds, partitions, rotation
 scripts/           create_topics.py, probe_feeds.py, convert_raw.py, check_raw.py, pipeline.sh
@@ -255,3 +255,48 @@ is driven by books and pending buffers rather than day length; parallel jobs
 multiply worker memory. Measure representative full days before choosing job
 counts. Python training additionally holds all input features and wide matrices
 in RAM; the replay RSS figures do not estimate training memory.
+
+## Deribit DVOL (P22, features v5)
+
+`uv run python -m collectors deribit` runs a REST poller through the same Kafka
+sink and session/crash tracking as the WebSocket collectors; `pipeline.sh` includes
+it. After an initial catch-up poll it polls BTC and ETH each minute about five
+seconds after the boundary, fetching a five-minute overlap. Only closed candles
+are emitted, once per currency/timestamp per process, in ascending candle order.
+HTTP errors emit in-band drop/start events with exponential backoff and jitter;
+Kafka loss triggers drop/start and re-fetches the overlap. Restarts can repeat
+closed candles; the engine keeps the first observation of each timestamp.
+
+The envelope is `deribit/index/dvol`, symbol BTC or ETH, kind `update`, topic
+`raw.deribit.index.dvol.v1` (BTC partition 0, ETH partition 1). Payload is the
+single `[ts_ms,open,high,low,close]` row. A token-preserving JSON decoder retains
+all number spellings, and joins the five tokens into a row array without float
+conversion. Only JSON whitespace is normalized. The v3 archive is
+`Deribit/Index/<BTC|ETH>/YYYYMMDD_dvol.jsonl`, with `channel=dvol`, metadata and
+`data` containing the row; decimal/exponent tokens become exact strings.
+Readers accept `deribit*` and `index*` directory prefixes case-insensitively.
+
+Backfill runs **only on the server**. Stop writers for the target dates first:
+
+```sh
+PYTHON_DOTENV_DISABLED=1 uv run python scripts/backfill_dvol.py \
+  --archive-root /server/archive/raw --from 2026-10-01 --to 2026-10-17 --currency BTC ETH
+```
+
+Both dates are inclusive, completed UTC **receive days**. Backfill pages backwards
+using `continuation` as the next `end_timestamp`, sleeps between requests and
+backs off on 429/5xx or transport errors. Synthetic receive time is candle start
+plus 70 seconds (60 seconds to close plus 10 seconds fixed lag). Thus the prior
+day's 23:59 candle is this day's first record at 00:00:10; this day's 23:59 candle
+belongs to the next file. Files have connection `backfill`, offsets from zero,
+a deterministic final rollover and recorder-compatible `.meta.json` with
+`synthetic_offsets=true`. Identical existing content is skipped; differing files,
+metadata checksum mismatches and existing open/gzip counterparts are refused.
+Writes use exclusive creation and fsync; interrupted partial files are preserved
+and cause a later run to refuse, for operator review.
+
+Features v5 appends five nullable float columns to each asset's `cross` row:
+`dvol`, `dvol_chg_300s`, `dvol_chg_900s`, `dvol_chg_3600s`, `dvol_rv_gap`.
+See the [engine field contract](engine/replay/README.md#deribit-dvol-features-v5)
+for timing and units. Existing market row values are unchanged; their DVOL
+columns are null. No Deribit market row is emitted.

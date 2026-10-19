@@ -856,3 +856,56 @@ fn collector_crash_book_features_accept_new_conn_metadata_and_updates() {
     assert_eq!(r.bid_depth10, Some(0.6));
     assert_eq!(e.book_breaks, 1);
 }
+
+#[test]
+fn dvol_exact_v3_reader_and_nullable_parquet_roundtrip() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/dvol");
+    let paths = discover(&root, "2026-10-17", false).unwrap();
+    let mut merge = Merge::new(paths).unwrap();
+    let record = merge.pop().unwrap().unwrap();
+    assert_eq!(
+        (
+            &*record.exchange,
+            &*record.market,
+            &*record.feed,
+            &*record.symbol
+        ),
+        ("deribit", "index", "dvol", "BTC")
+    );
+    assert_eq!(record.kind, Kind::Update);
+    assert!(record.payload.contains("\"52.30000000\""));
+    assert!(record.payload.contains("\"5.240E+1\""));
+    let mut engine = Engine::default();
+    engine.consume(&record).unwrap();
+    let ts = day_bounds("2026-10-17").unwrap().0;
+    let target = scratch().join("dvol.parquet");
+    let mut writer = Writer::new(&target).unwrap();
+    for t in [69, 70, 180, 181] {
+        let rows = engine.tick(ts + t * SECOND).unwrap();
+        assert_eq!(rows.len(), 1);
+        writer.push(rows.into_iter().next().unwrap()).unwrap();
+    }
+    writer.finish().unwrap();
+    let reader = SerializedFileReader::new(File::open(target).unwrap()).unwrap();
+    let rows = reader
+        .get_row_iter(None)
+        .unwrap()
+        .map(|r| row_json(r.unwrap()))
+        .collect::<Vec<_>>();
+    assert!(rows[0]["dvol"].is_null());
+    assert_eq!(rows[1]["dvol"], 52.3);
+    assert_eq!(rows[2]["dvol"], 52.3);
+    assert!(rows[3]["dvol"].is_null());
+    for row in rows {
+        assert_eq!(row["exchange"], "cross");
+        assert_eq!(row["asset"], "BTC");
+        for name in [
+            "dvol_chg_300s",
+            "dvol_chg_900s",
+            "dvol_chg_3600s",
+            "dvol_rv_gap",
+        ] {
+            assert!(row[name].is_null());
+        }
+    }
+}

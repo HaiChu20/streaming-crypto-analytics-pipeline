@@ -234,3 +234,13 @@ def test_stale_day_outside_selected_archive_days_blocks_training(launcher, args)
     assert "2026-09-14" in result.stderr
     assert stale.read_bytes() == before
     assert not (work / "trained").exists()
+
+
+def test_launcher_discovers_deribit_index_days(launcher):
+    work, launch = launcher
+    pair = work.parent / "archive/DeribitRaw/IndexV2/BTC"
+    pair.mkdir(parents=True)
+    (pair / "20260917_dvol.jsonl").write_text("stub DVOL archive\n")
+    result = launch()
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert (work / "features/date=2026-09-17/features.parquet").exists()

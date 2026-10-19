@@ -242,6 +242,11 @@ impl Writer {
         optional!(DoubleType, depth_ask_10bps);
         optional!(DoubleType, depth_ask_25bps);
         optional!(DoubleType, depth_ask_50bps);
+        optional!(DoubleType, dvol);
+        optional!(DoubleType, dvol_chg_300s);
+        optional!(DoubleType, dvol_chg_900s);
+        optional!(DoubleType, dvol_chg_3600s);
+        optional!(DoubleType, dvol_rv_gap);
         group.close()?;
         self.rows.clear();
         Ok(())
@@ -406,4 +411,9 @@ const SCHEMA: &str = r#"message features {
   OPTIONAL DOUBLE depth_ask_10bps;
   OPTIONAL DOUBLE depth_ask_25bps;
   OPTIONAL DOUBLE depth_ask_50bps;
+  OPTIONAL DOUBLE dvol;
+  OPTIONAL DOUBLE dvol_chg_300s;
+  OPTIONAL DOUBLE dvol_chg_900s;
+  OPTIONAL DOUBLE dvol_chg_3600s;
+  OPTIONAL DOUBLE dvol_rv_gap;
 }"#;

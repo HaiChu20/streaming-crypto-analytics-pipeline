@@ -57,4 +57,9 @@ pub struct Row {
     pub basis_bps_kraken: Option<f64>,
     pub spot_dev_bps_okx: Option<f64>,
     pub spot_dev_bps_kraken: Option<f64>,
+    pub dvol: Option<f64>,
+    pub dvol_chg_300s: Option<f64>,
+    pub dvol_chg_900s: Option<f64>,
+    pub dvol_chg_3600s: Option<f64>,
+    pub dvol_rv_gap: Option<f64>,
 }
