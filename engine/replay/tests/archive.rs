@@ -98,8 +98,10 @@ fn users_v3_archive_replays_every_pair_and_validates_all_books() {
             .metadata()
             .file_metadata()
             .schema_descr()
-            .num_columns()
-            - 1;
+            .columns()
+            .iter()
+            .position(|c| c.name() == "asset")
+            .unwrap();
         for row in reader.get_row_iter(None).unwrap() {
             let row = row.unwrap();
             let (exchange, market, symbol) = (
@@ -212,4 +214,35 @@ fn fixture_ofi_windows_cover_all_four_market_types_and_restart_identically() {
             .map(String::from)
             .collect()
     );
+}
+
+#[test]
+fn archived_kraken_ticker_funding_is_an_epoch_millisecond_timestamp() {
+    use engine_core::{SECOND, features::Engine};
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/archive");
+    let mut merge = Merge::new(discover(&root, "2026-10-08", false).unwrap()).unwrap();
+    while let Some(record) = merge.pop().unwrap() {
+        if record.feed != "ticker" || record.kind == engine_core::Kind::Control {
+            continue;
+        }
+        let payload: Value = serde_json::from_str(&record.payload).unwrap();
+        assert_eq!(payload["next_funding_rate_time"], 1791471600000i64);
+        let mut engine = Engine::default();
+        engine.consume(&record).unwrap();
+        let tick = (record.recv_ns as i64 / SECOND + 1) * SECOND;
+        let row = engine
+            .tick(tick)
+            .unwrap()
+            .into_iter()
+            .find(|r| r.exchange == "kraken")
+            .unwrap();
+        let expected = (1791471600000.0 - tick as f64 / 1_000_000.0) / 60000.0;
+        assert_eq!(row.funding_min_to_next, Some(expected));
+        assert!((0.0..60.0).contains(&expected));
+        let mark: f64 = payload["markPrice"].as_str().unwrap().parse().unwrap();
+        let index: f64 = payload["index"].as_str().unwrap().parse().unwrap();
+        assert_eq!(row.mark_index_bps, Some((mark - index) / index * 10000.0));
+        return;
+    }
+    panic!("fixture has no ticker");
 }

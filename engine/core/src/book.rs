@@ -61,6 +61,44 @@ impl Book {
         }
         levels
     }
+    /// Native size within each band. A side must extend strictly beyond its edge.
+    /// Integer comparisons retain half-atom midpoints and exact boundary inclusion.
+    pub(crate) fn bands(&self, mid_e9: i64) -> [[Option<i128>; 3]; 2] {
+        let mut result = [[None; 3]; 2];
+        for (side, levels) in [&self.bids, &self.asks].into_iter().enumerate() {
+            for (i, bps) in [10, 25, 50].into_iter().enumerate() {
+                let edge = i128::from(mid_e9) * (10000 + if side == 0 { -bps } else { bps });
+                let price = |p: i64| i128::from(p) * 10 * 10000;
+                let extends = if side == 0 {
+                    levels
+                        .first_key_value()
+                        .is_some_and(|(p, _)| price(*p) < edge)
+                } else {
+                    levels
+                        .last_key_value()
+                        .is_some_and(|(p, _)| price(*p) > edge)
+                };
+                if extends {
+                    let size = if side == 0 {
+                        levels
+                            .iter()
+                            .rev()
+                            .take_while(|(p, _)| price(**p) >= edge)
+                            .map(|(_, l)| i128::from(l.size))
+                            .sum()
+                    } else {
+                        levels
+                            .iter()
+                            .take_while(|(p, _)| price(**p) <= edge)
+                            .map(|(_, l)| i128::from(l.size))
+                            .sum()
+                    };
+                    result[side][i] = Some(size);
+                }
+            }
+        }
+        result
+    }
     pub fn mid(&self) -> Option<Mid> {
         Some(Mid((i128::from(self.best_bid()?.0.0)
             + i128::from(self.best_ask()?.0.0))
@@ -128,5 +166,54 @@ impl Book {
         while self.asks.len() > depth {
             self.asks.pop_last();
         }
+    }
+}
+
+#[cfg(test)]
+mod band_tests {
+    use super::*;
+    use serde_json::json;
+    #[test]
+    fn band_edges_include_boundary_but_require_a_level_strictly_beyond_it() {
+        let mut book = Book::default();
+        for (side, levels) in [
+            (
+                Side::Bid,
+                [("99.99", "1"), ("99.9", "2"), ("99.75", "4"), ("99.5", "8")],
+            ),
+            (
+                Side::Ask,
+                [
+                    ("100.01", "3"),
+                    ("100.1", "5"),
+                    ("100.25", "7"),
+                    ("100.5", "9"),
+                ],
+            ),
+        ] {
+            for (p, q) in levels {
+                book.set(side, &json!(p), &json!(q)).unwrap();
+            }
+        }
+        let unit = 100_000_000i128;
+        assert_eq!(
+            book.bands(100_000_000_000),
+            [
+                [Some(3 * unit), Some(7 * unit), None],
+                [Some(8 * unit), Some(15 * unit), None]
+            ]
+        );
+        // Each side is assessed independently; strictly beyond the 50bps edge.
+        book.set(Side::Bid, &json!("99.49"), &json!("100")).unwrap();
+        assert_eq!(book.bands(100_000_000_000)[0][2], Some(15 * unit));
+        assert_eq!(book.bands(100_000_000_000)[1][2], None);
+        let mut truncated = Book::default();
+        truncated
+            .set(Side::Bid, &json!("99.99"), &json!("1"))
+            .unwrap();
+        truncated
+            .set(Side::Ask, &json!("100.01"), &json!("1"))
+            .unwrap();
+        assert_eq!(truncated.bands(100_000_000_000), [[None; 3]; 2]);
     }
 }

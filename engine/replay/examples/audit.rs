@@ -104,6 +104,11 @@ fn main() -> Result<()> {
                 ) || name.starts_with("ret_")
                     || name.starts_with("range_bps_")
                     || name == "microprice_dev_bps"
+                    || name == "funding_min_to_next"
+                    || name == "mark_index_bps"
+                    || name.starts_with("oi_chg_pct_")
+                    || name.starts_with("depth_bid_")
+                    || name.starts_with("depth_ask_")
                 {
                     // Historical OFI/volatility may remain populated until their
                     // window expires. Endpoint-based fields require a current mid.

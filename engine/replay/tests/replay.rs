@@ -381,6 +381,15 @@ fn parquet_optional_columns_metadata_and_atomic_publish() {
         .push(Row {
             exchange: "test".into(),
             engine_version: ENGINE_VERSION.into(),
+            funding_min_to_next: Some(12.5),
+            mark_index_bps: Some(-1.5),
+            oi_chg_pct_300s: Some(2.5),
+            depth_bid_10bps: Some(3.5),
+            memory: engine_core::windows::MemoryColumns {
+                liq_sell_base_10s: Some(0.25),
+                liq_buy_count_3600s: Some(7),
+                ..Default::default()
+            },
             ..Default::default()
         })
         .unwrap();
@@ -401,6 +410,12 @@ fn parquet_optional_columns_metadata_and_atomic_publish() {
     let v = row_json(r);
     assert!(v["mid"].is_null());
     assert!(v["mid_e9"].is_null());
+    assert_eq!(v["funding_min_to_next"], 12.5);
+    assert_eq!(v["mark_index_bps"], -1.5);
+    assert_eq!(v["oi_chg_pct_300s"], 2.5);
+    assert_eq!(v["depth_bid_10bps"], 3.5);
+    assert_eq!(v["liq_sell_base_10s"], 0.25);
+    assert_eq!(v["liq_buy_count_3600s"], 7);
 }
 #[test]
 fn cli_reports_engine_version_without_replay_arguments() {
@@ -560,7 +575,7 @@ fn kraken_trade_sides_and_snapshots_and_perp_extras() {
         "liquidations",
         "update",
         SECOND,
-        json!({"data":{"o":{"q":"10","z":"3"}}}),
+        json!({"data":{"o":{"q":"10","z":"3","S":"SELL"}}}),
     )))
     .unwrap();
     let r = row(&mut e, SECOND);

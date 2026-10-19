@@ -45,6 +45,8 @@ pub(crate) struct Sample {
     pub l3: [i64; 4],
     pub mid: Option<i64>,
     pub r2: f64,
+    pub liq_base: [i128; 2], // sell, buy; calibrated 1e-16 base units
+    pub liq_count: [i64; 2],
 }
 #[derive(Default, Serialize, Deserialize)]
 struct Window {
@@ -74,6 +76,8 @@ impl Window {
         for i in 0..2 {
             self.sum.ofi[i] += i128::from(sign) * sample.ofi[i];
             self.sum.depth[i] += i128::from(sign) * sample.depth[i];
+            self.sum.liq_base[i] += i128::from(sign) * sample.liq_base[i];
+            self.sum.liq_count[i] += sign * sample.liq_count[i];
         }
         for i in 0..4 {
             self.sum.l3[i] += sign * sample.l3[i];
@@ -118,6 +122,8 @@ struct Values {
     range: Option<f64>,
     l3: [Option<i64>; 4],
     rv: Option<f64>,
+    liq_base: [Option<f64>; 2],
+    liq_count: [Option<i64>; 2],
 }
 impl Memory {
     fn push(&mut self, tick: i64, sample: Sample) {
@@ -140,6 +146,7 @@ impl Memory {
         sample: Sample,
         trades: bool,
         l3: bool,
+        liquidations: bool,
     ) -> MemoryColumns {
         // Callers normally tick every second. Explicit gaps must still age every window.
         if let Some(last) = self.last_tick {
@@ -164,6 +171,10 @@ impl Memory {
                     value.flow = Some(sum.flow as f64 / BASE_SCALE);
                 }
                 value.trades = Some(sum.trades);
+            }
+            if liquidations {
+                value.liq_base = sum.liq_base.map(|v| Some(v as f64 / BASE_SCALE));
+                value.liq_count = sum.liq_count.map(Some);
             }
             let normalized = |i| {
                 (sum.depth[i] > 0)
@@ -191,14 +202,17 @@ impl Memory {
 
 macro_rules! columns {
     ($(($i:tt, $cov:ident, $vol:ident, $flow:ident, $trades:ident, $ofi1:ident, $ofi10:ident,
-        $range:ident, $ab:ident, $aa:ident, $db:ident, $da:ident)),* $(,)?) => {
+        $range:ident, $ab:ident, $aa:ident, $db:ident, $da:ident,
+        $lsb:ident, $lbb:ident, $lsc:ident, $lbc:ident)),* $(,)?) => {
         #[derive(Debug, Default, Clone, Serialize, Deserialize)]
         #[serde(default)]
         pub struct MemoryColumns {
             $(pub $cov: Option<f64>, pub $vol: Option<f64>, pub $flow: Option<f64>,
               pub $trades: Option<i64>, pub $ofi1: Option<f64>, pub $ofi10: Option<f64>,
               pub $range: Option<f64>, pub $ab: Option<i64>, pub $aa: Option<i64>,
-              pub $db: Option<i64>, pub $da: Option<i64>,)*
+              pub $db: Option<i64>, pub $da: Option<i64>,
+              pub $lsb: Option<f64>, pub $lbb: Option<f64>,
+              pub $lsc: Option<i64>, pub $lbc: Option<i64>,)*
             pub ret_300s: Option<f64>, pub ret_900s: Option<f64>,
             pub ret_1800s: Option<f64>, pub ret_3600s: Option<f64>,
             pub rv_900s: Option<f64>, pub rv_1800s: Option<f64>, pub rv_3600s: Option<f64>,
@@ -210,7 +224,9 @@ macro_rules! columns {
                     $($cov: v[$i].cov, $vol: v[$i].vol, $flow: v[$i].flow,
                       $trades: v[$i].trades, $ofi1: v[$i].ofi1, $ofi10: v[$i].ofi10,
                       $range: v[$i].range, $ab: v[$i].l3[0], $aa: v[$i].l3[1],
-                      $db: v[$i].l3[2], $da: v[$i].l3[3],)*
+                      $db: v[$i].l3[2], $da: v[$i].l3[3],
+                      $lsb: v[$i].liq_base[0], $lbb: v[$i].liq_base[1],
+                      $lsc: v[$i].liq_count[0], $lbc: v[$i].liq_count[1],)*
                     rv_900s: v[3].rv, rv_1800s: v[4].rv, rv_3600s: v[5].rv,
                     ..Default::default()
                 }
@@ -220,12 +236,12 @@ macro_rules! columns {
 }
 
 columns! {
-    (0, cov_10s, vol_10s, flow_10s, trades_10s, ofi1_10s, ofi10_10s, range_bps_10s, l3_add_bid_10s, l3_add_ask_10s, l3_del_bid_10s, l3_del_ask_10s),
-    (1, cov_60s, vol_60s, flow_60s, trades_60s, ofi1_60s, ofi10_60s, range_bps_60s, l3_add_bid_60s, l3_add_ask_60s, l3_del_bid_60s, l3_del_ask_60s),
-    (2, cov_300s, vol_300s, flow_300s, trades_300s, ofi1_300s, ofi10_300s, range_bps_300s, l3_add_bid_300s, l3_add_ask_300s, l3_del_bid_300s, l3_del_ask_300s),
-    (3, cov_900s, vol_900s, flow_900s, trades_900s, ofi1_900s, ofi10_900s, range_bps_900s, l3_add_bid_900s, l3_add_ask_900s, l3_del_bid_900s, l3_del_ask_900s),
-    (4, cov_1800s, vol_1800s, flow_1800s, trades_1800s, ofi1_1800s, ofi10_1800s, range_bps_1800s, l3_add_bid_1800s, l3_add_ask_1800s, l3_del_bid_1800s, l3_del_ask_1800s),
-    (5, cov_3600s, vol_3600s, flow_3600s, trades_3600s, ofi1_3600s, ofi10_3600s, range_bps_3600s, l3_add_bid_3600s, l3_add_ask_3600s, l3_del_bid_3600s, l3_del_ask_3600s),
+    (0, cov_10s, vol_10s, flow_10s, trades_10s, ofi1_10s, ofi10_10s, range_bps_10s, l3_add_bid_10s, l3_add_ask_10s, l3_del_bid_10s, l3_del_ask_10s, liq_sell_base_10s, liq_buy_base_10s, liq_sell_count_10s, liq_buy_count_10s),
+    (1, cov_60s, vol_60s, flow_60s, trades_60s, ofi1_60s, ofi10_60s, range_bps_60s, l3_add_bid_60s, l3_add_ask_60s, l3_del_bid_60s, l3_del_ask_60s, liq_sell_base_60s, liq_buy_base_60s, liq_sell_count_60s, liq_buy_count_60s),
+    (2, cov_300s, vol_300s, flow_300s, trades_300s, ofi1_300s, ofi10_300s, range_bps_300s, l3_add_bid_300s, l3_add_ask_300s, l3_del_bid_300s, l3_del_ask_300s, liq_sell_base_300s, liq_buy_base_300s, liq_sell_count_300s, liq_buy_count_300s),
+    (3, cov_900s, vol_900s, flow_900s, trades_900s, ofi1_900s, ofi10_900s, range_bps_900s, l3_add_bid_900s, l3_add_ask_900s, l3_del_bid_900s, l3_del_ask_900s, liq_sell_base_900s, liq_buy_base_900s, liq_sell_count_900s, liq_buy_count_900s),
+    (4, cov_1800s, vol_1800s, flow_1800s, trades_1800s, ofi1_1800s, ofi10_1800s, range_bps_1800s, l3_add_bid_1800s, l3_add_ask_1800s, l3_del_bid_1800s, l3_del_ask_1800s, liq_sell_base_1800s, liq_buy_base_1800s, liq_sell_count_1800s, liq_buy_count_1800s),
+    (5, cov_3600s, vol_3600s, flow_3600s, trades_3600s, ofi1_3600s, ofi10_3600s, range_bps_3600s, l3_add_bid_3600s, l3_add_ask_3600s, l3_del_bid_3600s, l3_del_ask_3600s, liq_sell_base_3600s, liq_buy_base_3600s, liq_sell_count_3600s, liq_buy_count_3600s),
 }
 
 #[cfg(test)]
@@ -271,6 +287,7 @@ mod tests {
             mid: Some(100 + n),
             l3: [n, 2 * n, 3 * n, 4 * n],
             r2: 0.25,
+            ..Default::default()
         }
     }
     #[test]
@@ -278,26 +295,26 @@ mod tests {
         let mut m = Memory::default();
         for t in 1..10 {
             assert!(
-                m.update(t * SECOND, sample(1), true, true)
+                m.update(t * SECOND, sample(1), true, true, false)
                     .cov_10s
                     .is_none()
             );
         }
-        let row = m.update(10 * SECOND, sample(1), false, false);
+        let row = m.update(10 * SECOND, sample(1), false, false, false);
         assert_eq!(row.cov_10s, Some(1.0));
         assert!(row.vol_10s.is_none() && row.l3_add_bid_10s.is_none());
         for t in 11..=20 {
-            m.update(t * SECOND, Sample::default(), true, true);
+            m.update(t * SECOND, Sample::default(), true, true, false);
         }
-        let row = m.update(21 * SECOND, Sample::default(), true, true);
+        let row = m.update(21 * SECOND, Sample::default(), true, true, false);
         assert_eq!(row.cov_10s, Some(0.0));
         assert!(row.ofi1_10s.is_none() && row.rv_900s.is_none() && row.trades_10s.is_none());
     }
     #[test]
     fn gaps_take_wall_seconds_and_unknown_trades_reduce_coverage() {
         let mut m = Memory::default();
-        m.update(SECOND, sample(1), true, true);
-        let row = m.update(10 * SECOND, sample(2), true, true);
+        m.update(SECOND, sample(1), true, true, false);
+        let row = m.update(10 * SECOND, sample(2), true, true, false);
         assert_eq!(row.cov_10s, Some(0.2));
         assert_eq!(row.vol_10s, Some(3.0));
         let unknown = Sample {
@@ -307,7 +324,7 @@ mod tests {
             trades: 0,
             ..sample(3)
         };
-        let row = m.update(11 * SECOND, unknown, true, true);
+        let row = m.update(11 * SECOND, unknown, true, true, false);
         assert_eq!(row.cov_10s, Some(0.1));
         assert_eq!(row.trades_10s, Some(2));
         assert_eq!(row.ofi1_10s, Some(0.5)); // 5 OFI / 10 mean depth
@@ -316,7 +333,7 @@ mod tests {
     fn exact_eviction_all_windows_and_per_side_l3() {
         let mut m = Memory::default();
         for t in 1..=7201 {
-            let row = m.update(t * SECOND, sample(t), true, true);
+            let row = m.update(t * SECOND, sample(t), true, true, false);
             if t >= 3600 {
                 for (window, width) in m.windows.iter().zip(WINDOWS) {
                     let expected = (t - width as i64 + 1..=t).sum::<i64>();
@@ -340,6 +357,41 @@ mod tests {
         assert_eq!(m.ring.len(), 3600);
     }
     #[test]
+    fn liquidations_share_volume_gating_and_exact_eviction_for_every_window() {
+        let mut memory = Memory::default();
+        let unit = 10_000_000_000_000_000i128;
+        for t in 1..=7201 {
+            let mut s = sample(t);
+            s.liq_base = [i128::from(t) * unit, i128::from(t) * unit * 2];
+            s.liq_count = [t, 2 * t];
+            let row = memory.update(t * SECOND, s, true, true, true);
+            let json = serde_json::to_value(row).unwrap();
+            for (window, w) in memory.windows.iter().zip(WINDOWS) {
+                let count = format!("liq_sell_count_{w}s");
+                if t < w as i64 {
+                    assert!(json[&count].is_null());
+                    continue;
+                }
+                let sum = (t - w as i64 + 1..=t).sum::<i64>();
+                assert_eq!(
+                    window.sum.liq_base,
+                    [i128::from(sum) * unit, i128::from(sum) * unit * 2]
+                );
+                assert_eq!(json[&count], sum);
+                let actual = json[format!("liq_buy_base_{w}s")].as_f64().unwrap();
+                assert!((actual - (2 * sum) as f64).abs() < actual * 1e-15);
+            }
+        }
+        let absent = memory.update(7202 * SECOND, Sample::default(), true, true, false);
+        assert!(absent.liq_sell_base_10s.is_none());
+        for t in 7203..=7212 {
+            memory.update(t * SECOND, Sample::default(), true, true, true);
+        }
+        let empty = memory.update(7213 * SECOND, Sample::default(), true, true, true);
+        assert_eq!(empty.cov_10s, Some(0.0));
+        assert!(empty.liq_sell_count_10s.is_none());
+    }
+    #[test]
     fn hand_range_ofi_and_partial_realized_volatility() {
         let mut m = Memory::default();
         for t in 1..=900 {
@@ -351,7 +403,7 @@ mod tests {
             } else {
                 0.0
             };
-            let row = m.update(t * SECOND, s, true, true);
+            let row = m.update(t * SECOND, s, true, true, false);
             if t == 900 {
                 assert_eq!(row.rv_900s, Some(0.5));
                 assert_eq!(row.range_bps_10s, Some(90.0)); // (1000 - 991) / 1000
@@ -368,14 +420,14 @@ mod tests {
 mod schema_tests {
     use super::*;
     #[test]
-    fn exactly_seventy_four_columns_and_rv_returns_to_exact_zero() {
+    fn exactly_ninety_eight_columns_and_rv_returns_to_exact_zero() {
         assert_eq!(
             serde_json::to_value(MemoryColumns::default())
                 .unwrap()
                 .as_object()
                 .unwrap()
                 .len(),
-            74
+            98
         );
         let mut memory = Memory::default();
         for t in 0..=1800 {
@@ -387,6 +439,7 @@ mod schema_tests {
                     r2: if t < 100 { 0.1 } else { 0.0 },
                     ..Default::default()
                 },
+                false,
                 false,
                 false,
             );

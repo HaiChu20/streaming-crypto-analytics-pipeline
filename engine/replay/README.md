@@ -140,7 +140,7 @@ version is the shared `engine_core::ENGINE_VERSION`.
 - Memory windows use `W = 10, 60, 300, 900, 1800, 3600` seconds and suffix
   `_{W}s`. Each market retains 3,600 one-second buckets, with exact integer
   add/evict sums and rolling midpoint extrema. Skipped ticks occupy missing
-  seconds. All 74 new columns remain null on `cross` rows.
+  seconds. All memory columns remain null on `cross` rows.
   `cov_{W}s` is null until W buckets have elapsed since this market's first tick;
   then it is the fraction with a non-warmup valid book and, if trades were seen,
   known trades (the same rule as non-null `trade_count`). Other window fields
@@ -174,7 +174,7 @@ version is the shared `engine_core::ENGINE_VERSION`.
   `microprice_dev_bps` is `(microprice-mid)/mid*10000`, null if unavailable.
 - Checkpoints/start states serialize the ring, sums, extrema, return history,
   pending bucket OFI/L3 counts and sync eligibility. The version is bumped to
-  `features-v3`; older-version checkpoints are rejected. Numeric columns are
+  `features-v4`; older-version checkpoints are rejected. Numeric columns are
   automatically selected by `research/dataset.py`; inference explicitly includes
   them. Dashboard SQL stays unchanged: ClickHouse's Kafka engine defaults to
   skipping unknown JSON fields, so dashboard ingestion tolerates new features
@@ -185,6 +185,51 @@ version is the shared `engine_core::ENGINE_VERSION`.
   exceeds 60 seconds. Liquidation flow counts
   pushed sampled forceOrder messages and uses `z`, cumulative filled quantity,
   rather than the original order quantity `q`.
+- Features v4 adds **35 columns**, all null on `cross` rows:
+  `liq_{sell,buy}_{base,count}_{W}s` (24), `funding_min_to_next`,
+  `mark_index_bps`, `oi_chg_pct_{300,900,3600}s`, and
+  `depth_{bid,ask}_{10,25,50}bps`. Liquidation base quantities/counts use the
+  same covered-second sums, full-window and nonzero-coverage gating as `vol_{W}s`.
+  A source applies after Binance perp's `liquidations` feed is seen or Kraken
+  perp's `trades` feed is seen, including control frames. Spot and OKX stay null;
+  applicable sources with no events produce zero after window gating.
+- Liquidation `sell` is a forced SELL closing a long; `buy` closes a short.
+  [Binance forceOrder](https://developers.binance.com/docs/derivatives/usds-margined-futures/websocket-market-streams/Liquidation-Order-Streams)
+  supplies order side `o.S` and cumulative filled quantity `o.z`; the existing
+  `liq:{o}` dedup is unchanged. Binance publishes only the latest liquidation
+  order per symbol per **1000 ms**, so its totals are sampled, not total venue
+  liquidation activity. Kraken's complete
+  [Futures trade stream](https://docs.kraken.com/exchange/api-reference/futures-websocket/trade)
+  supplies `type="liquidation"`, `qty`, and taker `side`.
+  [Kraken's fee semantics](https://support.kraken.com/in/articles/360048917612-fee-schedule)
+  identify the liquidated party as taker and counterparty as maker; together these
+  establish that trade `side` is the forced-order direction (no inversion).
+  Liquidation trades retain normal volume/flow/count contributions and UID dedup;
+  historical snapshots seed IDs only. Existing `liq_count_1s`/`liq_base_1s` now
+  also include these Kraken trades, without warmup/book gating as before.
+- `funding_min_to_next = (next_funding_ms - tick_ns/1e6)/60000`, using
+  [Binance markPrice](https://developers.binance.com/docs/derivatives/usds-margined-futures/websocket-market-streams/Mark-Price-Stream)
+  `T` or [Kraken ticker](https://docs.kraken.com/exchange/api-reference/futures-websocket/ticker)
+  `next_funding_rate_time`. Both are epoch milliseconds. Kraken describes the
+  latter as “time until,” but its official example and the archived
+  `KrakenRaw/Futurev6/PF_XBTUSD/20261008_ticker.jsonl.gz` show absolute timestamps
+  (`time=1791471234981`, `next_funding_rate_time=1791471600000`). The countdown
+  uses the row tick, may become negative, and never invents a funding schedule.
+  It follows funding freshness: null after source end or receive age >60s.
+- `mark_index_bps = (mark-index)/index*10000` requires both fields in the same
+  fresh message and a positive index: Binance `p`/`i`, Kraken `markPrice`/`index`.
+  Missing fields clear prior values. `oi_chg_pct_{W}s = 100*(OI_t-OI_{t-W})/OI_{t-W}`
+  uses per-second carried Kraken `openInterest`, requiring both fresh/known
+  endpoints and positive previous OI; interior gaps are allowed. Skipped ticks
+  store missing endpoints. These extras are independent of book warmup/coverage.
+- `depth_{bid,ask}_{10,25,50}bps` sums base size on that side within the inclusive
+  mid ± band edge. Integer price comparisons preserve exact boundaries; OKX uses
+  the active L2 connection's `ctVal`, just like `bid_depth10`. Each side must have
+  a retained level **strictly beyond** its edge, otherwise that band is null
+  because the book may be truncated (including limited-depth Kraken spot).
+  Invalid/stale/uncalibrated books give null. Bands are calculated once per row,
+  never per message. Checkpoints serialize liquidation rings/sums/pending buckets,
+  the OI endpoint history, and the new carried extras.
 - L3 snapshots produce no order-event counts. Adds/modifications use their event's
   top-ten rank, deletes the rank immediately before removal. Events are applied
   in frame order, so a formerly eleventh level can enter the top ten after an
@@ -266,3 +311,25 @@ This is a fixture ingestion comparison, not a paired full-day benchmark. Full-da
 CLI output on these sparse excerpts produced 691,160 rows in 0.674 s for spot
 (49,730 records/s) and 172,794 rows in 0.251 s for futures (300,133 records/s).
 Most spot output rows follow the excerpt's end and contain stale/null values.
+
+## Features v4 fixture validation (P21)
+
+Required checks: `cargo test --release --locked` (109 passed, one pre-existing
+ignored timing test), `cargo clippy --locked --all-targets -- -D warnings`,
+`cargo fmt --check`, and root `PYTHON_DOTENV_DISABLED=1 uv run pytest -q`
+(336 passed). Tests include archive replay, live/as_live/from_state parity,
+a full hour of liquidation and OI history, and a pending liquidation at restart.
+
+The benchmark command above ran before edits and after all checks. Warm samples
+are records/s (run 0 excluded). Three unchanged post-change batches were retained
+because individual batches varied; the reported after median includes **all nine**
+warm samples, rather than selecting one batch. This measures ingestion only,
+not the new once-per-second band calculations or Parquet output.
+
+| Fixture | Before warm samples | After warm samples, in three batches | Before median | After median | Regression |
+| --- | --- | --- | ---: | ---: | ---: |
+| Spot, 33,511 records | 330409, 342982, 340212 | 322473, 321620, 322394; 322130, 329200, 329955; 305944, 305476, 311901 | 340212 | 322130 | 5.3% |
+| Futures, 75,235 records | 641786, 646099, 644572 | 551758, 538423, 540489; 607191, 615092, 609306; 607110, 598264, 604099 | 644572 | 604099 | 6.3% |
+
+All benchmark runs reported no data anomalies. Individual batch regressions
+reached 10.1% (spot) and 16.1% (futures); aggregate medians meet the 10% threshold.

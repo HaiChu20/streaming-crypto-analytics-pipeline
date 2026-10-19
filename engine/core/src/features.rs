@@ -128,9 +128,26 @@ struct Bucket {
     malformed_trades: bool,
     liq_count: i64,
     liq: i128,
+    liq_base: [i128; 2],
+    liq_count_sides: [i64; 2],
     l3: [i64; 3],
     l3_sides: [i64; 4],
     ofi: [i128; 2],
+}
+impl Bucket {
+    fn liquidation(&mut self, quantity: i128, buy: bool) -> Result<()> {
+        let side = usize::from(buy);
+        self.liq = self
+            .liq
+            .checked_add(quantity)
+            .ok_or_else(|| error("liquidation volume overflow"))?;
+        self.liq_base[side] = self.liq_base[side]
+            .checked_add(quantity)
+            .ok_or_else(|| error("liquidation side volume overflow"))?;
+        self.liq_count += 1;
+        self.liq_count_sides[side] += 1;
+        Ok(())
+    }
 }
 #[derive(Default, Serialize, Deserialize)]
 struct Instrument {
@@ -146,11 +163,14 @@ struct Instrument {
     memory: crate::windows::Memory,
     last_tick: Option<i64>,
     history: VecDeque<Option<i64>>,
+    oi_history: VecDeque<Option<f64>>,
     returns: VecDeque<Option<f64>>,
     first_mid: Option<i64>,
     last_recv: BTreeMap<String, i128>,
     extras_source: Option<String>,
     funding: Option<f64>,
+    next_funding_ms: Option<f64>,
+    mark_index_bps: Option<f64>,
     mark: Option<f64>,
     oi: Option<f64>,
 }
@@ -204,6 +224,8 @@ impl Instrument {
                     {
                         self.mark = None;
                         self.funding = None;
+                        self.next_funding_ms = None;
+                        self.mark_index_bps = None;
                         self.oi = None;
                     }
                     if crash {
@@ -348,6 +370,13 @@ impl Instrument {
                         continue;
                     };
                     let volume = i128::from(qty) * i128::from(factor);
+                    if r.exchange == "kraken"
+                        && r.market == "perp"
+                        && trade["type"].as_str() == Some("liquidation")
+                    {
+                        // Kraken side is taker side; the liquidated party is the taker.
+                        bucket.liquidation(volume, buy)?;
+                    }
                     bucket.volume = bucket
                         .volume
                         .checked_add(volume)
@@ -370,12 +399,16 @@ impl Instrument {
                 let data = payload.get("data").unwrap_or(&payload);
                 self.funding = number(&data["r"]);
                 self.mark = number(&data["p"]);
+                self.next_funding_ms = number(&data["T"]);
+                self.mark_index_bps = mark_index(self.mark, number(&data["i"]));
             }
             "ticker" => {
                 self.extras_source = Some("ticker".into());
                 self.funding = number(&payload["funding_rate"]);
                 self.mark = number(&payload["markPrice"]);
                 self.oi = number(&payload["openInterest"]);
+                self.next_funding_ms = number(&payload["next_funding_rate_time"]);
+                self.mark_index_bps = mark_index(self.mark, number(&payload["index"]));
             }
             "liquidations" => {
                 let data = payload.get("data").unwrap_or(&payload);
@@ -386,13 +419,14 @@ impl Instrument {
                     .buckets
                     .entry(window_tick(r.recv_ns, current_tick)?)
                     .or_default();
-                bucket.liq_count += 1;
                 // forceOrder is sampled; z is cumulative filled quantity of the pushed order.
                 let quantity = i128::from(fixed(&data["o"]["z"])?) * i128::from(UNIT);
-                bucket.liq = bucket
-                    .liq
-                    .checked_add(quantity)
-                    .ok_or_else(|| error("liquidation volume overflow"))?;
+                let buy = match data["o"]["S"].as_str() {
+                    Some("BUY") => true,
+                    Some("SELL") => false,
+                    _ => return Err(error("invalid forceOrder side")),
+                };
+                bucket.liquidation(quantity, buy)?;
             }
             _ => {}
         }
@@ -401,6 +435,10 @@ impl Instrument {
     fn row(&mut self, key: &Key, tick: i64) -> Result<Row> {
         if let Some(last) = self.last_tick {
             for _ in ((last + SECOND)..tick).step_by(SECOND as usize) {
+                self.oi_history.push_back(None);
+                if self.oi_history.len() > 3600 {
+                    self.oi_history.pop_front();
+                }
                 self.history.push_back(None);
                 if self.history.len() > 3600 {
                     self.history.pop_front();
@@ -478,6 +516,19 @@ impl Instrument {
                 depth = [total * i128::from(factor), (bid + ask) * i128::from(factor)];
                 row.bid_depth10 = Some(scale(bid, factor));
                 row.ask_depth10 = Some(scale(ask, factor));
+                let bands = book
+                    .bands(mid_e9)
+                    .map(|side| side.map(|v| v.map(|v| scale(v, factor))));
+                [
+                    row.depth_bid_10bps,
+                    row.depth_bid_25bps,
+                    row.depth_bid_50bps,
+                ] = bands[0];
+                [
+                    row.depth_ask_10bps,
+                    row.depth_ask_25bps,
+                    row.depth_ask_50bps,
+                ] = bands[1];
                 if bid + ask > 0 {
                     row.imbalance10 = Some((bid - ask) as f64 / (bid + ask) as f64);
                 }
@@ -549,7 +600,13 @@ impl Instrument {
                 row.taker_sell_base = Some(bucket.sell as f64 / 10_000_000_000_000_000.0);
             }
         }
-        if self.seen.contains("liquidations") {
+        let liquidations = key.1 == "perp"
+            && match key.0.as_str() {
+                "binance" => self.seen.contains("liquidations"),
+                "kraken" => self.seen.contains("trades"),
+                _ => false,
+            };
+        if liquidations {
             row.liq_count_1s = Some(bucket.liq_count);
             row.liq_base_1s = Some(bucket.liq as f64 / 10_000_000_000_000_000.0);
         }
@@ -567,9 +624,31 @@ impl Instrument {
         ) {
             row.funding_rate = self.funding;
             row.mark_price = self.mark;
+            row.funding_min_to_next = self
+                .next_funding_ms
+                .map(|ms| (ms - tick as f64 / 1_000_000.0) / 60000.0);
+            row.mark_index_bps = self.mark_index_bps;
         }
         if fresh(self.last_recv.get("ticker").copied(), tick) {
             row.open_interest = self.oi;
+        }
+        for (target, lag) in [
+            (&mut row.oi_chg_pct_300s, 300),
+            (&mut row.oi_chg_pct_900s, 900),
+            (&mut row.oi_chg_pct_3600s, 3600),
+        ] {
+            *target = self
+                .oi_history
+                .len()
+                .checked_sub(lag)
+                .and_then(|i| self.oi_history[i])
+                .zip(row.open_interest)
+                .filter(|(past, _)| *past > 0.0)
+                .map(|(past, now)| 100.0 * (now - past) / past);
+        }
+        self.oi_history.push_back(row.open_interest);
+        if self.oi_history.len() > 3600 {
+            self.oi_history.pop_front();
         }
         let valid = row.book_valid && !row.warmup;
         let covered = valid && (!self.seen.contains("trades") || row.trade_count.is_some());
@@ -597,12 +676,19 @@ impl Instrument {
             // The longer RVs sum every existing one-second return, just as
             // the legacy return history does (including warmup endpoints).
             r2: row.ret_1s.map_or(0.0, |r| r * r),
+            liq_base: if covered { bucket.liq_base } else { [0; 2] },
+            liq_count: if covered {
+                bucket.liq_count_sides
+            } else {
+                [0; 2]
+            },
         };
         row.memory = self.memory.update(
             tick,
             sample,
             self.seen.contains("trades"),
             self.seen.contains("l3"),
+            liquidations,
         );
         for ((target, cov), ret) in [
             (&mut row.memory.ret_300s, row.memory.cov_300s),
@@ -622,6 +708,11 @@ impl Instrument {
             .map(|(micro, mid)| (micro - mid) / mid * 10000.0);
         Ok(row)
     }
+}
+fn mark_index(mark: Option<f64>, index: Option<f64>) -> Option<f64> {
+    mark.zip(index)
+        .filter(|(_, i)| *i > 0.0)
+        .map(|(m, i)| (m - i) / i * 10000.0)
 }
 fn taker_buy(trade: &Value) -> Result<bool> {
     match trade["side"].as_str() {
@@ -765,6 +856,8 @@ impl Engine {
             } else if matches!(r.feed.as_str(), "mark" | "ticker") {
                 state.mark = None;
                 state.funding = None;
+                state.next_funding_ms = None;
+                state.mark_index_bps = None;
                 state.oi = None;
             }
             *self
@@ -798,6 +891,8 @@ impl Engine {
             } else if r.feed == "mark" || r.feed == "ticker" {
                 state.mark = None;
                 state.funding = None;
+                state.next_funding_ms = None;
+                state.mark_index_bps = None;
                 state.oi = None;
             }
             *self
@@ -1135,6 +1230,22 @@ mod tests {
         let expected = (row.microprice.unwrap() - row.mid.unwrap()) / row.mid.unwrap() * 10000.0;
         assert_eq!(row.memory.microprice_dev_bps, Some(expected));
         let cross = rows.iter().find(|r| r.exchange == "cross").unwrap();
+        let json = serde_json::to_value(cross).unwrap();
+        for name in [
+            "funding_min_to_next",
+            "mark_index_bps",
+            "oi_chg_pct_300s",
+            "oi_chg_pct_900s",
+            "oi_chg_pct_3600s",
+            "depth_bid_10bps",
+            "depth_bid_25bps",
+            "depth_bid_50bps",
+            "depth_ask_10bps",
+            "depth_ask_25bps",
+            "depth_ask_50bps",
+        ] {
+            assert!(json[name].is_null(), "cross column {name}");
+        }
         assert!(
             serde_json::to_value(&cross.memory)
                 .unwrap()
@@ -1253,6 +1364,280 @@ mod tests {
                 assert!((row.memory.rv_900s.unwrap() - 1.1_f64.ln()).abs() < 1e-15);
             }
         }
+    }
+    #[test]
+    fn forced_order_sides_filled_quantity_and_overlap_dedup() {
+        let mut state = Instrument::default();
+        for (conn, side, qty) in [
+            ("A", "SELL", "0.1"),
+            ("B", "SELL", "0.1"),
+            ("B", "BUY", "0.2"),
+            ("A", "BUY", "10"),
+        ] {
+            state
+                .consume(
+                    &message(
+                        "binance",
+                        "perp",
+                        "liquidations",
+                        "update",
+                        conn,
+                        SECOND,
+                        json!({"o":{"S":side,"z":qty,"q":"100"}}),
+                    ),
+                    None,
+                )
+                .unwrap();
+        }
+        let bucket = &state.buckets[&SECOND];
+        assert_eq!(bucket.liq_count_sides, [1, 1]);
+        assert_eq!(
+            bucket.liq_base,
+            [1_000_000_000_000_000, 2_000_000_000_000_000]
+        );
+        let row = state
+            .row(&("binance".into(), "perp".into(), "BTCUSDT".into()), SECOND)
+            .unwrap();
+        assert_eq!(row.liq_count_1s, Some(2));
+        assert_eq!(row.liq_base_1s, Some(0.3));
+    }
+    #[test]
+    fn kraken_liquidation_is_forced_taker_side_and_still_a_trade() {
+        let mut state = Instrument::default();
+        let trade = |conn, id, side, qty, kind| {
+            message(
+                "kraken",
+                "perp",
+                "trades",
+                "trade",
+                conn,
+                SECOND,
+                json!({"uid":id,"qty":qty,"side":side,"type":kind}),
+            )
+        };
+        state.consume(&message("kraken", "perp", "trades", "snapshot", "A", SECOND,
+            json!({"trades":[{"uid":"old","qty":"100","side":"sell","type":"liquidation"}]})), None).unwrap();
+        for r in [
+            trade("A", "old", "sell", "100", "liquidation"),
+            trade("A", "1", "sell", "2.5", "liquidation"),
+            trade("B", "1", "sell", "2.5", "liquidation"),
+            trade("B", "2", "buy", "1.25", "liquidation"),
+            trade("B", "3", "buy", "3", "fill"),
+        ] {
+            state.consume(&r, None).unwrap();
+        }
+        assert_eq!(state.buckets[&SECOND].liq_count_sides, [1, 1]);
+        let key = ("kraken".into(), "perp".into(), "PF_XBTUSD".into());
+        let row = state.row(&key, SECOND).unwrap();
+        assert_eq!(row.trade_count, Some(3));
+        assert_eq!(row.volume_base, Some(6.75));
+        assert_eq!(row.taker_buy_base, Some(4.25));
+        assert_eq!(row.taker_sell_base, Some(2.5));
+        assert_eq!(row.liq_count_1s, Some(2));
+        assert_eq!(row.liq_base_1s, Some(3.75));
+        assert_eq!(state.row(&key, 2 * SECOND).unwrap().liq_count_1s, Some(0));
+        for (ex, market) in [("kraken", "spot"), ("okx", "perp"), ("binance", "spot")] {
+            let row = state
+                .row(&(ex.into(), market.into(), "BTCUSDT".into()), 3 * SECOND)
+                .unwrap();
+            assert!(row.liq_count_1s.is_none() && row.memory.liq_sell_count_10s.is_none());
+        }
+    }
+    #[test]
+    fn funding_countdown_same_message_gap_and_freshness() {
+        for (ex, feed) in [("binance", "mark"), ("kraken", "ticker")] {
+            let key = (ex.into(), "perp".into(), "BTCUSDT".into());
+            let mut state = Instrument::default();
+            let payload = if ex == "binance" {
+                json!({"data":{"r":"0.1","p":"101","i":"100","T":120000}})
+            } else {
+                json!({"funding_rate":"0.1","markPrice":"101","index":"100","next_funding_rate_time":120000})
+            };
+            state
+                .consume(
+                    &message(ex, "perp", feed, "update", "A", SECOND, payload),
+                    None,
+                )
+                .unwrap();
+            let row = state.row(&key, SECOND).unwrap();
+            assert_eq!(row.funding_min_to_next, Some(119.0 / 60.0));
+            assert_eq!(row.mark_index_bps, Some(100.0));
+            assert_eq!(
+                state.row(&key, 61 * SECOND).unwrap().funding_min_to_next,
+                Some(59.0 / 60.0)
+            );
+            let row = state.row(&key, 62 * SECOND).unwrap();
+            assert!(
+                row.funding_rate.is_none()
+                    && row.funding_min_to_next.is_none()
+                    && row.mark_index_bps.is_none()
+            );
+            // New mark without index or funding time cannot reuse an older message's fields.
+            let payload = if ex == "binance" {
+                json!({"p":"102"})
+            } else {
+                json!({"markPrice":"102"})
+            };
+            state
+                .consume(
+                    &message(ex, "perp", feed, "update", "B", 63 * SECOND, payload),
+                    None,
+                )
+                .unwrap();
+            let row = state.row(&key, 63 * SECOND).unwrap();
+            assert!(row.mark_index_bps.is_none() && row.funding_min_to_next.is_none());
+            let payload = if ex == "binance" {
+                json!({"p":"101","i":"100","T":120000})
+            } else {
+                json!({"markPrice":"101","index":"100","next_funding_rate_time":120000})
+            };
+            state
+                .consume(
+                    &message(ex, "perp", feed, "update", "B", 64 * SECOND, payload),
+                    None,
+                )
+                .unwrap();
+            let mut stop = message(ex, "perp", feed, "control", "B", 65 * SECOND, Value::Null);
+            stop.event = Some("stop".into());
+            state.consume(&stop, None).unwrap();
+            let row = state.row(&key, 65 * SECOND).unwrap();
+            assert!(row.mark_index_bps.is_none() && row.funding_min_to_next.is_none());
+        }
+        assert_eq!(mark_index(Some(100.0), Some(0.0)), None);
+    }
+    #[test]
+    fn oi_changes_require_fresh_endpoints_but_allow_interior_gaps() {
+        let key = ("kraken".into(), "perp".into(), "PF_XBTUSD".into());
+        let mut state = Instrument::default();
+        for t in 0..=3600 {
+            // Endpoint at t=100 expires; fresh carried OI at t=300 is from t=299.
+            if t != 300 && (t % 60 == 0 || t == 299) && !(60..=180).contains(&t) {
+                state
+                    .consume(
+                        &message(
+                            "kraken",
+                            "perp",
+                            "ticker",
+                            "update",
+                            "A",
+                            t * SECOND,
+                            json!({"openInterest":1000+t}),
+                        ),
+                        None,
+                    )
+                    .unwrap();
+            }
+            let row = state.row(&key, t * SECOND).unwrap();
+            if t == 299 {
+                assert!(row.oi_chg_pct_300s.is_none());
+            }
+            if t == 300 {
+                assert_eq!(row.oi_chg_pct_300s, Some(29.9));
+            }
+            if t == 400 {
+                assert!(row.oi_chg_pct_300s.is_none());
+            }
+            if t == 900 {
+                assert_eq!(row.oi_chg_pct_900s, Some(90.0));
+            }
+            if t == 3600 {
+                assert_eq!(row.oi_chg_pct_3600s, Some(360.0));
+            }
+        }
+        let row = state.row(&key, 3661 * SECOND).unwrap();
+        assert!(row.oi_chg_pct_300s.is_none() && row.oi_chg_pct_3600s.is_none());
+        // Skipped wall-clock ticks are missing endpoints, never carried over a gap.
+        state
+            .consume(
+                &message(
+                    "kraken",
+                    "perp",
+                    "ticker",
+                    "update",
+                    "A",
+                    3961 * SECOND,
+                    json!({"openInterest":5000}),
+                ),
+                None,
+            )
+            .unwrap();
+        assert!(
+            state
+                .row(&key, 3961 * SECOND)
+                .unwrap()
+                .oi_chg_pct_300s
+                .is_none()
+        );
+    }
+    #[test]
+    fn zero_or_missing_oi_endpoint_is_unknown() {
+        let key = ("kraken".into(), "perp".into(), "PF_XBTUSD".into());
+        let mut state = Instrument::default();
+        for t in 0..=301 {
+            let payload = if t == 0 {
+                json!({"openInterest":0})
+            } else if t == 1 {
+                json!({})
+            } else {
+                json!({"openInterest":100})
+            };
+            state
+                .consume(
+                    &message(
+                        "kraken",
+                        "perp",
+                        "ticker",
+                        "update",
+                        "A",
+                        t * SECOND,
+                        payload,
+                    ),
+                    None,
+                )
+                .unwrap();
+            let row = state.row(&key, t * SECOND).unwrap();
+            assert!(row.oi_chg_pct_300s.is_none());
+        }
+        assert_eq!(
+            state.row(&key, 302 * SECOND).unwrap().oi_chg_pct_300s,
+            Some(0.0)
+        );
+    }
+    #[test]
+    fn bands_scale_okx_contracts_and_remain_null_without_calibration_or_valid_book() {
+        let key = ("okx".into(), "perp".into(), "BTCUSDT".into());
+        let mut state = Instrument::default();
+        let r = message(
+            "okx",
+            "perp",
+            "l2",
+            "snapshot",
+            "A",
+            SECOND,
+            json!({"data":[{"seqId":1,"prevSeqId":0,"checksum":0,
+            "bids":[["99.99","2"],["99.9","3"],["99","100"]],
+            "asks":[["100.01","4"],["100.1","5"],["101","200"]]}]}),
+        );
+        state.consume(&r, None).unwrap();
+        assert!(state.row(&key, SECOND).unwrap().depth_bid_10bps.is_none());
+        let mut metadata = r.clone();
+        metadata.kind = Kind::Control;
+        metadata.event = Some("start".into());
+        metadata.detail = Some(json!({"instrument":{"ctVal":"0.01"}}));
+        state.consume(&metadata, None).unwrap();
+        state.consume(&r, None).unwrap();
+        let row = state.row(&key, 2 * SECOND).unwrap();
+        assert_eq!(row.depth_bid_10bps, Some(0.05));
+        assert_eq!(row.depth_ask_50bps, Some(0.09));
+        assert_eq!(row.bid_depth10, Some(1.05));
+        state.l2.as_mut().unwrap().invalidate_malformed("A");
+        assert!(
+            state
+                .row(&key, 3 * SECOND)
+                .unwrap()
+                .depth_ask_10bps
+                .is_none()
+        );
     }
     #[test]
     fn trade_ids_are_bounded_and_recent_duplicates_rejected() {
