@@ -163,9 +163,9 @@ fn run() -> Result<()> {
             processed.insert(format!("{}/{}", topic.name(), partition.id()), end - 1);
         }
     }
-    if processed.len() != 44 {
+    if processed.len() != 46 {
         return Err(error(format!(
-            "expected 44 raw partitions, found {}",
+            "expected 46 raw partitions, found {}",
             processed.len()
         )));
     }
@@ -198,7 +198,7 @@ fn run() -> Result<()> {
         .open(startup_path.with_file_name(format!("metrics_{startup_tick}.jsonl")))?;
     println!(
         "{}",
-        serde_json::json!({"event":"started","pid":std::process::id(),"startup_tick":startup_tick,"state":startup_path,"partitions":44,"engine_version":ENGINE_VERSION})
+        serde_json::json!({"event":"started","pid":std::process::id(),"startup_tick":startup_tick,"state":startup_path,"partitions":46,"engine_version":ENGINE_VERSION})
     );
     let mut queues = Queues::default();
     let mut rows_written = 0u64;

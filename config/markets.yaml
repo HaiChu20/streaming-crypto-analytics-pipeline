@@ -78,3 +78,11 @@ exchanges:
         futures:
           url: wss://futures.kraken.com/ws/v1
           feeds: {l2: book, trades: trade, ticker: ticker}
+
+  deribit:
+    index:
+      symbols: {BTC: BTC, ETH: ETH}
+      connections:
+        poller:
+          url: https://www.deribit.com/api/v2/public/get_volatility_index_data
+          feeds: {dvol: dvol}

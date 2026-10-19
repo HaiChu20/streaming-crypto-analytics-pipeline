@@ -1,6 +1,6 @@
 """Run one exchange's collectors until SIGINT/SIGTERM.
 
-    uv run python -m collectors binance|okx|kraken
+    uv run python -m collectors binance|okx|kraken|deribit
 
 SIGHUP replaces every connection make-before-break (same procedure as the midnight rotation).
 """
@@ -11,7 +11,7 @@ import logging
 import signal
 import time
 
-from collectors import binance, kraken, okx
+from collectors import binance, deribit, kraken, okx
 from collectors.common.config import data_dir, kafka_bootstrap, load_config
 from collectors.common.runner import run_exchange
 from collectors.common.session import Session
@@ -35,13 +35,16 @@ async def _run(exchange: str) -> int:
     for sig in (signal.SIGINT, signal.SIGTERM):
         loop.add_signal_handler(sig, stop.set)
     loop.add_signal_handler(signal.SIGHUP, rotate.set)
+    if exchange == "deribit":
+        clean = await deribit.run_poller(sink, cfg, session, stop, rotate)
+        return 0 if clean else 1
     stats = await run_exchange(exchange, HANDLERS[exchange], sink, cfg, session, stop, rotate)
     return 0 if stats.clean_shutdown else 1
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("exchange", choices=sorted(HANDLERS))
+    parser.add_argument("exchange", choices=sorted([*HANDLERS, "deribit"]))
     args = parser.parse_args()
     setup_logging()
     raise SystemExit(asyncio.run(_run(args.exchange)))

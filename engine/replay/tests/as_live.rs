@@ -294,9 +294,15 @@ fn from_state_preserves_full_hour_windows_and_pending_flow() {
             json!({"uid":t.to_string(),"qty":"0.01",
             "side":if t%2==0 {"sell"} else {"buy"},"type":"liquidation"}),
         );
-        let rows = state
-            .apply(cutoff(t), vec![record, book, ticker, trade])
-            .unwrap();
+        let mut batch = vec![record, book, ticker, trade];
+        if t >= 65 && t % 60 == 5 {
+            let ts = t - 65;
+            batch.push(Record::parse(&json!({"exchange":"deribit","market":"index","symbol":"BTC",
+                "feed":"dvol","kind":"update","conn":"D","seq":t,"recv_ns":start+t*SECOND,
+                "payload":json!([(start+ts*SECOND)/1_000_000,50,50,50,50.0+ts as f64/60.0]).to_string()
+            }).to_string()).unwrap());
+        }
+        let rows = state.apply(cutoff(t), batch).unwrap();
         if t == 3900 {
             let row = rows.iter().find(|r| r.exchange == "okx").unwrap();
             assert_eq!(row.memory.cov_3600s, Some(1.0));
@@ -310,6 +316,12 @@ fn from_state_preserves_full_hour_windows_and_pending_flow() {
             assert_eq!(row.funding_min_to_next, Some(1.0));
             assert!(row.mark_index_bps.unwrap() > 0.0);
             assert_eq!(row.depth_bid_50bps, Some(1.0));
+            let row = rows
+                .iter()
+                .find(|r| r.exchange == "cross" && r.asset == "BTC")
+                .unwrap();
+            assert_eq!(row.dvol, Some(113.0));
+            assert_eq!(row.dvol_chg_3600s, Some(60.0));
         }
     }
     let future = Record::parse(&json!({"exchange":"okx","market":"spot","symbol":"BTC-USDT","feed":"trades",
@@ -321,6 +333,15 @@ fn from_state_preserves_full_hour_windows_and_pending_flow() {
         "payload":json!({"uid":"pending","qty":"0.12345678","side":"sell","type":"liquidation"}).to_string()
     }).to_string()).unwrap();
     state.engine.consume(&liquidation).unwrap();
+    let pending_dvol = Record::parse(
+        &json!({"exchange":"deribit","market":"index","symbol":"BTC",
+            "feed":"dvol","kind":"update","conn":"D","seq":3900,"recv_ns":start+3900*SECOND,
+            "payload":json!([(start+3840*SECOND)/1_000_000,114,114,114,114]).to_string()
+        })
+        .to_string(),
+    )
+    .unwrap();
+    state.engine.consume(&pending_dvol).unwrap();
     let checkpoint = directory.join("hour_state.json");
     state_io::save(&checkpoint, &state).unwrap();
     let cutoffs = (3901..=3965).map(cutoff).collect::<Vec<_>>();
@@ -338,6 +359,18 @@ fn from_state_preserves_full_hour_windows_and_pending_flow() {
     for cutoff in cutoffs {
         let tick = cutoff.tick_ns;
         let live = state.apply(cutoff.clone(), vec![]).unwrap();
+        let dvol = live
+            .iter()
+            .find(|r| r.exchange == "cross" && r.asset == "BTC")
+            .unwrap();
+        assert_eq!(
+            dvol.dvol,
+            Some(if tick < start + 3910 * SECOND {
+                113.0
+            } else {
+                114.0
+            })
+        );
         assert_eq!(
             serde_json::to_value(&live).unwrap(),
             serde_json::to_value(replay.tick(cutoff).unwrap()).unwrap()

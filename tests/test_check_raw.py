@@ -139,7 +139,7 @@ def test_missing_streams_and_auth_skip(tmp_path, monkeypatch, capsys, has_key):
         check_raw.main()
     assert exc.value.code == 1
     output = capsys.readouterr().out
-    missing = 44 if has_key else 42
+    missing = 46 if has_key else 44
     assert output.count("MISSING") == missing
     assert output.count("skipped (no API key)") == (0 if has_key else 2)
     assert f"\n{missing} errors\n" in output
@@ -179,7 +179,7 @@ def test_pipeline_start_detects_failed_processes(tmp_path):
     python.chmod(0o755)
     result = subprocess.run(["bash", str(script), "start"], capture_output=True, text=True, timeout=30)
     assert result.returncode == 1
-    for name in ("binance", "okx", "kraken", "recorder"):
+    for name in ("binance", "okx", "kraken", "deribit", "recorder"):
         assert f"FAILED to start {name}, see data/logs/{name}.log" in result.stdout
 
 

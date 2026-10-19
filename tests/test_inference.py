@@ -174,7 +174,7 @@ def test_pipeline_lifecycle_in_isolated_directory(tmp_path):
     result = subprocess.run(["bash", str(script), "status"], env=env, capture_output=True, text=True, check=True)
     assert "inference: stopped" in result.stdout
     # Limit the isolated start to inference and replace sleep/caffeinate with no-ops.
-    script.write_text(script.read_text().replace('NAMES=(binance okx kraken recorder)', 'NAMES=()')
+    script.write_text(script.read_text().replace('NAMES=(binance okx kraken deribit recorder)', 'NAMES=()')
                       .replace('nohup caffeinate -s -w "$(cat data/state/recorder.pid)" >/dev/null 2>&1 &', ':'))
     result = subprocess.run(["bash", str(script), "start"], env=env, capture_output=True, text=True)
     assert "started inference" in result.stdout and result.returncode == 1

@@ -728,10 +728,84 @@ pub fn window_tick(ns: i128, current_tick: Option<i64>) -> Result<i64> {
     Ok(current_tick.map_or(tick, |current| tick.max(current)))
 }
 
+/// Closed minute candles; timestamps and availability remain distinct in checkpoints.
+#[derive(Serialize, Deserialize)]
+struct DvolCandle {
+    available_ns: i128,
+    close: f64,
+}
+#[derive(Default, Serialize, Deserialize)]
+struct Dvol {
+    candles: BTreeMap<i64, DvolCandle>,
+}
+impl Dvol {
+    fn consume(&mut self, r: &Record) -> Result<()> {
+        // A connection loss cannot invalidate a previously observed closed candle.
+        if r.kind == Kind::Control {
+            return Ok(());
+        }
+        let payload: Value = serde_json::from_str(&r.payload)?;
+        let row = payload
+            .as_array()
+            .filter(|row| row.len() == 5)
+            .ok_or_else(|| error("DVOL requires [timestamp,open,high,low,close]"))?;
+        let ts_ms = row[0]
+            .as_i64()
+            .or_else(|| row[0].as_str().and_then(|v| v.parse().ok()))
+            .filter(|ts| *ts >= 0 && *ts % 60_000 == 0)
+            .ok_or_else(|| error("invalid DVOL candle timestamp"))?;
+        let ts = ts_ms
+            .checked_mul(1_000_000)
+            .ok_or_else(|| error("DVOL timestamp overflow"))?;
+        if i128::from(ts) + 60 * i128::from(SECOND) > r.recv_ns {
+            return Err(error("DVOL candle is not closed at receive time"));
+        }
+        let close = number(&row[4])
+            .filter(|v| *v >= 0.0)
+            .ok_or_else(|| error("invalid DVOL close"))?;
+        self.candles.entry(ts).or_insert(DvolCandle {
+            available_ns: r.recv_ns.max(i128::from(ts) + 70 * i128::from(SECOND)),
+            close,
+        });
+        Ok(())
+    }
+    fn usable(&self, tick: i64) -> Option<f64> {
+        let (ts, candle) = self
+            .candles
+            .range(..=tick)
+            .rev()
+            .find(|(_, candle)| candle.available_ns <= i128::from(tick))?;
+        (tick - ts <= 180 * SECOND).then_some(candle.close)
+    }
+    fn fill(&mut self, row: &mut Row, realized: Option<f64>) {
+        let tick = row.tick_ns;
+        row.dvol = self.usable(tick);
+        for (window, target) in [
+            (300, &mut row.dvol_chg_300s),
+            (900, &mut row.dvol_chg_900s),
+            (3600, &mut row.dvol_chg_3600s),
+        ] {
+            *target = row
+                .dvol
+                .zip(self.usable(tick - window * SECOND))
+                .map(|(now, then)| now - then);
+        }
+        row.dvol_rv_gap = row
+            .dvol
+            .zip(realized)
+            .map(|(iv, rv)| iv - rv * (365.0_f64 * 24.0).sqrt() * 100.0);
+        // Changes only need one hour plus endpoint freshness; also retain pending candles.
+        self.candles
+            .retain(|ts, _| *ts >= tick - (3600 + 180) * SECOND);
+    }
+}
+
 #[derive(Default, Serialize, Deserialize)]
 pub struct Engine {
     #[serde(with = "instrument_entries")]
     instruments: BTreeMap<Key, Instrument>,
+    #[serde(default)]
+    dvol: BTreeMap<String, Dvol>,
     pub records: u64,
     pub book_breaks: u64,
     pub book_break_reasons: BTreeMap<String, u64>,
@@ -779,6 +853,23 @@ impl Engine {
         self.consume_inner(r, Some(tick))
     }
     fn consume_inner(&mut self, r: &Record, current_tick: Option<i64>) -> Result<()> {
+        if r.exchange == "deribit" && r.market == "index" && r.feed == "dvol" {
+            self.records += 1;
+            if matches!(r.symbol.as_str(), "BTC" | "ETH") {
+                if let Err(error) = self.dvol.entry(r.symbol.clone()).or_default().consume(r) {
+                    *self
+                        .data_anomalies
+                        .entry(format!("deribit/index/{}/dvol: {}", r.symbol, error))
+                        .or_default() += 1;
+                }
+            } else {
+                *self
+                    .data_anomalies
+                    .entry("deribit/index/dvol: unknown currency".into())
+                    .or_default() += 1;
+            }
+            return Ok(());
+        }
         let key = (r.exchange.clone(), r.market.clone(), r.symbol.clone());
         if r.event.as_deref() == Some("corrupt_message") {
             *self
@@ -953,6 +1044,8 @@ impl Engine {
         let assets = rows
             .iter()
             .filter_map(|r| asset(&r.symbol))
+            .chain(self.dvol.keys().map(String::as_str))
+            .map(str::to_owned)
             .collect::<BTreeSet<_>>();
         let mid = |ex: &str, market: &str, asset_: &str| {
             rows.iter()
@@ -965,7 +1058,8 @@ impl Engine {
                 .and_then(|r| r.mid)
         };
         let mut cross = Vec::new();
-        for asset_ in assets {
+        for asset_name in assets {
+            let asset_ = asset_name.as_str();
             let mut row = Row {
                 exchange: "cross".into(),
                 market: "cross".into(),
@@ -998,6 +1092,18 @@ impl Engine {
                 mid("kraken", "spot", asset_),
                 mid("binance", "spot", asset_),
             );
+            if let Some(dvol) = self.dvol.get_mut(asset_) {
+                let realized = rows
+                    .iter()
+                    .find(|r| {
+                        r.exchange == "binance"
+                            && r.market == "spot"
+                            && asset(&r.symbol) == Some(asset_)
+                            && r.memory.rv_3600s.is_some()
+                    })
+                    .and_then(|r| r.memory.rv_3600s);
+                dvol.fill(&mut row, realized);
+            }
             cross.push(row);
         }
         rows.extend(cross);
@@ -1669,3 +1775,7 @@ mod instrument_entries {
             .collect())
     }
 }
+
+#[cfg(test)]
+#[path = "dvol_tests.rs"]
+mod dvol_tests;

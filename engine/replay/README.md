@@ -14,8 +14,8 @@ record/row counts, clock steps, break reasons, coverage and cross-price maxima.
 
 V3 files under `<Exchange>/<Market>/<Pair>/YYYYMMDD_<channel>.jsonl` define
 streams; the root may also contain a `raw` directory. Exchange directories match
-case-insensitive `binance*`, `kraken*`, `okx*`; `spot*` means spot and
-`fut*`/`perp*`/`swap*` means perp. `--exchange` and `--market` filter canonical
+case-insensitive `binance*`, `kraken*`, `okx*`, `deribit*`; `spot*` means spot and
+`fut*`/`perp*`/`swap*` means perp, and `index*` means index. `--exchange` and `--market` filter canonical
 names. Every native pair is accepted. Kraken spot directory hyphens become `/`
 in the native output symbol; other symbols retain their native spelling.
 
@@ -26,6 +26,7 @@ in the native output symbol; other symbols retain their native spelling.
 | OKX | book → l2; bbo → l1; trades → trades_agg; tradesall → trades |
 | Kraken spot | book → l2; level3 → l3; trades → trades |
 | Kraken futures | book → l2; trades → trades; ticker → ticker |
+| Deribit index | dvol → dvol |
 
 Unknown feeds are skipped with a warning. If several representations of the same
 stream exist, prefer `.jsonl`, then `.jsonl.gz`, then `.jsonl.open`. Open files
@@ -333,3 +334,58 @@ not the new once-per-second band calculations or Parquet output.
 
 All benchmark runs reported no data anomalies. Individual batch regressions
 reached 10.1% (spot) and 16.1% (futures); aggregate medians meet the 10% threshold.
+
+## Deribit DVOL (features v5)
+
+`ENGINE_VERSION` ends in `-features-v5`; checkpoints from earlier versions are
+rejected. The five new nullable DOUBLE columns are appended after existing
+Parquet columns and also appear in JSON/live output and inference's raw schema.
+They populate only the `cross/cross/BTC` and `cross/cross/ETH` rows. DVOL never
+creates an index market row, and existing market features retain their values.
+If several Binance spot pairs have the same asset, the first native symbol with
+a known `rv_3600s` supplies realized volatility, matching deterministic venue
+selection elsewhere.
+
+- `dvol`: CLOSE of the newest usable one-minute DVOL candle, in annualized
+  volatility percentage points (52.3 means 52.3% annualized implied volatility).
+  Candle timestamps mark the START, not the close. At tick T a candle is usable
+  iff `max(recv_ns, candle_start_ns + 70 seconds) <= T`; the 70-second floor gives
+  early live receives and fixed-lag backfill identical feature availability.
+  Later live receives remain unavailable until actually received. A newest usable
+  candle older than 180 seconds **from its start** is null (exactly 180 is fresh).
+- `dvol_chg_300s`, `dvol_chg_900s`, `dvol_chg_3600s`: current usable value minus
+  the usable value as of `T-W`, in volatility points, with the same availability
+  and staleness rules at both endpoints. Either unknown endpoint makes the change
+  null; no interpolation is used and interior gaps are allowed.
+- `dvol_rv_gap`: `dvol - Binance_spot_rv_3600s * sqrt(365*24) * 100`, for the
+  matching asset. The underlying RV is the square root of the sum of existing
+  one-second squared log returns over an hour. Scaling annualizes the hourly
+  value and converts it to the same volatility points as DVOL. Null if either
+  value is missing; this uses the existing RV coverage semantics.
+
+Closed candles are immutable observations: duplicate timestamps keep the first
+received value/availability, and connection controls do not erase known candles.
+State retains the hour plus 180-second endpoint grace and pending candles, and
+is included in checkpoints, `as_live` and `--from-state` replay. Archive input
+accepts numeric and exact-string OHLC values; the reader retains the inner row's
+text without decimal reserialization. See [server backfill](../../README.md#deribit-dvol-p22-features-v5)
+for receive-day files and operational instructions.
+
+P22 validation: `cargo test --release --locked` passed 114 tests (one existing
+ignored timing test); Clippy with `--locked --all-targets -- -D warnings` and
+`cargo fmt --check` passed. Root `PYTHON_DOTENV_DISABLED=1 uv run pytest -q`
+passed 383 tests. New offline fixtures cover exact response number tokens,
+recorder/reader round trips, poll retries/dedupe/closed candles, Kafka recovery,
+server backfill pagination/receive days/no-clobber behavior, all DVOL windows,
+RV units, Parquet and checkpoint/from-state parity with a pending candle.
+
+`benchmark_archive` before/after warm records/s (run 0 excluded):
+
+| Fixture | Before samples | After samples | Before median | After median | Regression |
+| --- | --- | --- | ---: | ---: | ---: |
+| Spot, 33,511 records | 288323, 274507, 276290 | 321458, 322784, 325630 | 276290 | 322784 | none (−16.8%) |
+| Futures, 75,235 records | 491008, 460519, 454109 | 586371, 586325, 612476 | 460519 | 586371 | none (−27.3%) |
+
+Both measured regressions are below 5%, with zero data anomalies. These short
+fixture ingestion runs vary with local load; the increases are not evidence of
+an algorithmic speedup. They exclude ticks and Parquet, as described above.

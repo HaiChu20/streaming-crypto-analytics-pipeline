@@ -40,6 +40,7 @@ def timestamp(ns: int) -> str:
 # Single source for file channel / wrapper line name. Kraken Futures line names
 # additionally distinguish snapshots using the native feed.
 CHANNELS = {
+    "deribit": {"dvol": ("dvol", "dvol")},
     "binance": {"l2": ("depth", "depth"), "snapshot": ("snapshot", "snapshot"),
                 "l1": ("bookticker", "bookTicker"), "trades": ("trades", "trade"),
                 "trades_agg": ("aggtrades", "aggTrade"), "mark": ("markprice", "markPrice"),
@@ -75,8 +76,8 @@ def path(root: Path, exchange: str, market: str, symbol: str, day: str, feed: st
     if exchange == "control":
         return root / "control" / f"{day}_control.jsonl"
     file = channel(exchange, market, feed, kind, native)[0]
-    return (root / {"binance": "Binance", "kraken": "Kraken", "okx": "OKX"}[exchange]
-            / ("Spot" if market == "spot" else "Futures") / symbol.replace("/", "-") / f"{day}_{file}.jsonl")
+    return (root / {"binance": "Binance", "kraken": "Kraken", "okx": "OKX", "deribit": "Deribit"}[exchange]
+            / {"spot": "Spot", "perp": "Futures", "index": "Index"}[market] / symbol.replace("/", "-") / f"{day}_{file}.jsonl")
 
 
 def inject(payload: dict, fields: dict) -> dict:
@@ -133,7 +134,9 @@ def line(envelope: dict | bytes, offset: int) -> bytes:
             payload = payload["data"]
         _, name = channel(exchange, market, e.get("feed"), e["kind"], payload)
         fallback = {"channel": name, **fields, "raw": text}
-        if isinstance(payload, dict):
+        if exchange == "deribit" and e.get("feed") == "dvol" and isinstance(payload, list):
+            rec = {"channel": name, **fields, "data": payload}
+        elif isinstance(payload, dict):
             if not payload.keys().isdisjoint(fields):
                 count_collision(e, next(key for key in fields if key in payload))
                 rec = fallback
@@ -160,7 +163,7 @@ def archive_identity(path):
     ex, market, pair = path.parts[-4:-1]
     exchange = next((x for x in CHANNELS if ex.lower().startswith(x)), None)
     m = market.lower()
-    market = "spot" if m.startswith("spot") else "perp" if m.startswith(("fut", "perp", "swap")) else None
+    market = "spot" if m.startswith("spot") else "perp" if m.startswith(("fut", "perp", "swap")) else "index" if m.startswith("index") else None
     return exchange, market, pair, path.name.split("_", 1)[1].split(".", 1)[0]
 
 

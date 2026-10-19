@@ -174,7 +174,15 @@ impl StreamPath {
                 action: Option<&'a str>,
                 feed: Option<&'a str>,
             }
-            let shape: Shape<'_> = serde_json::from_str(native)?;
+            let shape: Shape<'_> = if self.feed == "dvol" {
+                Shape {
+                    kind: None,
+                    action: None,
+                    feed: None,
+                }
+            } else {
+                serde_json::from_str(native)?
+            };
             let snapshot = self.channel == "snapshot"
                 || shape.kind == Some("snapshot")
                 || shape.action == Some("snapshot")
@@ -218,7 +226,7 @@ impl StreamPath {
 }
 fn canonical_exchange(value: &str) -> Option<&'static str> {
     let value = value.to_ascii_lowercase();
-    ["binance", "kraken", "okx"]
+    ["binance", "kraken", "okx", "deribit"]
         .into_iter()
         .find(|prefix| value.starts_with(prefix))
 }
@@ -228,12 +236,15 @@ fn canonical_market(value: &str) -> Option<&'static str> {
         Some("spot")
     } else if ["fut", "perp", "swap"].iter().any(|p| value.starts_with(p)) {
         Some("perp")
+    } else if value.starts_with("index") {
+        Some("index")
     } else {
         None
     }
 }
 fn channel_feed(exchange: &str, market: &str, channel: &str) -> Option<&'static str> {
     match (exchange, market, channel) {
+        ("deribit", "index", "dvol") => Some("dvol"),
         ("binance", _, "depth" | "snapshot") | ("okx" | "kraken", _, "book") => Some("l2"),
         ("binance", _, "bookticker") | ("okx", _, "bbo") => Some("l1"),
         ("okx", _, "trades") | ("binance", "perp", "aggtrades") => Some("trades_agg"),

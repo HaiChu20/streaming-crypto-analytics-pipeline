@@ -210,7 +210,7 @@ In a day-D replay, books start from B's first snapshot, and book features for th
 
 ## 6. Kafka
 
-- **Topics:** `raw.<exchange>.<spot|perp>.<feed>.v1` (22 topics). Also:
+- **Topics:** `raw.<exchange>.<spot|perp|index>.<feed>.v1` (23 topics). Also:
   - `engine.cutoffs.v1` (phase 4);
   - `features.1s.v1`, `predictions.v1` (phases 4 and 6).
 - **Partitions:** 2 per raw topic with an **explicit mapping from config: BTC → 0, ETH → 1** (no hashing). Each (topic, partition) is exactly one (feed, symbol) stream, so ordering and recorder recovery work per stream.
@@ -225,7 +225,7 @@ In a day-D replay, books start from B's first snapshot, and book features for th
 ## 7. Storage
 
 ```text
-Local: data/raw/date=YYYY-MM-DD/exchange=<x>/market=<m>/feed=<f>/<SYMBOL>.jsonl   (.open while writing)
+Local: data/raw/<Exchange>/<Spot|Futures|Index>/<SYMBOL>/YYYYMMDD_<channel>.jsonl   (.open while writing)
        data/engine/date=YYYY-MM-DD/cutoffs.jsonl, start_state.bin, carry_in.jsonl (phase 4)
        data/state/collector-<exchange>.json                                     (crash detection; not archived)
 S3:    raw/… and engine/… (same paths, .jsonl.gz) · manifests/date=YYYY-MM-DD.json
@@ -233,7 +233,14 @@ S3:    raw/… and engine/… (same paths, .jsonl.gz) · manifests/date=YYYY-MM-
 ```
 
 **Recorder** (one file per (topic, partition) per day):
-- Each line is the envelope plus `{topic, partition, offset}`.
+- Raw format v3 wraps native data with `channel`, `recv_time_ns`, `conn` and
+  Kafka `offset`; Kraken spot injects metadata into its native object. Decimal
+  JSON number tokens become exact strings, with integers kept as integers.
+  Kafka envelopes remain v1. Invalid/colliding native objects retain exact `raw`
+  text. Closed files end with a rollover marker and have `.meta.json`.
+- Deribit index uses `Deribit/Index/<BTC|ETH>/YYYYMMDD_dvol.jsonl` and a wrapped
+  `data: [ts_ms,open,high,low,close]` array. Directory prefixes are case-insensitive.
+  Day assignment remains by receive time, including synthetic backfill receives.
 - Calls `fsync` every few seconds, then commits Kafka offsets. Commits are only used for monitoring lag.
 - **Recovery:** the files are the source of truth.
   1. For each (topic, partition), open its newest file and truncate a partial last line.
@@ -245,7 +252,7 @@ S3:    raw/… and engine/… (same paths, .jsonl.gz) · manifests/date=YYYY-MM-
 
 **Daily job (from 00:15 UTC, then hourly until day D is complete):**
 1. gzip each closed day-D file (streamed), test-read it, and upload it with a SHA-256 checksum. Re-uploading is harmless (same key, same checksum).
-2. While any of day D's 44 stream files or its engine files is still open, write `manifests/date=D.json` with `"status":"provisional"`, listing what is uploaded and what is pending. An outage delays completion; it never moves data to another day.
+2. While any of day D's 46 streams' channel files or its engine files is still open, write `manifests/date=D.json` with `"status":"provisional"`, listing what is uploaded and what is pending. An outage delays completion; it never moves data to another day.
 3. Once every file for day D is closed and uploaded, rewrite the manifest as `"status":"complete"`, with per-file counts, offsets and sha256. Only `complete` days are used for training.
 4. Delete local copies 48h after `complete`. Missed days are caught up automatically.
 
@@ -292,6 +299,34 @@ S3:    raw/… and engine/… (same paths, .jsonl.gz) · manifests/date=YYYY-MM-
 - **Training:** Parquet features + labels → Python (LightGBM baseline). Walk-forward time splits; never shuffle across time. Record the replay mode (`as_live` / `ideal`) of every training row.
 - **Inference:** consume `features.1s.v1`, load the versioned model from S3, emit `predictions.v1` (time, target, horizon, return, direction, model version).
 - **Backtests:** must include fees, spread, funding and latency.
+
+### 10.10 Deribit DVOL (P22)
+
+BTC and ETH one-minute OHLC candles come from REST
+`public/get_volatility_index_data` at resolution 60. Poll five seconds after each
+minute boundary, fetching a five-minute overlap, emitting closed candles in
+ascending order with per-currency timestamp dedupe. Use the standard v1 envelope
+(`deribit/index/dvol`, symbol BTC/ETH, kind update), Kafka sink and start/drop
+controls; raw topic `raw.deribit.index.dvol.v1` adds two partitions (46 total).
+Payload contains only the row array, re-serialized from original number tokens
+so decimal spellings survive without float conversion. Archive layout is §7 v3.
+
+Server-only backfill pages via `continuation` as the next end timestamp. Inclusive
+closed receive dates use `recv_ns = (ts_ms + 70000) * 1000000`, connection
+`backfill`, per-file offsets 0..n, deterministic rollover and recorder metadata.
+Identical files are skipped and differing files refused without overwriting or
+removing anything. Sleep between requests and retry 429/5xx with backoff.
+
+Features v5 serializes per-asset candle state. At tick T, the latest close is
+usable iff `max(recv_ns, ts + 70s) <= T`, and null after its start age exceeds
+180s. Append cross-only `dvol`, `dvol_chg_300s`, `dvol_chg_900s`,
+`dvol_chg_3600s`, `dvol_rv_gap`. Changes subtract the usable as-of T-W endpoint;
+both endpoints must be known/fresh. Units are annualized volatility points.
+The gap subtracts Binance spot `rv_3600s * sqrt(365*24) * 100` of the same asset.
+Market rows retain existing behavior and have null DVOL fields. Parquet, audit,
+live JSON and inference raw schema carry the new columns; checkpoint version is
+`-features-v5`. The detailed field contract and tests are documented in
+[engine/replay/README.md](engine/replay/README.md#deribit-dvol-features-v5).
 
 ## 11. Build order
 

@@ -33,6 +33,17 @@ fn main() -> Result<()> {
         let market = row.get_string(1)?;
         let symbol = row.get_string(2)?;
         let tick = row.get_long(3)?;
+        for (name, value) in row
+            .get_column_iter()
+            .filter(|(name, _)| name.starts_with("dvol"))
+        {
+            if exchange != "cross" || tick > end + 180 * SECOND {
+                assert!(
+                    matches!(value, parquet::record::Field::Null),
+                    "non-null DVOL field {name}"
+                );
+            }
+        }
         let key = (tick, exchange.clone(), market.clone(), symbol.clone());
         assert!(previous.as_ref().is_none_or(|p| p < &key));
         previous = Some(key);
