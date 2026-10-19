@@ -37,6 +37,11 @@ FLOATS += [f"{name}_{w}s" for w in WINDOWS
            for name in ("cov", "vol", "flow", "ofi1", "ofi10", "range_bps")]
 FLOATS += [f"ret_{w}s" for w in (300, 900, 1800, 3600)]
 FLOATS += [f"rv_{w}s" for w in (900, 1800, 3600)] + ["microprice_dev_bps"]
+INTS += [f"liq_{side}_count_{w}s" for w in WINDOWS for side in ("sell", "buy")]
+FLOATS += [f"liq_{side}_base_{w}s" for w in WINDOWS for side in ("sell", "buy")]
+FLOATS += ["funding_min_to_next", "mark_index_bps"]
+FLOATS += [f"oi_chg_pct_{w}s" for w in (300, 900, 3600)]
+FLOATS += [f"depth_{side}_{bps}bps" for side in ("bid", "ask") for bps in (10, 25, 50)]
 SCHEMA = {**dict.fromkeys(STRINGS, pl.String), **dict.fromkeys(BOOLS, pl.Boolean),
           **dict.fromkeys(INTS, pl.Int64), **dict.fromkeys(FLOATS, pl.Float64),
           "replay_mode": pl.String}

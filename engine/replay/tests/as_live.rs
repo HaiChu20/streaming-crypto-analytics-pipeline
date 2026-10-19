@@ -269,19 +269,58 @@ fn from_state_preserves_full_hour_windows_and_pending_flow() {
             "kind":if t==0 {"snapshot"} else {"update"}, "conn":"A","seq":t,"recv_ns":start+t*SECOND,
             "payload":json!({"data":[{"seqId":t,"prevSeqId":t-1,"checksum":0,
                 "bids":[[format!("100.{t:08}"),(t+1).to_string()]],"asks":[["102","3"]]}]}).to_string()}).to_string()).unwrap();
-        let rows = state.apply(cutoff(t), vec![record]).unwrap();
+        let kraken = |feed: &str, kind: &str, payload: serde_json::Value| {
+            Record::parse(&json!({
+            "exchange":"kraken","market":"perp","symbol":"PF_XBTUSD","feed":feed,
+            "kind":kind,"conn":"K","seq":t,"recv_ns":start+t*SECOND,"payload":payload.to_string()
+        }).to_string()).unwrap()
+        };
+        let book = kraken(
+            "l2",
+            "snapshot",
+            json!({"seq":t,
+            "bids":[{"price":"99.99","qty":"1"},{"price":"99","qty":"2"}],
+            "asks":[{"price":"100.01","qty":"3"},{"price":"101","qty":"4"}]}),
+        );
+        let ticker = kraken(
+            "ticker",
+            "update",
+            json!({"openInterest":1000+t,"markPrice":"100.1",
+            "index":"100","funding_rate":"0.01","next_funding_rate_time":(start/1_000_000)+(t+60)*1000}),
+        );
+        let trade = kraken(
+            "trades",
+            "trade",
+            json!({"uid":t.to_string(),"qty":"0.01",
+            "side":if t%2==0 {"sell"} else {"buy"},"type":"liquidation"}),
+        );
+        let rows = state
+            .apply(cutoff(t), vec![record, book, ticker, trade])
+            .unwrap();
         if t == 3900 {
             let row = rows.iter().find(|r| r.exchange == "okx").unwrap();
             assert_eq!(row.memory.cov_3600s, Some(1.0));
             assert!(row.memory.ofi10_3600s.unwrap() > 0.0);
             assert!(row.memory.ret_3600s.unwrap() > 0.0);
             assert!(row.memory.rv_3600s.unwrap() > 0.0);
+            let row = rows.iter().find(|r| r.exchange == "kraken").unwrap();
+            assert_eq!(row.memory.liq_sell_count_3600s, Some(1800));
+            assert_eq!(row.memory.liq_buy_base_3600s, Some(18.0));
+            assert_eq!(row.oi_chg_pct_3600s, Some(100.0 * 3600.0 / 1300.0));
+            assert_eq!(row.funding_min_to_next, Some(1.0));
+            assert!(row.mark_index_bps.unwrap() > 0.0);
+            assert_eq!(row.depth_bid_50bps, Some(1.0));
         }
     }
     let future = Record::parse(&json!({"exchange":"okx","market":"spot","symbol":"BTC-USDT","feed":"trades",
         "kind":"trade","conn":"T","seq":1,"recv_ns":start+3901*SECOND,
         "payload":json!({"data":[{"tradeId":"1","sz":"123456.12345678","side":"buy"}]}).to_string()}).to_string()).unwrap();
     state.engine.consume(&future).unwrap();
+    let liquidation = Record::parse(&json!({"exchange":"kraken","market":"perp","symbol":"PF_XBTUSD",
+        "feed":"trades","kind":"trade","conn":"K","seq":3901,"recv_ns":start+3901*SECOND,
+        "payload":json!({"uid":"pending","qty":"0.12345678","side":"sell","type":"liquidation"}).to_string()
+    }).to_string()).unwrap();
+    state.engine.consume(&liquidation).unwrap();
     let checkpoint = directory.join("hour_state.json");
     state_io::save(&checkpoint, &state).unwrap();
     let cutoffs = (3901..=3965).map(cutoff).collect::<Vec<_>>();
