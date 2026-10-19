@@ -133,7 +133,7 @@ def test_build_matrix_includes_calendar_and_can_disable():
                                                             'BTC_spot', spec=spec)[1])
 
 
-def test_training_metadata_and_native_model_calendar_validation(tmp_path, caplog):
+def test_training_metadata_and_native_model_calendar_validation(tmp_path, caplog, compact_folds):
     from inference.service import SCHEMA, load_models
     from research.labels import load_spec
     from research.train import train_target
@@ -150,7 +150,7 @@ def test_training_metadata_and_native_model_calendar_validation(tmp_path, caplog
     path.write_bytes(EVENTS.read_bytes())
     spec = dict(load_spec(), calendar=str(path))
     report = train_target(pl.DataFrame(rows, schema=SCHEMA), 'BTC_spot', 900, tmp_path,
-                          'calendar', n_folds=2, rounds=1, spec=spec)
+                          'calendar', rounds=1, spec=spec, lockbox_from='2024-01-03')
     cal = Calendar.load(path)
     assert report['calendar'] == cal.metadata(report['data_window']['end_ns'])
     assert len(report['calendar']['sha256']) == 64
@@ -205,7 +205,7 @@ def test_live_calendar_coverage_and_vector_parity(caplog):
     complete_tick(svc, '2025-10-24T12:30:00Z')
     assert len(produced) == 1
     import numpy as np
-    expected = features('2025-10-24T12:30:00Z').select(svc.models[0].metadata['features']).to_numpy()
+    expected = features('2025-10-24T12:30:00Z').select(svc.models[0].metadata['features']).to_numpy().astype(np.float32)
     np.testing.assert_array_equal(vectors[0], expected)
     complete_tick(svc, '2026-11-01T00:00:00Z')
     complete_tick(svc, '2026-11-01T00:00:10Z')

@@ -215,8 +215,42 @@ and [Rust via rustup](https://rustup.rs), then run:
 git clone <repository-url>
 cd streaming-crypto-analytics-pipeline
 uv sync
-scripts/train_offline.sh /path/to/archive /path/to/work --jobs 2 --version btc-spot-v1
+# 1. Inventory without opening archive payloads.
+uv run python scripts/archive_inventory.py /path/to/archive --json /path/to/inventory.json
+# 2. Optional: DVOL backfill (see the Deribit DVOL section below).
+# 3. Replay and train on development dates only.
+scripts/train_offline.sh /path/to/archive /path/to/work --jobs 2 --version btc-spot-v1 --shuffle-test
+# 4. Read /path/to/work/report_btc-spot-v1.html locally.
+# 5. Only after all model choices are final, open the lockbox ONCE (no refit).
+PYTHON_DOTENV_DISABLED=1 uv run python -m research.train /path/to/work --version btc-spot-v1 --open-lockbox
 ```
+
+The split uses UTC dates present across all feature instruments. By default the
+last 20% (rounded up) are a closed lockbox; the preceding calendar day is an
+embargo used by neither split. `--lockbox-pct` or `--lockbox-from YYYY-MM-DD`
+and `--embargo-days` control this split (embargo must cover the longest horizon).
+Neither labels nor metrics are computed from lockbox rows during development.
+Weekly expanding tests start after 14 days; `--fold-days`, `--min-train-days`,
+`--fold-embargo-s` (default one horizon in addition to the horizon purge), and
+`--max-folds` (latest 12) bound evaluation. Final models fit development rows only.
+
+Reports include direction, stop calibration, regimes, shuffle diagnostics and
+LightGBM gain / mean absolute SHAP importance. Each model also has an HTML page
+beside its version directory. Regenerate pages with
+`uv run python -m research.report /path/to/work --version btc-spot-v1`.
+Opening uses the saved split, models and development-only baseline calibration;
+`lockbox_ledger.jsonl` records the range, timestamp and metrics digest. Reuse of a
+range across versions warns and requires `--i-understand-lockbox-reuse`.
+The launcher passes these flags through and skips replay when opening a lockbox.
+
+X is float32 in both training and inference through the same conversion helper;
+labels stay float64. Tree decisions normally agree with float64 to prediction
+precision; values at a split threshold can differ, which is why live uses the
+same float32 path. Before allocating X, training prints rows × features × 4 bytes.
+`--max-memory-gb` defaults to 70% of physical RAM; exceed it and training stops
+with advice to raise `--stride-s` or use fewer days. This is an X allocation guard,
+not an upper bound on total RAM: input frames, labels and LightGBM need more.
+No new plotting or SHAP dependency is required; HTML uses inline SVG.
 
 The command builds release replay, discovers closed v3 days, and publishes
 `work/features/date=D/features.parquet` atomically. It resumes completed days;

@@ -132,8 +132,8 @@ def test_quantile_oof_calibration_and_pinball_on_heteroscedastic_data():
     adverse = {side: rv * rng.exponential(1, n) * scale
                for side, scale in (("long", 1.), ("short", 1.5))}
     adverse["long"][::41] = np.nan
-    ticks = np.arange(n, dtype=np.int64) * 10 * NS
-    folds = walk_forward_folds(ticks, 300, 3)
+    ticks = np.arange(n, dtype=np.int64) * 300 * NS
+    folds = walk_forward_folds(ticks, 300, max_folds=3)
     reports, overall = evaluate_stops(x, adverse, rv, ["rv"], folds, rounds=100)
     assert set(overall) == set(STOP_NAMES)
     for name, result in overall.items():

@@ -164,10 +164,10 @@ def test_trailing_momentum_uses_exact_past_and_never_future(tmp_path):
 
 @pytest.mark.parametrize("horizon", [300, 900, 1800])
 def test_walk_forward_order_expansion_and_purge_no_overlapping_labels(horizon):
-    ticks = np.arange(0, 30000, 10, dtype=np.int64) * NS
+    ticks = np.arange(40 * 24, dtype=np.int64) * 3600 * NS
     # Some labels are emitted even later than the normal endpoint + 250ms.
     available = ticks + horizon * NS + 125 * NS
-    folds = walk_forward_folds(ticks, horizon, 3, label_available_ns=available)
+    folds = walk_forward_folds(ticks, horizon, label_available_ns=available)
     previous_train, previous_test_end = set(), -1
     for train, test in folds:
         assert np.all(np.diff(ticks[train]) > 0) and np.all(np.diff(ticks[test]) > 0)
@@ -190,9 +190,9 @@ def test_reject_small_purge_unsorted_folds_and_insufficient_history():
 
 
 def test_late_training_feature_availability_is_purged():
-    ticks = np.arange(0, 30000, 10, dtype=np.int64) * NS
+    ticks = np.arange(40 * 24, dtype=np.int64) * 3600 * NS
     available = ticks + 250_000_000
-    available[0] = 40000 * NS
+    available[0] = ticks[-1] + 86400 * NS
     folds = walk_forward_folds(ticks, 900, feature_available_ns=available)
     assert all(0 not in train for train, _ in folds)
     for train, test in folds:
@@ -228,10 +228,10 @@ def test_metrics_ties_flats_missing_predictions_and_undefined_ic():
 
 
 @pytest.mark.parametrize("horizon", [300, 900, 1800])
-def test_tiny_end_to_end_cli_models_metadata_and_row_modes(tmp_path, synthetic_path, horizon):
+def test_tiny_end_to_end_cli_models_metadata_and_row_modes(tmp_path, synthetic_path, horizon, compact_folds):
     output = tmp_path / "output"
     result = main([str(synthetic_path), "--output-root", str(output), "--target", "BTC_spot",
-                   "--horizon-s", str(horizon), "--folds", "2", "--rounds", "3", "--version", "test"])
+                   "--horizon-s", str(horizon), "--lockbox-from", "1970-01-03", "--rounds", "3", "--version", "test"])
     report = result["results"][0]
     assert report["labeled_rows"] > 0 and len(report["folds"]) == 2
     assert report["replay_modes"] == ["ideal"]
@@ -258,7 +258,7 @@ def test_tiny_end_to_end_cli_models_metadata_and_row_modes(tmp_path, synthetic_p
     from research.labels import make_labels
     data = matrix.join(make_labels(read_features([synthetic_path]), "BTC_spot", horizon), on="tick_ns").filter(
         pl.col("return_pct").is_not_null() & (pl.col("available_ns") < pl.col("label_end_ns")))
-    folds = walk_forward_folds(data["tick_ns"].to_numpy(), horizon, 2,
+    folds = compact_folds(data["tick_ns"].to_numpy(), horizon,
                                label_available_ns=data["label_available_ns"].to_numpy(),
                                feature_available_ns=data["available_ns"].to_numpy())
     test = np.concatenate([test for _, test in folds])
@@ -273,7 +273,7 @@ def test_tiny_end_to_end_cli_models_metadata_and_row_modes(tmp_path, synthetic_p
         assert fold["train_feature_available_ns"] < fold["test_start_ns"]
     with pytest.raises(FileExistsError):
         train_target(read_features([synthetic_path]), "BTC_spot", horizon, output,
-                     "test", n_folds=2, rounds=1)
+                     "test", rounds=1, lockbox_from="1970-01-03")
 
 
 def test_matrix_uses_explicit_asset_for_generic_pairs(tmp_path):
@@ -287,9 +287,9 @@ def test_matrix_uses_explicit_asset_for_generic_pairs(tmp_path):
     assert not any(f.endswith('_asset') for f in features)
 
 
-def test_missing_references_are_skipped_while_present_target_trains(tmp_path, synthetic_path):
+def test_missing_references_are_skipped_while_present_target_trains(tmp_path, synthetic_path, compact_folds):
     result = main([str(synthetic_path), "--output-root", str(tmp_path / "skipping"),
-                   "--horizon-s", "900", "--folds", "2", "--rounds", "1", "--version", "skip"])
+                   "--horizon-s", "900", "--lockbox-from", "1970-01-03", "--rounds", "1", "--version", "skip"])
     assert result["trained"] == 1 and result["skipped"] == 3
     assert result["results"][0]["target"] == "BTC_spot"
     assert result["results"][0]["status"] == "trained"
@@ -302,7 +302,7 @@ def test_missing_references_are_skipped_while_present_target_trains(tmp_path, sy
 def test_no_targets_or_too_few_labels_is_a_reported_success(tmp_path, capsys):
     path = write_parquet(tmp_path, [row(0), row(900)])
     output = tmp_path / "no-labels"
-    result = main([str(path), "--output-root", str(output), "--version", "tiny"])
+    result = main([str(path), "--output-root", str(output), "--version", "tiny", "--lockbox-from", "1970-01-03"])
     assert result["trained"] == 0 and result["skipped"] == 12
     assert all(report["status"] == "skipped" for report in result["results"])
     assert "not enough labeled rows" in result["results"][0]["reason"]
@@ -311,11 +311,11 @@ def test_no_targets_or_too_few_labels_is_a_reported_success(tmp_path, capsys):
     assert "No targets could train" in capsys.readouterr().out
     only_perp = read_features([write_parquet(tmp_path, [row(0, exchange="kraken", market="perp",
                                                              symbol="PF_XBTUSD")], name="perp.parquet")])
-    report = train_target(only_perp, "BTC_spot", 900, output, "absent")
+    report = train_target(only_perp, "BTC_spot", 900, output, "absent", lockbox_from="1970-01-03")
     assert report["reference"] == dict(exchange="binance", market="spot", symbol="BTCUSDT")
     assert report["reason"] == "reference instrument has no rows in input"
     with pytest.raises(ValueError, match="stride/folds"):
-        train_target(only_perp, "BTC_spot", 900, output, "bad", n_folds=0)
+        train_target(only_perp, "BTC_spot", 900, output, "bad", max_folds=0)
 
 
 def test_context_assets_same_tick_premium_missing_nulls_and_no_future_leakage(tmp_path):
@@ -348,7 +348,7 @@ def test_context_assets_apply_mode_version_and_availability_guards(tmp_path):
         row(0, 1_000_000_000, symbol="USDTUSD", available_ns=901 * NS)])])
     matrix, _ = build_matrix(frame, "BTC_spot")
     assert matrix["available_ns"][0] == 901 * NS
-    report = train_target(frame, "BTC_spot", 900, tmp_path, "late-context")
+    report = train_target(frame, "BTC_spot", 900, tmp_path, "late-context", lockbox_from="1970-01-03")
     assert report["status"] == "skipped" and report["labeled_rows"] == 0
     for column, value in [("replay_mode", "as_live"), ("engine_version", "other-version")]:
         conflicting = frame.with_columns(pl.when(pl.col("symbol") == "USDTUSD").then(pl.lit(value))

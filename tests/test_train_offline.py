@@ -90,6 +90,7 @@ from pathlib import Path
 import sys
 if sys.argv[1:3] == ['-m', 'research.train']:
     (Path(sys.argv[3]) / 'trained').write_text('trained')
+    (Path(sys.argv[3]) / 'train-args.json').write_text(__import__('json').dumps(sys.argv[4:]))
 else:
     os.execv({sys.executable!r}, [{sys.executable!r}, *sys.argv[1:]])
 ''')
@@ -244,3 +245,30 @@ def test_launcher_discovers_deribit_index_days(launcher):
     result = launch()
     assert result.returncode == 0, result.stdout + result.stderr
     assert (work / "features/date=2026-09-17/features.parquet").exists()
+
+
+def test_evaluation_flags_pass_through_and_ranges_print_before_replay(launcher):
+    work, launch = launcher
+    flags = ['--lockbox-pct', '30', '--lockbox-from', '2026-09-16', '--embargo-days', '1',
+             '--fold-days', '7', '--min-train-days', '14', '--fold-embargo-s', '900',
+             '--max-folds', '4', '--shuffle-test', '--max-memory-gb', '2', '--stride-s', '30',
+             '--target', 'BTC_spot', '--horizon-s', '900', '--rounds', '3']
+    result = launch('--version', 'flags', *flags)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert result.stdout.index('Development:') < result.stdout.index('Replay 2026-09-15')
+    assert 'Lockbox (closed): 2026-09-16' in result.stdout
+    passed = json.loads((work / 'train-args.json').read_text())
+    assert passed == ['--version', 'flags', '--embargo-days', '1', *flags]
+
+
+def test_open_lockbox_skips_build_and_replay_and_requires_version(launcher):
+    work, launch = launcher
+    refused = launch('--open-lockbox')
+    assert refused.returncode != 0 and 'already-trained --version' in refused.stderr
+    result = launch('--version', 'saved', '--open-lockbox', '--i-understand-lockbox-reuse')
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert not list(work.glob('.replay-*'))
+    assert not list(work.glob('features/date=*'))
+    assert 'Building release replay' not in result.stdout
+    passed = json.loads((work / 'train-args.json').read_text())
+    assert '--open-lockbox' in passed and '--i-understand-lockbox-reuse' in passed

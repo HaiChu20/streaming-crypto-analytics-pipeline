@@ -20,6 +20,7 @@ import polars as pl
 from collectors.common.config import kafka_bootstrap
 from research.calendar import Calendar, verify_calendar
 from research.dataset import build_matrix
+from research.evaluation import feature_array
 from research.labels import NS, load_spec, reference_for
 from research.risk import STOP_NAMES, predict_stops
 
@@ -151,10 +152,7 @@ def _matrix_for(rows, history, meta, calendar=None):
 
 
 def _reindex(matrix, features):
-    x = matrix.select([pl.col(c) if c in matrix.columns else pl.lit(None).alias(c)
-                       for c in features]).to_numpy().astype(np.float64)
-    x[~np.isfinite(x)] = np.nan
-    return x
+    return feature_array(matrix, features)
 
 
 def vector_for(rows, history, meta):

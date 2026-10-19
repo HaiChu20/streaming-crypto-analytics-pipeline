@@ -77,7 +77,7 @@ def test_parity_full_multinstrument_frame_and_online_ticks():
                    and r["exchange"] == "binance" and r["market"] == "spot" and r["symbol"] == "BTCUSDT"]
         actual = vector_for(current, history, meta)
         expected = matrix.filter(pl.col("tick_ns") == tick).with_columns(
-            pl.lit(None).alias("kraken_spot_spread_bps")).select(features).to_numpy().astype(float)
+            pl.lit(None).alias("kraken_spot_spread_bps")).select(features).to_numpy().astype(np.float32)
         np.testing.assert_array_equal(actual, expected)
         np.testing.assert_array_equal(captured[tick], expected)
     assert np.isnan(captured[910 * NS][0, features.index("okx_spot_spread_bps")])
@@ -299,10 +299,10 @@ def test_matrices_shared_across_horizons_reindexed_per_model_and_reset_per_tick(
     feed(svc, row(10), row(11), row(20, spread_bps=3.), row(21))
     assert builds == [('BTC_spot', 10, 'v1')] * 2
     assert svc.counts['predictions'] == 4
-    np.testing.assert_array_equal(vectors[0], [[2., .01]])
-    np.testing.assert_array_equal(vectors[1], [[.01, np.nan, 2.]])
-    np.testing.assert_array_equal(vectors[2], [[3., .01]])
-    np.testing.assert_array_equal(vectors[3], [[.01, np.nan, 3.]])
+    np.testing.assert_array_equal(vectors[0], np.array([[2., .01]], dtype=np.float32))
+    np.testing.assert_array_equal(vectors[1], np.array([[.01, np.nan, 2.]], dtype=np.float32))
+    np.testing.assert_array_equal(vectors[2], np.array([[3., .01]], dtype=np.float32))
+    np.testing.assert_array_equal(vectors[3], np.array([[.01, np.nan, 3.]], dtype=np.float32))
 
 
 @pytest.mark.parametrize('change', [{'target': 'BTC_perp'}, {'stride_s': 20},
@@ -342,7 +342,7 @@ def test_asset_field_matches_rust_and_clickhouse():
     assert svc.counts['malformed'] == 0
 
 
-def test_context_trained_models_match_live_vectors_and_missing_context_nulls(tmp_path):
+def test_context_trained_models_match_live_vectors_and_missing_context_nulls(tmp_path, compact_folds):
     spec = {**metadata()["label_spec"], "context_assets": ["USDT"]}
     rows = []
     for second in range(0, 7201, 10):
@@ -356,7 +356,7 @@ def test_context_trained_models_match_live_vectors_and_missing_context_nulls(tmp
                                 available_ns=second * NS + 700_000_000))
     frame = pl.DataFrame(rows, schema=SCHEMA)
     report = train_target(frame, "BTC_spot", 900, tmp_path, "context",
-                          n_folds=2, rounds=2, spec=spec)
+                          rounds=2, spec=spec, lockbox_from="1970-01-03")
     assert report["status"] == "trained"
     models = load_models(tmp_path, "context")
     features = models[0].metadata["features"]
@@ -377,7 +377,7 @@ def test_context_trained_models_match_live_vectors_and_missing_context_nulls(tmp
                    for _, message in svc.producer.messages}
     for second in [900, 910, 920]:
         tick = second * NS
-        expected = matrix.filter(pl.col("tick_ns") == tick).select(features).to_numpy().astype(float)
+        expected = matrix.filter(pl.col("tick_ns") == tick).select(features).to_numpy().astype(np.float32)
         current = [r for r in rows if r["tick_ns"] == tick]
         history = [r for r in rows if 0 <= r["tick_ns"] < tick and r["symbol"] == "BTCUSDT"]
         np.testing.assert_array_equal(vector_for(current, history, models[0].metadata), expected)
@@ -421,18 +421,18 @@ def test_memory_features_are_numeric_and_reach_the_training_matrix():
         assert matrix[f"binance_spot_{name}"][0] == rows[0][name]
 
 
-def test_five_minute_trained_stop_models_and_live_vector_parity(tmp_path):
+def test_five_minute_trained_stop_models_and_live_vector_parity(tmp_path, compact_folds):
     from research.risk import STOP_NAMES, predict_stops
     spec = metadata()["label_spec"]
     rows = [row(t, mid_e9=100 * NS + int(200_000_000 * np.sin(t / 130)),
                 rv_300s=float(1 + abs(np.sin(t / 130)))) for t in range(4501)]
     frame = pl.DataFrame(rows, schema=SCHEMA)
-    report = train_target(frame, "BTC_spot", 300, tmp_path, "risk", n_folds=2, rounds=3, spec=spec)
+    report = train_target(frame, "BTC_spot", 300, tmp_path, "risk", rounds=3, spec=spec, lockbox_from="1970-01-03")
     models = load_models(tmp_path, "risk", horizons=[300])
     assert set(models[0].stops) == set(STOP_NAMES)
     assert report["stop_labeled_rows"]["long"] == report["labeled_rows"]
     matrix, features = build_matrix(frame, "BTC_spot", spec=spec)
-    expected = matrix.filter(pl.col("tick_ns") == 300 * NS).select(features).to_numpy().astype(float)
+    expected = matrix.filter(pl.col("tick_ns") == 300 * NS).select(features).to_numpy().astype(np.float32)
     svc = Service(models, Producer())
     feed(svc, *rows[:302])
     np.testing.assert_array_equal(vector_for([rows[300]], rows[:300], models[0].metadata), expected)

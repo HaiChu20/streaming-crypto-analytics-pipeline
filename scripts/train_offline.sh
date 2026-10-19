@@ -3,7 +3,7 @@
 set -euo pipefail
 
 usage() {
-    echo "Usage: $0 <archive_root> <work_dir> [--jobs N] [--from YYYY-MM-DD] [--to YYYY-MM-DD] [--version V] [--allow-missing-days] [--rebuild-stale]" >&2
+    echo "Usage: $0 <archive_root> <work_dir> [--jobs N] [--from YYYY-MM-DD] [--to YYYY-MM-DD] [--version V] [--allow-missing-days] [--rebuild-stale] [research.train flags: --lockbox-pct/--lockbox-from/--embargo-days, --fold-days/--min-train-days/--fold-embargo-s/--max-folds, --shuffle-test, --max-memory-gb, --open-lockbox/--i-understand-lockbox-reuse]" >&2
 }
 fail() { echo "train_offline: $*" >&2; exit 1; }
 [[ $# -ge 2 ]] || { usage; exit 2; }
@@ -16,6 +16,12 @@ to_day=""
 version="offline-$(date -u +%Y%m%dT%H%M%SZ)-$$"
 allow_missing=0
 rebuild_stale=0
+train_args=(--embargo-days 1)
+lockbox_pct=20
+lockbox_from=""
+embargo_days=1
+open_lockbox=0
+version_set=0
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --jobs|--from|--to|--version)
@@ -24,9 +30,22 @@ while [[ $# -gt 0 ]]; do
                 --jobs) jobs=$2 ;;
                 --from) from_day=$2 ;;
                 --to) to_day=$2 ;;
-                --version) version=$2 ;;
+                --version) version=$2; version_set=1 ;;
             esac
             shift 2 ;;
+        --lockbox-pct|--lockbox-from|--embargo-days|--fold-days|--min-train-days|--fold-embargo-s|--max-folds|--max-memory-gb|--stride-s|--target|--horizon-s|--rounds|--purge-s)
+            [[ $# -ge 2 && -n $2 ]] || fail "$1 requires a value"
+            train_args+=("$1" "$2")
+            case "$1" in
+                --lockbox-pct) lockbox_pct=$2 ;;
+                --lockbox-from) lockbox_from=$2 ;;
+                --embargo-days) embargo_days=$2 ;;
+            esac
+            shift 2 ;;
+        --shuffle-test|--open-lockbox|--i-understand-lockbox-reuse)
+            train_args+=("$1")
+            if [[ $1 == --open-lockbox ]]; then open_lockbox=1; fi
+            shift ;;
         --allow-missing-days) allow_missing=1; shift ;;
         --rebuild-stale) rebuild_stale=1; shift ;;
         *) usage; fail "unknown option: $1" ;;
@@ -41,7 +60,6 @@ work_dir=$(cd "$work_dir" && pwd)
 cd "$repo_root"
 export PYTHON_DOTENV_DISABLED=1
 export PATH="${HOME}/.cargo/bin:$PATH"
-command -v cargo >/dev/null 2>&1 || fail "cargo is missing. Install Rust with rustup (https://rustup.rs), then restart your shell."
 if [[ -x $repo_root/.venv/bin/python ]]; then
     python_cmd=("$repo_root/.venv/bin/python")
 elif command -v uv >/dev/null 2>&1; then
@@ -50,6 +68,12 @@ else
     fail "Python environment is missing. Install uv (https://docs.astral.sh/uv/getting-started/installation/), then run uv sync in $repo_root."
 fi
 "${python_cmd[@]}" -c 'import lightgbm, numpy, polars, pyarrow, yaml' || fail "Python dependencies are unavailable. Run uv sync (LightGBM also needs the system OpenMP runtime)."
+if [[ $open_lockbox -eq 1 ]]; then
+    [[ $version_set -eq 1 ]] || fail "--open-lockbox requires an already-trained --version"
+    "${python_cmd[@]}" -m research.train "$work_dir" --version "$version" "${train_args[@]}"
+    exit 0
+fi
+command -v cargo >/dev/null 2>&1 || fail "cargo is missing. Install Rust with rustup (https://rustup.rs), then restart your shell."
 if [[ -z $jobs ]]; then
     jobs=$("${python_cmd[@]}" -c 'import os; print(max(1, (os.cpu_count() or 2) // 2))')
 fi
@@ -115,6 +139,29 @@ for day in sorted(days):
     print(day)
 PY
 [[ -s $days_file ]] || fail "no closed v3 archive days found in the requested range"
+# Projected ranges from selected archive dates and all already-completed feature
+# dates. Training recomputes the exact split from tick_ns after replay.
+"${python_cmd[@]}" - "$days_file" "$work_dir" "$lockbox_pct" "$lockbox_from" "$embargo_days" <<'PYRANGES'
+from datetime import date, timedelta
+from pathlib import Path
+import math
+import sys
+archive = [date.fromisoformat(d) for d in Path(sys.argv[1]).read_text().splitlines()]
+existing = [date.fromisoformat(p.parent.name.removeprefix('date='))
+            for p in Path(sys.argv[2]).glob('features/date=*/features.parquet')]
+days = sorted(set(archive + existing))
+pct, embargo = float(sys.argv[3]), int(sys.argv[5])
+if not math.isfinite(pct) or not 0 < pct < 100 or embargo < 1:
+    raise SystemExit('Need 0 < --lockbox-pct < 100 and --embargo-days >= 1')
+start = date.fromisoformat(sys.argv[4]) if sys.argv[4] else days[-max(1, math.ceil(len(days)*pct/100))]
+end_dev = start - timedelta(days=embargo)
+def span(values):
+    return f'{values[0]} .. {values[-1]} ({len(values)} days)' if values else 'none'
+print('Planned UTC ranges before replay (exact tick-based ranges printed by training):')
+print('Development: ' + span([d for d in days if d < end_dev]))
+print(f'Embargo: {end_dev} .. {start-timedelta(days=1)}')
+print('Lockbox (closed): ' + span([d for d in days if d >= start]))
+PYRANGES
 echo "Building release replay (log: $logs/build-$run_id.log)"
 if ! (cd "$repo_root/engine" && cargo build --release --locked -p engine-replay) > "$logs/build-$run_id.log" 2>&1; then
     fail "Rust build failed; see $logs/build-$run_id.log. Install/update the toolchain required by engine/ via rustup."
@@ -234,4 +281,4 @@ fi
 # Discovered successful outputs are the only published feature files; training
 # reads all complete days in work_dir, including successful earlier invocations.
 echo "Training CPU baselines, version=$version (log: $logs/train-$version.log)"
-"${python_cmd[@]}" -m research.train "$work_dir" --version "$version" 2>&1 | tee "$logs/train-$version.log"
+"${python_cmd[@]}" -m research.train "$work_dir" --version "$version" "${train_args[@]}" 2>&1 | tee "$logs/train-$version.log"
