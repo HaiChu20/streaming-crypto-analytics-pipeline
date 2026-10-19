@@ -3,7 +3,7 @@
 set -euo pipefail
 
 usage() {
-    echo "Usage: $0 <archive_root> <work_dir> [--jobs N] [--from YYYY-MM-DD] [--to YYYY-MM-DD] [--version V] [--allow-missing-days]" >&2
+    echo "Usage: $0 <archive_root> <work_dir> [--jobs N] [--from YYYY-MM-DD] [--to YYYY-MM-DD] [--version V] [--allow-missing-days] [--rebuild-stale]" >&2
 }
 fail() { echo "train_offline: $*" >&2; exit 1; }
 [[ $# -ge 2 ]] || { usage; exit 2; }
@@ -15,6 +15,7 @@ from_day=""
 to_day=""
 version="offline-$(date -u +%Y%m%dT%H%M%SZ)-$$"
 allow_missing=0
+rebuild_stale=0
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --jobs|--from|--to|--version)
@@ -27,6 +28,7 @@ while [[ $# -gt 0 ]]; do
             esac
             shift 2 ;;
         --allow-missing-days) allow_missing=1; shift ;;
+        --rebuild-stale) rebuild_stale=1; shift ;;
         *) usage; fail "unknown option: $1" ;;
     esac
 done
@@ -116,12 +118,46 @@ if ! (cd "$repo_root/engine" && cargo build --release --locked -p engine-replay)
     fail "Rust build failed; see $logs/build-$run_id.log. Install/update the toolchain required by engine/ via rustup."
 fi
 replay="$repo_root/engine/target/release/engine-replay"
+engine_version=$("$replay" --engine-version) || fail "could not read engine version from $replay"
+[[ -n $engine_version ]] || fail "replay returned an empty engine version: $replay"
+# Training includes every completed day in work_dir, even outside --from/--to.
+# Validate all of them before any replay or replacement, then plan selected days.
+replay_plan="$logs/replay-plan-$run_id.txt"
+"${python_cmd[@]}" - "$work_dir" "$days_file" "$engine_version" "$rebuild_stale" > "$replay_plan" <<'PY'
+from pathlib import Path
+import sys
+import pyarrow.parquet as pq
+
+work, days_file = map(Path, sys.argv[1:3])
+expected, rebuild = sys.argv[3], sys.argv[4] == '1'
+days = days_file.read_text().splitlines()
+stale = {}
+for path in sorted(work.glob('features/date=*/features.parquet')):
+    try:
+        actual = (pq.read_metadata(path).metadata or {}).get(b'engine_version')
+        reason = repr(actual)
+    except (OSError, ValueError) as error:
+        actual, reason = None, f'unreadable metadata: {error}'
+    if actual != expected.encode():
+        stale[path.parent.name.removeprefix('date=')] = reason
+if stale and (not rebuild or stale.keys() - set(days)):
+    details = '\n'.join(f'  {day}: {reason}' for day, reason in stale.items())
+    raise SystemExit(
+        f'Stale feature days (expected engine_version={expected!r}):\n{details}\n'
+        'Use a new work dir, or --rebuild-stale with archive inputs and a date range covering every stale day.'
+    )
+for day in days:
+    exists = (work / f'features/date={day}/features.parquet').is_file()
+    action = 'rebuild' if day in stale else ('reuse' if exists else 'replay')
+    print(day, action)
+PY
 replay_day() {
     local day=$1
+    local action=$2
     local final="$work_dir/features/date=$day/features.parquet"
     local staging="$work_dir/.replay-$day-$run_id"
     local report_tmp="$logs/$day-$run_id.json.tmp"
-    if [[ -f $final ]]; then
+    if [[ $action == reuse ]]; then
         echo "Skip $day: complete features already exist"
         return 0
     fi
@@ -133,15 +169,18 @@ replay_day() {
     # Publish only newly generated outputs. Source archives are never modified.
     # Staging and reports stay in work_dir, so these renames are atomic. Failed
     # or interrupted staging is retained and never treated as a completed day.
-    if ! "${python_cmd[@]}" - "$staging/date=$day/features.parquet" "$final" "$report_tmp" "$logs/$day.json" <<'PY'
+    if ! "${python_cmd[@]}" - "$staging/date=$day/features.parquet" "$final" "$report_tmp" "$logs/$day.json" "$engine_version" <<'PY'
 import json
 import os
 from pathlib import Path
 import sys
-source, target, report_tmp, report_path = map(Path, sys.argv[1:])
+import pyarrow.parquet as pq
+source, target, report_tmp, report_path = map(Path, sys.argv[1:5])
 report = json.loads(report_tmp.read_text())
 if not source.is_file():
     raise SystemExit(f'Replay did not produce {source}')
+if (pq.read_metadata(source).metadata or {}).get(b'engine_version') != sys.argv[5].encode():
+    raise SystemExit(f'Replay produced an unexpected engine_version in {source}')
 target.parent.mkdir(parents=True, exist_ok=True)
 report['output'] = str(target)
 report_tmp.write_text(json.dumps(report, indent=2) + '\n')
@@ -156,29 +195,36 @@ PY
 # Bounded batches also work with macOS Bash 3.2 (no wait -n dependency).
 pids=()
 running_days=()
+running_actions=()
 active=0
 failures=0
 failed_days=""
+failed_stale_days=""
 wait_batch() {
     local i
     for ((i=0; i<active; i++)); do
         if ! wait "${pids[$i]}"; then
             failures=$((failures + 1))
             failed_days="$failed_days ${running_days[$i]}"
+            if [[ ${running_actions[$i]} == rebuild ]]; then
+                failed_stale_days="$failed_stale_days ${running_days[$i]}"
+            fi
         fi
     done
     active=0
+    [[ -z $failed_stale_days ]] || fail "failed stale rebuild days:$failed_stale_days. Training stopped; retry --rebuild-stale or use a new work dir."
     if [[ $failures -gt 0 && $allow_missing -eq 0 ]]; then
         fail "failed replay days:$failed_days. Training stopped; rerun to retry, or explicitly use --allow-missing-days."
     fi
 }
-while IFS= read -r day; do
-    replay_day "$day" &
+while read -r day action; do
+    replay_day "$day" "$action" &
     pids[$active]=$!
     running_days[$active]=$day
+    running_actions[$active]=$action
     active=$((active + 1))
     if [[ $active -ge $jobs ]]; then wait_batch; fi
-done < "$days_file"
+done < "$replay_plan"
 wait_batch
 if [[ $failures -gt 0 ]]; then
     echo "WARNING: --allow-missing-days: training without failed days:$failed_days" >&2

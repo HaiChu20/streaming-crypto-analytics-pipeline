@@ -24,6 +24,10 @@ fn run() -> Result<()> {
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
+            "--engine-version" => {
+                println!("{}", engine_core::ENGINE_VERSION);
+                return Ok(());
+            }
             "--root" => {
                 root = PathBuf::from(args.next().ok_or_else(|| error("--root requires a path"))?)
             }
@@ -67,7 +71,7 @@ fn run() -> Result<()> {
             }
             "--help" => {
                 println!(
-                    "engine-replay --root data --date YYYY-MM-DD [--out data/features] [--allow-open] [--exchange NAME] [--market NAME]"
+                    "engine-replay --root data --date YYYY-MM-DD [--out data/features] [--allow-open] [--exchange NAME] [--market NAME]\nengine-replay --engine-version"
                 );
                 return Ok(());
             }

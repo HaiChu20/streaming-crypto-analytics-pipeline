@@ -403,6 +403,17 @@ fn parquet_optional_columns_metadata_and_atomic_publish() {
     assert!(v["mid_e9"].is_null());
 }
 #[test]
+fn cli_reports_engine_version_without_replay_arguments() {
+    let result = std::process::Command::new(env!("CARGO_BIN_EXE_engine-replay"))
+        .arg("--engine-version")
+        .output()
+        .unwrap();
+    assert!(result.status.success());
+    assert_eq!(result.stdout, format!("{ENGINE_VERSION}\n").as_bytes());
+    assert!(result.stderr.is_empty());
+}
+
+#[test]
 fn end_to_end_synthetic_day_directory() {
     let root = scratch();
     let day = "2026-10-17";

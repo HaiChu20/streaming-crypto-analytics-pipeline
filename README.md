@@ -202,6 +202,9 @@ Failed replay days stop training unless explicitly allowed with
 `--allow-missing-days`. Training uses all completed days in the work directory;
 use a separate work directory for a separate date selection, and a new version
 for each training run.
+Completed days are reused only when their Parquet `engine_version` matches the
+current engine; stale days require a new work directory or `--rebuild-stale`, which
+replays them and atomically replaces each file only after successful completion.
 
 `BTC_spot` keeps Binance BTCUSDT spot as its reference. Missing Binance/OKX perps
 or ETH do not cause fallback to another instrument: absent references are reported
