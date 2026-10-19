@@ -243,3 +243,69 @@ fn unrepresentable_mid_is_counted_and_book_invalidated_without_tick_failure() {
             .book_valid
     );
 }
+
+#[test]
+fn from_state_preserves_full_hour_windows_and_pending_flow() {
+    let root = std::env::temp_dir().join(format!(
+        "p18-state-{}-{}",
+        std::process::id(),
+        ID.fetch_add(1, Ordering::Relaxed)
+    ));
+    let date = "2026-10-17";
+    let start = engine_replay::input::day_bounds(date).unwrap().0;
+    let directory = root.join("engine").join(format!("date={date}"));
+    fs::create_dir_all(&directory).unwrap();
+    let raw = root.join("raw/okx/spot/BTC-USDT");
+    fs::create_dir_all(&raw).unwrap();
+    fs::write(raw.join("20261017_book.jsonl"), "").unwrap();
+    let mut state = Checkpoint::new(start, BTreeMap::new());
+    let cutoff = |t| Cutoff {
+        tick_ns: start + t * SECOND,
+        engine_version: ENGINE_VERSION.into(),
+        processed: BTreeMap::new(),
+    };
+    for t in 0..=3900 {
+        let record = Record::parse(&json!({"exchange":"okx","market":"spot","symbol":"BTC-USDT","feed":"l2",
+            "kind":if t==0 {"snapshot"} else {"update"}, "conn":"A","seq":t,"recv_ns":start+t*SECOND,
+            "payload":json!({"data":[{"seqId":t,"prevSeqId":t-1,"checksum":0,
+                "bids":[[format!("100.{t:08}"),(t+1).to_string()]],"asks":[["102","3"]]}]}).to_string()}).to_string()).unwrap();
+        let rows = state.apply(cutoff(t), vec![record]).unwrap();
+        if t == 3900 {
+            let row = rows.iter().find(|r| r.exchange == "okx").unwrap();
+            assert_eq!(row.memory.cov_3600s, Some(1.0));
+            assert!(row.memory.ofi10_3600s.unwrap() > 0.0);
+            assert!(row.memory.ret_3600s.unwrap() > 0.0);
+            assert!(row.memory.rv_3600s.unwrap() > 0.0);
+        }
+    }
+    let future = Record::parse(&json!({"exchange":"okx","market":"spot","symbol":"BTC-USDT","feed":"trades",
+        "kind":"trade","conn":"T","seq":1,"recv_ns":start+3901*SECOND,
+        "payload":json!({"data":[{"tradeId":"1","sz":"123456.12345678","side":"buy"}]}).to_string()}).to_string()).unwrap();
+    state.engine.consume(&future).unwrap();
+    let checkpoint = directory.join("hour_state.json");
+    state_io::save(&checkpoint, &state).unwrap();
+    let cutoffs = (3901..=3965).map(cutoff).collect::<Vec<_>>();
+    fs::write(
+        directory.join("cutoffs.jsonl"),
+        cutoffs
+            .iter()
+            .map(|c| format!("{}\n", serde_json::to_string(c).unwrap()))
+            .collect::<String>(),
+    )
+    .unwrap();
+    let mut replay = Replay::open(&root, date, Some(&checkpoint), false).unwrap();
+    let mut ideal: engine_core::features::Engine =
+        serde_json::from_slice(&serde_json::to_vec(&state.engine).unwrap()).unwrap();
+    for cutoff in cutoffs {
+        let tick = cutoff.tick_ns;
+        let live = state.apply(cutoff.clone(), vec![]).unwrap();
+        assert_eq!(
+            serde_json::to_value(&live).unwrap(),
+            serde_json::to_value(replay.tick(cutoff).unwrap()).unwrap()
+        );
+        assert_eq!(
+            serde_json::to_value(&live).unwrap(),
+            serde_json::to_value(ideal.tick(tick).unwrap()).unwrap()
+        );
+    }
+}

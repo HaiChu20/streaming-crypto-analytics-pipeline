@@ -235,7 +235,11 @@ def test_dashboard_preserves_panels_and_fixes_versioned_references():
 
 def test_live_schema_matches_rust_row_fields():
     rust = Path("engine/core/src/row.rs").read_text()
-    assert set(re.findall(r"pub (\w+):", rust)) == set(SCHEMA) - {"replay_mode"}
+    base_fields = set(re.findall(r"pub (\w+):", rust)) - {"memory"}
+    parquet = Path("engine/replay/src/output.rs").read_text().split('const SCHEMA:')[1]
+    fields = set(re.findall(r"(?:REQUIRED|OPTIONAL) \w+ (\w+)", parquet))
+    assert base_fields <= fields
+    assert fields == set(SCHEMA) - {"replay_mode"}
 
 
 def test_explicit_download_filters_artifacts_and_preserves_existing(tmp_path, monkeypatch):
@@ -397,3 +401,15 @@ def test_matrix_cache_separates_context_settings_with_same_spec_version():
     feed(svc, row(10), row(10, symbol="USDTUSD", asset="USDT", mid_e9=1_000_250_000), row(11))
     np.testing.assert_array_equal(captured[0], [[2.5]])
     assert svc.counts["predictions"] == 2
+
+
+def test_memory_features_are_numeric_and_reach_the_training_matrix():
+    rows = [row(900, vol_900s=12.5, flow_900s=-2., trades_900s=7,
+                cov_900s=.9, ofi1_900s=.2, ofi10_900s=-.3, range_bps_900s=15.,
+                l3_add_bid_900s=3, ret_900s=.01, rv_900s=.02, microprice_dev_bps=.5)]
+    matrix, features = build_matrix(pl.DataFrame(rows, schema=SCHEMA), "BTC_spot")
+    for name in ("vol_900s", "flow_900s", "trades_900s", "cov_900s", "ofi1_900s",
+                 "ofi10_900s", "range_bps_900s", "l3_add_bid_900s", "ret_900s",
+                 "rv_900s", "microprice_dev_bps"):
+        assert f"binance_spot_{name}" in features
+        assert matrix[f"binance_spot_{name}"][0] == rows[0][name]

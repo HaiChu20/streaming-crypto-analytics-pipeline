@@ -99,6 +99,8 @@ struct Order {
 #[derive(Serialize, Deserialize, Debug)]
 pub struct L3Book {
     depth: usize,
+    #[serde(default)]
+    side_counts: [i64; 4],
     sides: [BTreeMap<i64, Queue>; 2],
     where_: HashMap<String, (usize, i64)>,
 }
@@ -107,9 +109,13 @@ impl L3Book {
     pub fn new(depth: usize) -> Self {
         Self {
             depth,
+            side_counts: [0; 4],
             sides: Default::default(),
             where_: HashMap::new(),
         }
+    }
+    pub(crate) fn side_counts(&self) -> [i64; 4] {
+        self.side_counts
     }
     pub fn apply(&mut self, data: &Value, snapshot: bool) -> Result<()> {
         self.apply_counted(data, snapshot).map(|_| ())
@@ -133,6 +139,7 @@ impl L3Book {
         aggregate: Option<&mut Book>,
     ) -> Result<[i64; 3]> {
         let mut counts = [0; 3];
+        self.side_counts = [0; 4];
         let mut dirty = BTreeSet::new();
         if snapshot {
             self.sides = Default::default();
@@ -209,9 +216,15 @@ impl L3Book {
                         .get(oid)
                         .is_some_and(|(s, p)| self.top10(*s, *p));
                     match event {
-                        "add" if is_top => counts[0] += 1,
+                        "add" if is_top => {
+                            counts[0] += 1;
+                            self.side_counts[side] += 1;
+                        }
                         "modify" if was_top || is_top => counts[1] += 1,
-                        "delete" if was_top => counts[2] += 1,
+                        "delete" if was_top => {
+                            counts[2] += 1;
+                            self.side_counts[2 + before.unwrap().0] += 1;
+                        }
                         _ => {}
                     }
                 }
@@ -316,5 +329,45 @@ impl L3Book {
             }
         }
         Ok(book)
+    }
+}
+
+#[cfg(test)]
+mod flow_tests {
+    use super::*;
+    use serde_json::json;
+    #[test]
+    fn side_event_counts_use_top_ten_and_stored_delete_side() {
+        let order = |id: &str, price: i64, event: &str| {
+            json!({"order_id":id,
+            "limit_price":price.to_string(),"order_qty":"1","event":event,
+            "timestamp":"2026-10-16T00:00:01.000000000Z"})
+        };
+        let mut book = L3Book::new(100);
+        book.apply(
+            &json!({"bids":(0..11).map(|n| order(&n.to_string(),100-n,"add")).collect::<Vec<_>>(),
+            "asks":[order("ask",101,"add")]}),
+            true,
+        )
+        .unwrap();
+        assert_eq!(book.side_counts(), [0; 4]);
+        book.apply(
+            &json!({"bids":[order("newbid",102,"add"),order("far",1,"add")],
+            "asks":[order("newask",103,"add")]}),
+            false,
+        )
+        .unwrap();
+        assert_eq!(book.side_counts(), [1, 1, 0, 0]);
+        // Side in payload may differ: deletes count the stored side, as existing counts do.
+        book.apply(
+            &json!({"asks":[{"event":"delete","order_id":"0"},
+            {"event":"delete","order_id":"ask"},{"event":"delete","order_id":"far"}]}),
+            false,
+        )
+        .unwrap();
+        assert_eq!(book.side_counts(), [0, 0, 1, 1]);
+        book.apply(&json!({"bids":[order("newbid",102,"modify")]}), false)
+            .unwrap();
+        assert_eq!(book.side_counts(), [0; 4]);
     }
 }

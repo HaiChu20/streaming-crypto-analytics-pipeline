@@ -129,6 +129,8 @@ struct Bucket {
     liq_count: i64,
     liq: i128,
     l3: [i64; 3],
+    l3_sides: [i64; 4],
+    ofi: [i128; 2],
 }
 #[derive(Default, Serialize, Deserialize)]
 struct Instrument {
@@ -141,6 +143,8 @@ struct Instrument {
     #[serde(default)]
     uncertain_trades: bool,
     buckets: BTreeMap<i64, Bucket>,
+    memory: crate::windows::Memory,
+    last_tick: Option<i64>,
     history: VecDeque<Option<i64>>,
     returns: VecDeque<Option<f64>>,
     first_mid: Option<i64>,
@@ -221,7 +225,26 @@ impl Instrument {
                 *state = Some(StreamBook::new(r)?);
             }
             let state = state.as_mut().unwrap();
+            let before = state.flow_book(r).map(crate::Book::top10);
+            let factor = self
+                .gates
+                .get("l2")
+                .and_then(|g| g.factor(r))
+                .or_else(|| (r.exchange != "okx" || r.market != "perp").then_some(UNIT));
             let outcome = state.consume(r)?;
+            if outcome == Outcome::Applied
+                && let (Some(before), Some(after), Some(factor)) =
+                    (before, state.flow_book(r), factor)
+            {
+                let flow = crate::windows::ofi(&before, &after.top10());
+                let bucket = self
+                    .buckets
+                    .entry(window_tick(r.recv_ns, current_tick)?)
+                    .or_default();
+                for (total, value) in bucket.ofi.iter_mut().zip(flow) {
+                    *total += value * i128::from(factor);
+                }
+            }
             let gate = self.gates.entry(r.feed.clone()).or_default();
             if r.kind == Kind::Snapshot && !matches!(outcome, Outcome::Ignored) {
                 gate.accept(state.active_connection().unwrap_or(&r.conn));
@@ -229,12 +252,23 @@ impl Instrument {
             if matches!(outcome, Outcome::Break(_)) && !crash && r.exchange != "binance" {
                 gate.end(&r.conn);
             }
-            if r.feed == "l3" && outcome == Outcome::Applied {
+            if r.feed == "l3"
+                && outcome == Outcome::Applied
+                && state.active_connection() == Some(r.conn.as_str())
+                && state.valid()
+            {
                 let counts = state.l3_event_counts().unwrap();
                 let bucket = self
                     .buckets
                     .entry(window_tick(r.recv_ns, current_tick)?)
                     .or_default();
+                for (total, count) in bucket
+                    .l3_sides
+                    .iter_mut()
+                    .zip(state.l3_side_counts().unwrap())
+                {
+                    *total += count;
+                }
                 for (total, count) in bucket.l3.iter_mut().zip(counts) {
                     *total += count;
                 }
@@ -365,6 +399,20 @@ impl Instrument {
         Ok(())
     }
     fn row(&mut self, key: &Key, tick: i64) -> Result<Row> {
+        if let Some(last) = self.last_tick {
+            for _ in ((last + SECOND)..tick).step_by(SECOND as usize) {
+                self.history.push_back(None);
+                if self.history.len() > 3600 {
+                    self.history.pop_front();
+                }
+                self.returns.push_back(None);
+                if self.returns.len() > 300 {
+                    self.returns.pop_front();
+                }
+            }
+        }
+        self.last_tick = Some(tick);
+        let mut depth = [0; 2];
         let mut row = Row {
             exchange: key.0.clone(),
             market: key.1.clone(),
@@ -427,6 +475,7 @@ impl Instrument {
                     .iter()
                     .map(|(_, q)| i128::from(q.0))
                     .sum::<i128>();
+                depth = [total * i128::from(factor), (bid + ask) * i128::from(factor)];
                 row.bid_depth10 = Some(scale(bid, factor));
                 row.ask_depth10 = Some(scale(ask, factor));
                 if bid + ask > 0 {
@@ -455,6 +504,7 @@ impl Instrument {
         row.ret_1s = ret(1);
         row.ret_10s = ret(10);
         row.ret_60s = ret(60);
+        let long_returns = [ret(300), ret(900), ret(1800), ret(3600)];
         self.returns.push_back(row.ret_1s);
         if self.returns.len() > 300 {
             self.returns.pop_front();
@@ -474,7 +524,7 @@ impl Instrument {
         row.rv_60s = rv(60);
         row.rv_300s = rv(300);
         self.history.push_back(row.mid_e9);
-        if self.history.len() > 300 {
+        if self.history.len() > 3600 {
             self.history.pop_front();
         }
         let bucket = self.buckets.remove(&tick).unwrap_or_default();
@@ -521,6 +571,55 @@ impl Instrument {
         if fresh(self.last_recv.get("ticker").copied(), tick) {
             row.open_interest = self.oi;
         }
+        let valid = row.book_valid && !row.warmup;
+        let covered = valid && (!self.seen.contains("trades") || row.trade_count.is_some());
+        let sample = crate::windows::Sample {
+            valid: i64::from(valid),
+            covered: i64::from(covered),
+            mid: row.mid_e9.filter(|_| valid),
+            depth: if valid { depth } else { [0; 2] },
+            ofi: if valid { bucket.ofi } else { [0; 2] },
+            volume: if covered && row.volume_base.is_some() {
+                bucket.volume
+            } else {
+                0
+            },
+            flow: if covered && row.volume_base.is_some() {
+                bucket.buy - bucket.sell
+            } else {
+                0
+            },
+            trades: if covered { bucket.count } else { 0 },
+            unscaled: i64::from(
+                covered && self.seen.contains("trades") && row.volume_base.is_none(),
+            ),
+            l3: if valid { bucket.l3_sides } else { [0; 4] },
+            // The longer RVs sum every existing one-second return, just as
+            // the legacy return history does (including warmup endpoints).
+            r2: row.ret_1s.map_or(0.0, |r| r * r),
+        };
+        row.memory = self.memory.update(
+            tick,
+            sample,
+            self.seen.contains("trades"),
+            self.seen.contains("l3"),
+        );
+        for ((target, cov), ret) in [
+            (&mut row.memory.ret_300s, row.memory.cov_300s),
+            (&mut row.memory.ret_900s, row.memory.cov_900s),
+            (&mut row.memory.ret_1800s, row.memory.cov_1800s),
+            (&mut row.memory.ret_3600s, row.memory.cov_3600s),
+        ]
+        .into_iter()
+        .zip(long_returns)
+        {
+            *target = cov.filter(|v| *v > 0.0).and(ret);
+        }
+        row.memory.microprice_dev_bps = row
+            .microprice
+            .zip(row.mid)
+            .filter(|(_, mid)| *mid > 0.0)
+            .map(|(micro, mid)| (micro - mid) / mid * 10000.0);
         Ok(row)
     }
 }
@@ -817,6 +916,344 @@ impl Engine {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
+    fn message(
+        exchange: &str,
+        market: &str,
+        feed: &str,
+        kind: &str,
+        conn: &str,
+        ns: i64,
+        payload: Value,
+    ) -> Record {
+        Record::parse(
+            &json!({"exchange":exchange,"market":market,"symbol":"BTCUSDT",
+            "feed":feed,"kind":kind,"conn":conn,"seq":1,"recv_ns":ns,"payload":payload.to_string()})
+            .to_string(),
+        )
+        .unwrap()
+    }
+    fn okx(kind: &str, conn: &str, ns: i64, seq: i64, prev: i64, bid: i64, qty: i64) -> Record {
+        message(
+            "okx",
+            "spot",
+            "l2",
+            kind,
+            conn,
+            ns,
+            json!({"data":[{"seqId":seq,"prevSeqId":prev,"checksum":0,
+                "bids":[[bid.to_string(),qty.to_string()]],"asks":[["10000","3"]]}]}),
+        )
+    }
+    #[test]
+    fn ofi_hook_ignores_snapshot_invalid_resync_and_overlapping_connections() {
+        let mut state = Instrument::default();
+        state
+            .consume(&okx("snapshot", "A", 1, 1, 0, 99, 2), None)
+            .unwrap();
+        assert!(state.buckets.is_empty());
+        state
+            .consume(&okx("update", "A", 2, 2, 1, 99, 5), None)
+            .unwrap();
+        assert_eq!(state.buckets[&SECOND].ofi, [3 * i128::from(UNIT).pow(2); 2]);
+        // B is not active, even if its stream produces an update outcome.
+        state
+            .consume(&okx("update", "B", 3, 1, 0, 99, 100), None)
+            .unwrap();
+        state
+            .consume(&okx("update", "A", 4, 4, 999, 99, 100), None)
+            .unwrap();
+        // Invalid A and replacement snapshot cannot create flow.
+        state
+            .consume(&okx("update", "A", 5, 5, 4, 99, 101), None)
+            .unwrap();
+        state
+            .consume(&okx("snapshot", "C", 6, 1, 0, 100, 1000), None)
+            .unwrap();
+        state
+            .consume(&okx("update", "A", 7, 6, 5, 99, 1000), None)
+            .unwrap();
+        assert_eq!(state.buckets[&SECOND].ofi, [3 * i128::from(UNIT).pow(2); 2]);
+    }
+    #[test]
+    fn binance_sync_catchup_and_first_delta_produce_zero_ofi() {
+        for buffered in [false, true] {
+            let mut state = Instrument::default();
+            let delta = |u, qty| {
+                message(
+                    "binance",
+                    "spot",
+                    "l2",
+                    "update",
+                    "A",
+                    2,
+                    json!({"U":u,"u":u,"b":[["99",qty]],"a":[]}),
+                )
+            };
+            if buffered {
+                state.consume(&delta(2, "5"), None).unwrap();
+            }
+            state
+                .consume(
+                    &message(
+                        "binance",
+                        "spot",
+                        "l2",
+                        "snapshot",
+                        "A",
+                        1,
+                        json!({"lastUpdateId":1,"bids":[["99","2"]],"asks":[["101","3"]]}),
+                    ),
+                    None,
+                )
+                .unwrap();
+            if !buffered {
+                state.consume(&delta(2, "5"), None).unwrap();
+            }
+            assert!(state.buckets.is_empty());
+            state.consume(&delta(3, "7"), None).unwrap();
+            assert_eq!(state.buckets[&SECOND].ofi, [2 * i128::from(UNIT).pow(2); 2]);
+            // Break, then catch up buffered updates under a fresh snapshot.
+            state.consume(&delta(5, "100"), None).unwrap();
+            state.consume(&delta(7, "1000"), None).unwrap();
+            state
+                .consume(
+                    &message(
+                        "binance",
+                        "spot",
+                        "l2",
+                        "snapshot",
+                        "A",
+                        3,
+                        json!({"lastUpdateId":6,"bids":[["99","2"]],"asks":[["101","3"]]}),
+                    ),
+                    None,
+                )
+                .unwrap();
+            assert_eq!(state.buckets[&SECOND].ofi, [2 * i128::from(UNIT).pow(2); 2]);
+        }
+    }
+    #[test]
+    fn window_numerator_matches_sixty_message_buckets_and_contract_units() {
+        let key = ("okx".into(), "perp".into(), "BTCUSDT".into());
+        let mut state = Instrument {
+            first_mid: Some(-1000 * SECOND),
+            ..Default::default()
+        };
+        let mut start = okx("snapshot", "A", 1, 1, 0, 99, 1);
+        start.market = "perp".into();
+        let mut metadata = start.clone();
+        metadata.kind = Kind::Control;
+        metadata.event = Some("start".into());
+        metadata.detail = Some(json!({"instrument":{"ctVal":"0.01"}}));
+        state.consume(&metadata, None).unwrap();
+        state.consume(&start, None).unwrap();
+        let mut total = 0i128;
+        let mut depth = 0i128;
+        let mut normalized = None;
+        for t in 1..=60 {
+            let mut update = okx("update", "A", t * SECOND, t + 1, t, 99, t + 1);
+            update.market = "perp".into();
+            state.consume(&update, None).unwrap();
+            total += state.buckets[&(t * SECOND)].ofi[0];
+            depth += i128::from(t + 4) * i128::from(UNIT) * 1_000_000;
+            normalized = state.row(&key, t * SECOND).unwrap().memory.ofi1_60s;
+        }
+        assert_eq!(total, 60 * i128::from(UNIT) * 1_000_000);
+        assert_eq!(normalized, Some(2.0 * total as f64 * 60.0 / depth as f64));
+    }
+    #[test]
+    fn long_returns_ranges_and_existing_strict_rv_with_a_gap() {
+        let key = ("okx".into(), "spot".into(), "BTCUSDT".into());
+        let mut state = Instrument {
+            first_mid: Some(-1000 * SECOND),
+            ..Default::default()
+        };
+        let mut last = Row::default();
+        for t in 0..=3600 {
+            // All snapshots: no OFI, but a known varying midpoint at every tick.
+            state
+                .consume(&okx("snapshot", "A", t * SECOND, t, 0, 100 + t, 2), None)
+                .unwrap();
+            last = state.row(&key, t * SECOND).unwrap();
+        }
+        let current = (3700.0 + 10000.0) / 2.0;
+        for (lag, ret) in [
+            (300, last.memory.ret_300s),
+            (900, last.memory.ret_900s),
+            (1800, last.memory.ret_1800s),
+            (3600, last.memory.ret_3600s),
+        ] {
+            let previous = (3700.0 - lag as f64 + 10000.0) / 2.0;
+            assert!((ret.unwrap() - (current / previous).ln()).abs() < 1e-15);
+        }
+        assert_eq!(last.memory.cov_3600s, Some(1.0));
+        assert_eq!(last.memory.ofi1_10s, Some(0.0));
+        let gap = state.row(&key, 3602 * SECOND).unwrap();
+        assert!(gap.ret_1s.is_none() && gap.rv_60s.is_none() && gap.rv_300s.is_none());
+        assert_eq!(gap.memory.cov_10s, Some(0.9));
+        assert!(gap.memory.rv_3600s.unwrap() > 0.0);
+    }
+    #[test]
+    fn coverage_masks_warmup_and_unknown_trade_seconds() {
+        let key = ("okx".into(), "spot".into(), "BTCUSDT".into());
+        let mut state = Instrument::default();
+        state
+            .consume(&okx("snapshot", "A", 0, 0, 0, 99, 2), None)
+            .unwrap();
+        state.seen.insert("trades".into());
+        for t in 0..=310 {
+            state
+                .consume(&okx("snapshot", "A", t * SECOND, t, 0, 99, 2), None)
+                .unwrap();
+            if t == 305 {
+                state
+                    .buckets
+                    .entry(t * SECOND)
+                    .or_default()
+                    .malformed_trades = true;
+            }
+            let row = state.row(&key, t * SECOND).unwrap();
+            if t == 9 {
+                assert_eq!(row.memory.cov_10s, Some(0.0));
+                assert!(row.memory.vol_10s.is_none());
+            }
+            if t == 309 {
+                assert_eq!(row.memory.cov_10s, Some(0.9));
+                assert_eq!(row.memory.trades_10s, Some(0));
+            }
+        }
+    }
+    #[test]
+    fn microprice_deviation_and_cross_memory_nulls() {
+        let mut engine = Engine::default();
+        engine
+            .consume(&okx("snapshot", "A", 1, 1, 0, 100, 1))
+            .unwrap();
+        let rows = engine.tick(SECOND).unwrap();
+        let row = rows.iter().find(|r| r.exchange == "okx").unwrap();
+        let expected = (row.microprice.unwrap() - row.mid.unwrap()) / row.mid.unwrap() * 10000.0;
+        assert_eq!(row.memory.microprice_dev_bps, Some(expected));
+        let cross = rows.iter().find(|r| r.exchange == "cross").unwrap();
+        assert!(
+            serde_json::to_value(&cross.memory)
+                .unwrap()
+                .as_object()
+                .unwrap()
+                .values()
+                .all(Value::is_null)
+        );
+    }
+    #[test]
+    fn silent_seconds_age_windows_and_uncalibrated_volume_stays_unknown() {
+        let key = ("okx".into(), "perp".into(), "BTCUSDT".into());
+        let mut state = Instrument {
+            first_mid: Some(-1000 * SECOND),
+            ..Default::default()
+        };
+        let mut snapshot = okx("snapshot", "A", 1, 0, 0, 99, 2);
+        snapshot.market = "perp".into();
+        let mut start = snapshot.clone();
+        start.kind = Kind::Control;
+        start.event = Some("start".into());
+        start.detail = Some(json!({"instrument":{"ctVal":"0.01"}}));
+        state.consume(&start, None).unwrap();
+        state.consume(&snapshot, None).unwrap();
+        let trade = message(
+            "okx",
+            "perp",
+            "trades",
+            "trade",
+            "T",
+            SECOND,
+            json!({"data":[{"tradeId":"1","sz":"2","side":"buy"}]}),
+        );
+        state.consume(&trade, None).unwrap();
+        for t in 1..=61 {
+            let row = state.row(&key, t * SECOND).unwrap();
+            if t == 10 {
+                assert_eq!(row.memory.cov_10s, Some(1.0));
+                assert_eq!(row.memory.trades_10s, Some(1));
+                assert!(row.memory.vol_10s.is_none() && row.memory.flow_10s.is_none());
+            }
+            if t == 60 {
+                assert_eq!(row.memory.cov_60s, Some(1.0));
+            }
+            if t == 61 {
+                assert_eq!(row.memory.cov_60s, Some(59.0 / 60.0));
+            }
+        }
+    }
+    #[test]
+    fn partial_rv_uses_only_existing_log_returns_and_strict_rv_stays_null() {
+        let key = ("okx".into(), "spot".into(), "BTCUSDT".into());
+        let mut state = Instrument {
+            first_mid: Some(-1000 * SECOND),
+            ..Default::default()
+        };
+        for t in 0..=903 {
+            let mid = match t {
+                900 => 110,
+                901 => 99,
+                _ => 100,
+            };
+            let payload = json!({"data":[{"seqId":t,"prevSeqId":0,"checksum":0,
+                "bids":[[(mid-1).to_string(),"1"]],"asks":[[(mid+1).to_string(),"1"]]}]});
+            let record = message("okx", "spot", "l2", "snapshot", "A", t * SECOND, payload);
+            state.consume(&record, None).unwrap();
+            if t == 902 {
+                state.l2.as_mut().unwrap().invalidate_malformed("A");
+            }
+            let row = state.row(&key, t * SECOND).unwrap();
+            if t == 903 {
+                let expected = (1.1_f64.ln().powi(2) + 0.9_f64.ln().powi(2)).sqrt();
+                // Reuse a fresh connection after the invalidation below.
+                assert!((row.memory.rv_900s.unwrap() - expected).abs() < 1e-14);
+                assert!(row.rv_60s.is_none() && row.rv_300s.is_none());
+            }
+            if t == 902 {
+                // Replace only the source before the following snapshot.
+                let replacement = message(
+                    "okx",
+                    "spot",
+                    "l2",
+                    "snapshot",
+                    "B",
+                    903 * SECOND,
+                    json!({"data":[{"seqId":903,"prevSeqId":0,"checksum":0,"bids":[["99","1"]],"asks":[["101","1"]]}]}),
+                );
+                state.consume(&replacement, None).unwrap();
+            }
+        }
+    }
+    #[test]
+    fn long_rv_includes_existing_warmup_returns_once_window_has_coverage() {
+        let key = ("okx".into(), "spot".into(), "BTCUSDT".into());
+        let mut state = Instrument::default();
+        for t in 0..=900 {
+            let mid = if t < 100 { 100 } else { 110 };
+            state
+                .consume(
+                    &message(
+                        "okx",
+                        "spot",
+                        "l2",
+                        "snapshot",
+                        "A",
+                        t * SECOND,
+                        json!({"data":[{"seqId":t,"prevSeqId":0,"checksum":0,
+                "bids":[[(mid-1).to_string(),"1"]],"asks":[[(mid+1).to_string(),"1"]]}]}),
+                    ),
+                    None,
+                )
+                .unwrap();
+            let row = state.row(&key, t * SECOND).unwrap();
+            if t == 900 {
+                assert!(row.memory.cov_900s.unwrap() > 0.0);
+                assert!((row.memory.rv_900s.unwrap() - 1.1_f64.ln()).abs() < 1e-15);
+            }
+        }
+    }
     #[test]
     fn trade_ids_are_bounded_and_recent_duplicates_rejected() {
         let mut state = Instrument::default();

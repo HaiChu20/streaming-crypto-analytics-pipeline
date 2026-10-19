@@ -16,6 +16,9 @@ pub(crate) struct Sync {
 }
 
 impl Sync {
+    pub(crate) fn synced(&self) -> bool {
+        self.last.is_some() && !self.waiting
+    }
     pub fn apply(
         &mut self,
         book: &mut Book,
@@ -132,6 +135,7 @@ impl Sync {
             self.waiting = false;
             self.last = Some(end);
         }
+        self.waiting = false;
         book.arrays(data, "b", "a")?;
         Ok(Outcome::Applied)
     }

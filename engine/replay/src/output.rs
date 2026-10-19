@@ -70,16 +70,16 @@ impl Writer {
             }};
         }
         macro_rules! optional {
-            ($kind:ty, $field:ident) => {{
+            ($kind:ty, $($field:ident).+) => {{
                 let values = self
                     .rows
                     .iter()
-                    .filter_map(|r| r.$field)
+                    .filter_map(|r| r.$($field).+)
                     .collect::<Vec<_>>();
                 let defs = self
                     .rows
                     .iter()
-                    .map(|r| i16::from(r.$field.is_some()))
+                    .map(|r| i16::from(r.$($field).+.is_some()))
                     .collect::<Vec<_>>();
                 let mut column = group.next_column()?.unwrap();
                 column
@@ -132,6 +132,80 @@ impl Writer {
         optional!(DoubleType, spot_dev_bps_okx);
         optional!(DoubleType, spot_dev_bps_kraken);
         optional!(DoubleType, book_age_ms);
+        optional!(DoubleType, memory.cov_10s);
+        optional!(DoubleType, memory.vol_10s);
+        optional!(DoubleType, memory.flow_10s);
+        optional!(Int64Type, memory.trades_10s);
+        optional!(DoubleType, memory.ofi1_10s);
+        optional!(DoubleType, memory.ofi10_10s);
+        optional!(DoubleType, memory.range_bps_10s);
+        optional!(Int64Type, memory.l3_add_bid_10s);
+        optional!(Int64Type, memory.l3_add_ask_10s);
+        optional!(Int64Type, memory.l3_del_bid_10s);
+        optional!(Int64Type, memory.l3_del_ask_10s);
+        optional!(DoubleType, memory.cov_60s);
+        optional!(DoubleType, memory.vol_60s);
+        optional!(DoubleType, memory.flow_60s);
+        optional!(Int64Type, memory.trades_60s);
+        optional!(DoubleType, memory.ofi1_60s);
+        optional!(DoubleType, memory.ofi10_60s);
+        optional!(DoubleType, memory.range_bps_60s);
+        optional!(Int64Type, memory.l3_add_bid_60s);
+        optional!(Int64Type, memory.l3_add_ask_60s);
+        optional!(Int64Type, memory.l3_del_bid_60s);
+        optional!(Int64Type, memory.l3_del_ask_60s);
+        optional!(DoubleType, memory.cov_300s);
+        optional!(DoubleType, memory.vol_300s);
+        optional!(DoubleType, memory.flow_300s);
+        optional!(Int64Type, memory.trades_300s);
+        optional!(DoubleType, memory.ofi1_300s);
+        optional!(DoubleType, memory.ofi10_300s);
+        optional!(DoubleType, memory.range_bps_300s);
+        optional!(Int64Type, memory.l3_add_bid_300s);
+        optional!(Int64Type, memory.l3_add_ask_300s);
+        optional!(Int64Type, memory.l3_del_bid_300s);
+        optional!(Int64Type, memory.l3_del_ask_300s);
+        optional!(DoubleType, memory.cov_900s);
+        optional!(DoubleType, memory.vol_900s);
+        optional!(DoubleType, memory.flow_900s);
+        optional!(Int64Type, memory.trades_900s);
+        optional!(DoubleType, memory.ofi1_900s);
+        optional!(DoubleType, memory.ofi10_900s);
+        optional!(DoubleType, memory.range_bps_900s);
+        optional!(Int64Type, memory.l3_add_bid_900s);
+        optional!(Int64Type, memory.l3_add_ask_900s);
+        optional!(Int64Type, memory.l3_del_bid_900s);
+        optional!(Int64Type, memory.l3_del_ask_900s);
+        optional!(DoubleType, memory.cov_1800s);
+        optional!(DoubleType, memory.vol_1800s);
+        optional!(DoubleType, memory.flow_1800s);
+        optional!(Int64Type, memory.trades_1800s);
+        optional!(DoubleType, memory.ofi1_1800s);
+        optional!(DoubleType, memory.ofi10_1800s);
+        optional!(DoubleType, memory.range_bps_1800s);
+        optional!(Int64Type, memory.l3_add_bid_1800s);
+        optional!(Int64Type, memory.l3_add_ask_1800s);
+        optional!(Int64Type, memory.l3_del_bid_1800s);
+        optional!(Int64Type, memory.l3_del_ask_1800s);
+        optional!(DoubleType, memory.cov_3600s);
+        optional!(DoubleType, memory.vol_3600s);
+        optional!(DoubleType, memory.flow_3600s);
+        optional!(Int64Type, memory.trades_3600s);
+        optional!(DoubleType, memory.ofi1_3600s);
+        optional!(DoubleType, memory.ofi10_3600s);
+        optional!(DoubleType, memory.range_bps_3600s);
+        optional!(Int64Type, memory.l3_add_bid_3600s);
+        optional!(Int64Type, memory.l3_add_ask_3600s);
+        optional!(Int64Type, memory.l3_del_bid_3600s);
+        optional!(Int64Type, memory.l3_del_ask_3600s);
+        optional!(DoubleType, memory.ret_300s);
+        optional!(DoubleType, memory.ret_900s);
+        optional!(DoubleType, memory.ret_1800s);
+        optional!(DoubleType, memory.ret_3600s);
+        optional!(DoubleType, memory.rv_900s);
+        optional!(DoubleType, memory.rv_1800s);
+        optional!(DoubleType, memory.rv_3600s);
+        optional!(DoubleType, memory.microprice_dev_bps);
         required!(ByteArrayType, |r: &Row| ByteArray::from(r.asset.as_str()));
         group.close()?;
         self.rows.clear();
@@ -187,5 +261,79 @@ const SCHEMA: &str = r#"message features {
   OPTIONAL DOUBLE spot_dev_bps_okx;
   OPTIONAL DOUBLE spot_dev_bps_kraken;
   OPTIONAL DOUBLE book_age_ms;
+  OPTIONAL DOUBLE cov_10s;
+  OPTIONAL DOUBLE vol_10s;
+  OPTIONAL DOUBLE flow_10s;
+  OPTIONAL INT64 trades_10s;
+  OPTIONAL DOUBLE ofi1_10s;
+  OPTIONAL DOUBLE ofi10_10s;
+  OPTIONAL DOUBLE range_bps_10s;
+  OPTIONAL INT64 l3_add_bid_10s;
+  OPTIONAL INT64 l3_add_ask_10s;
+  OPTIONAL INT64 l3_del_bid_10s;
+  OPTIONAL INT64 l3_del_ask_10s;
+  OPTIONAL DOUBLE cov_60s;
+  OPTIONAL DOUBLE vol_60s;
+  OPTIONAL DOUBLE flow_60s;
+  OPTIONAL INT64 trades_60s;
+  OPTIONAL DOUBLE ofi1_60s;
+  OPTIONAL DOUBLE ofi10_60s;
+  OPTIONAL DOUBLE range_bps_60s;
+  OPTIONAL INT64 l3_add_bid_60s;
+  OPTIONAL INT64 l3_add_ask_60s;
+  OPTIONAL INT64 l3_del_bid_60s;
+  OPTIONAL INT64 l3_del_ask_60s;
+  OPTIONAL DOUBLE cov_300s;
+  OPTIONAL DOUBLE vol_300s;
+  OPTIONAL DOUBLE flow_300s;
+  OPTIONAL INT64 trades_300s;
+  OPTIONAL DOUBLE ofi1_300s;
+  OPTIONAL DOUBLE ofi10_300s;
+  OPTIONAL DOUBLE range_bps_300s;
+  OPTIONAL INT64 l3_add_bid_300s;
+  OPTIONAL INT64 l3_add_ask_300s;
+  OPTIONAL INT64 l3_del_bid_300s;
+  OPTIONAL INT64 l3_del_ask_300s;
+  OPTIONAL DOUBLE cov_900s;
+  OPTIONAL DOUBLE vol_900s;
+  OPTIONAL DOUBLE flow_900s;
+  OPTIONAL INT64 trades_900s;
+  OPTIONAL DOUBLE ofi1_900s;
+  OPTIONAL DOUBLE ofi10_900s;
+  OPTIONAL DOUBLE range_bps_900s;
+  OPTIONAL INT64 l3_add_bid_900s;
+  OPTIONAL INT64 l3_add_ask_900s;
+  OPTIONAL INT64 l3_del_bid_900s;
+  OPTIONAL INT64 l3_del_ask_900s;
+  OPTIONAL DOUBLE cov_1800s;
+  OPTIONAL DOUBLE vol_1800s;
+  OPTIONAL DOUBLE flow_1800s;
+  OPTIONAL INT64 trades_1800s;
+  OPTIONAL DOUBLE ofi1_1800s;
+  OPTIONAL DOUBLE ofi10_1800s;
+  OPTIONAL DOUBLE range_bps_1800s;
+  OPTIONAL INT64 l3_add_bid_1800s;
+  OPTIONAL INT64 l3_add_ask_1800s;
+  OPTIONAL INT64 l3_del_bid_1800s;
+  OPTIONAL INT64 l3_del_ask_1800s;
+  OPTIONAL DOUBLE cov_3600s;
+  OPTIONAL DOUBLE vol_3600s;
+  OPTIONAL DOUBLE flow_3600s;
+  OPTIONAL INT64 trades_3600s;
+  OPTIONAL DOUBLE ofi1_3600s;
+  OPTIONAL DOUBLE ofi10_3600s;
+  OPTIONAL DOUBLE range_bps_3600s;
+  OPTIONAL INT64 l3_add_bid_3600s;
+  OPTIONAL INT64 l3_add_ask_3600s;
+  OPTIONAL INT64 l3_del_bid_3600s;
+  OPTIONAL INT64 l3_del_ask_3600s;
+  OPTIONAL DOUBLE ret_300s;
+  OPTIONAL DOUBLE ret_900s;
+  OPTIONAL DOUBLE ret_1800s;
+  OPTIONAL DOUBLE ret_3600s;
+  OPTIONAL DOUBLE rv_900s;
+  OPTIONAL DOUBLE rv_1800s;
+  OPTIONAL DOUBLE rv_3600s;
+  OPTIONAL DOUBLE microprice_dev_bps;
   REQUIRED BINARY asset (UTF8);
 }"#;

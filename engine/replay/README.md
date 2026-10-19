@@ -137,6 +137,48 @@ version is the shared `engine_core::ENGINE_VERSION`.
   Realized volatility is `sqrt(sum(ret_1s^2))`, not annualized, requiring every
   one-second return in the 60/300-second window. Warm-up lasts until 300 elapsed
   seconds after the first valid midpoint, including periods of invalidity.
+- Memory windows use `W = 10, 60, 300, 900, 1800, 3600` seconds and suffix
+  `_{W}s`. Each market retains 3,600 one-second buckets, with exact integer
+  add/evict sums and rolling midpoint extrema. Skipped ticks occupy missing
+  seconds. All 74 new columns remain null on `cross` rows.
+  `cov_{W}s` is null until W buckets have elapsed since this market's first tick;
+  then it is the fraction with a non-warmup valid book and, if trades were seen,
+  known trades (the same rule as non-null `trade_count`). Other window fields
+  are null until full or when coverage is zero. `vol_`, `flow_` (buy minus sell),
+  and `trades_` sum covered seconds in calibrated base units/counts; markets
+  without trades keep these null. If covered trade counts exist but contract
+  calibration is missing, `vol_`/`flow_` stay null until those buckets evict;
+  counts and coverage remain available. A silent but valid feed retains today's
+  known-zero semantics; a book expires after the existing 60-second timeout.
+- `ofi1_{W}s` and `ofi10_{W}s` sum Cont OFI by rank (level 1 or levels 1–10),
+  divided by mean side depth at those levels over non-warmup valid ticks.
+  Depth and OFI use identical contract scaling; a zero mean depth yields null.
+  Each applied exchange message compares its immediately preceding/following
+  active L2 book, with fixed-size top-ten arrays and i128 accumulation. A side
+  missing that rank at either endpoint contributes zero. Binance OFI is per
+  **100 ms depth batch**, and multi-level Kraken/OKX updates are one message.
+  Snapshots, resyncs/catch-up, connection switches, invalid books, and non-active
+  connections contribute **zero OFI**. Attribution follows the same receive-time
+  bucket/late-record clamp as trades. Valid tick buckets supply the numerator
+  and depth; trade uncertainty lowers coverage without discarding valid book flow.
+- `range_bps_{W}s` is `(max_mid_e9-min_mid_e9)/current_mid_e9*10000` over
+  non-warmup valid ticks; extrema stay integer until the final ratio.
+  `ret_{300,900,1800,3600}s` use the existing log-return endpoint rule, also
+  gated by window coverage. `rv_{900,1800,3600}s` is the square root of the sum
+  of all existing one-second log returns squared, including warmup endpoints
+  and allowing gaps (coverage gating still applies); the existing strict `rv_60s`/`rv_300s` semantics are unchanged.
+- Kraken spot `l3_{add,del}_{bid,ask}_{W}s` sum per-side event counts over valid
+  buckets, using the existing top-ten rules (stored side before deletes, rank
+  after adds). Snapshots count zero; modifications do not become adds/deletes.
+  Markets without L3 keep these null; existing `l3_*_1s` fields remain.
+  `microprice_dev_bps` is `(microprice-mid)/mid*10000`, null if unavailable.
+- Checkpoints/start states serialize the ring, sums, extrema, return history,
+  pending bucket OFI/L3 counts and sync eligibility. The version is bumped to
+  `features-v3`; older-version checkpoints are rejected. Numeric columns are
+  automatically selected by `research/dataset.py`; inference explicitly includes
+  them. Dashboard SQL stays unchanged: ClickHouse's Kafka engine defaults to
+  skipping unknown JSON fields, so dashboard ingestion tolerates new features
+  ([upstream implementation](https://github.com/ClickHouse/ClickHouse/blob/master/src/Storages/Kafka/StorageKafkaUtils.cpp)).
 - Funding values are the native fields requested by the spec, without assuming
   identical exchange units/periods. Kraken ticker mark/open interest and Binance
   mark/funding are carried until their active stream ends or its receive age

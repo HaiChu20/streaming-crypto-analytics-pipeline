@@ -139,3 +139,77 @@ fn users_v3_archive_replays_every_pair_and_validates_all_books() {
         println!("fixture {date}: {report}");
     }
 }
+
+#[test]
+fn fixture_ofi_windows_cover_all_four_market_types_and_restart_identically() {
+    use engine_core::{SECOND, features::Engine};
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/archive");
+    let mut seen = BTreeSet::new();
+    for date in ["2026-09-15", "2026-10-08"] {
+        let mut merge = Merge::new(discover(&root, date, false).unwrap()).unwrap();
+        let mut engine = Engine::default();
+        let mut head = merge.pop().unwrap();
+        let first = head.as_ref().unwrap().recv_ns as i64;
+        let mut tick = first.div_euclid(SECOND) * SECOND;
+        // These archives are shorter than the 300-second warmup. Prime only
+        // with each fixture's initial L2 snapshot; snapshots add no OFI.
+        let mut initial = std::collections::BTreeMap::new();
+        let mut scan = Merge::new(discover(&root, date, false).unwrap()).unwrap();
+        while let Some(record) = scan.pop().unwrap() {
+            if record.feed == "l2" && record.kind == engine_core::Kind::Snapshot {
+                initial
+                    .entry((
+                        record.exchange.clone(),
+                        record.market.clone(),
+                        record.symbol.clone(),
+                    ))
+                    .or_insert(record);
+            }
+        }
+        for prime in (tick - 300 * SECOND..tick).step_by(SECOND as usize) {
+            for snapshot in initial.values() {
+                let mut snapshot = snapshot.clone();
+                snapshot.recv_ns = i128::from(prime);
+                engine.consume(&snapshot).unwrap();
+            }
+            engine.tick(prime).unwrap();
+        }
+        let mut restarted = None;
+        while head.is_some() {
+            while head.as_ref().is_some_and(|r| r.recv_ns <= i128::from(tick)) {
+                let record = head.take().unwrap();
+                engine.consume(&record).unwrap();
+                if let Some(restored) = &mut restarted {
+                    Engine::consume(restored, &record).unwrap();
+                }
+                head = merge.pop().unwrap();
+            }
+            let rows = engine.tick(tick).unwrap();
+            if let Some(restored) = &mut restarted {
+                assert_eq!(
+                    serde_json::to_value(&rows).unwrap(),
+                    serde_json::to_value(restored.tick(tick).unwrap()).unwrap()
+                );
+            }
+            for row in rows {
+                if row.memory.ofi1_10s.is_some() && row.memory.ofi10_10s.is_some() {
+                    seen.insert(format!("{}/{}", row.exchange, row.market));
+                }
+            }
+            if tick == first.div_euclid(SECOND) * SECOND + 10 * SECOND {
+                restarted = Some(
+                    serde_json::from_slice::<Engine>(&serde_json::to_vec(&engine).unwrap())
+                        .unwrap(),
+                );
+            }
+            tick += SECOND;
+        }
+    }
+    assert_eq!(
+        seen,
+        ["binance/spot", "okx/spot", "kraken/spot", "kraken/perp"]
+            .into_iter()
+            .map(String::from)
+            .collect()
+    );
+}

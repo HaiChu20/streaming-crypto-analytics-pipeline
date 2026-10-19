@@ -50,6 +50,17 @@ impl Book {
                 .collect(),
         }
     }
+    /// Allocation-free rank snapshot for message-level OFI.
+    pub(crate) fn top10(&self) -> [[Option<(i64, i64)>; 10]; 2] {
+        let mut levels = [[None; 10]; 2];
+        for (slot, (price, level)) in levels[0].iter_mut().zip(self.bids.iter().rev()) {
+            *slot = Some((*price, level.size));
+        }
+        for (slot, (price, level)) in levels[1].iter_mut().zip(&self.asks) {
+            *slot = Some((*price, level.size));
+        }
+        levels
+    }
     pub fn mid(&self) -> Option<Mid> {
         Some(Mid((i128::from(self.best_bid()?.0.0)
             + i128::from(self.best_ask()?.0.0))

@@ -101,7 +101,12 @@ fn main() -> Result<()> {
                         | "basis_bps_kraken"
                         | "spot_dev_bps_okx"
                         | "spot_dev_bps_kraken"
-                ) {
+                ) || name.starts_with("ret_")
+                    || name.starts_with("range_bps_")
+                    || name == "microprice_dev_bps"
+                {
+                    // Historical OFI/volatility may remain populated until their
+                    // window expires. Endpoint-based fields require a current mid.
                     assert!(
                         matches!(value, parquet::record::Field::Null),
                         "non-null frozen tail field {name}"

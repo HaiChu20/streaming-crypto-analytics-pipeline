@@ -29,6 +29,13 @@ FLOATS = """book_age_ms best_bid best_ask mid microprice spread_bps bid_depth10 
 imbalance10 volume_base taker_buy_base taker_sell_base ret_1s ret_10s ret_60s rv_60s rv_300s
 funding_rate mark_price open_interest liq_base_1s basis_bps_binance basis_bps_okx
 basis_bps_kraken spot_dev_bps_okx spot_dev_bps_kraken""".split()
+WINDOWS = (10, 60, 300, 900, 1800, 3600)
+INTS += [f"{name}_{w}s" for w in WINDOWS
+         for name in ("trades", "l3_add_bid", "l3_add_ask", "l3_del_bid", "l3_del_ask")]
+FLOATS += [f"{name}_{w}s" for w in WINDOWS
+           for name in ("cov", "vol", "flow", "ofi1", "ofi10", "range_bps")]
+FLOATS += [f"ret_{w}s" for w in (300, 900, 1800, 3600)]
+FLOATS += [f"rv_{w}s" for w in (900, 1800, 3600)] + ["microprice_dev_bps"]
 SCHEMA = {**dict.fromkeys(STRINGS, pl.String), **dict.fromkeys(BOOLS, pl.Boolean),
           **dict.fromkeys(INTS, pl.Int64), **dict.fromkeys(FLOATS, pl.Float64),
           "replay_mode": pl.String}

@@ -8,9 +8,10 @@ pub mod kraken;
 mod okx;
 pub mod row;
 pub mod session;
+pub mod windows;
 
 pub const SECOND: i64 = 1_000_000_000;
-pub const ENGINE_VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), "-features-v2");
+pub const ENGINE_VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), "-features-v3");
 
 pub use book::{Book, Side};
 pub use fixed::{Fixed, Mid};
@@ -296,6 +297,28 @@ impl StreamBook {
             .and_then(|id| self.connections.get(id))
             .filter(|c| c.valid && c.l3.is_some())
             .map(|c| c.l3_counts)
+    }
+    /// Only an already-synced, active, uncrossed L2 book can supply OFI.
+    pub(crate) fn flow_book(&self, record: &Record) -> Option<&Book> {
+        if self.feed != "l2"
+            || record.kind != Kind::Update
+            || self.active.as_deref() != Some(&record.conn)
+        {
+            return None;
+        }
+        let connection = self.connections.get(&record.conn)?;
+        if !connection.valid || (self.exchange == "binance" && !connection.sync.synced()) {
+            return None;
+        }
+        let book = &connection.book;
+        (book.best_bid()?.0 < book.best_ask()?.0).then_some(book)
+    }
+    pub fn l3_side_counts(&self) -> Option<[i64; 4]> {
+        let connection = self.connections.get(self.active.as_ref()?)?;
+        connection
+            .valid
+            .then(|| connection.l3.as_ref().map(|l3| l3.side_counts()))
+            .flatten()
     }
     pub fn active_connection(&self) -> Option<&str> {
         self.active.as_deref()

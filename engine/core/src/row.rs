@@ -2,6 +2,8 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct Row {
+    #[serde(flatten)]
+    pub memory: crate::windows::MemoryColumns,
     pub exchange: String,
     pub market: String,
     pub symbol: String,
