@@ -5,6 +5,7 @@ from pathlib import Path
 import polars as pl
 import pyarrow.parquet as pq
 
+from research.calendar import Calendar, calendar_features
 from research.labels import NS, load_spec, momentum_900s, reference_for, reference_rows
 
 # Absolute prices are non-stationary. Timestamps/provenance never enter X.
@@ -56,7 +57,8 @@ def asset_expr() -> pl.Expr:
 
 
 def build_matrix(rows: pl.DataFrame, target: str, stride_s: int = 10,
-                 spec: dict | None = None) -> tuple[pl.DataFrame, list[str]]:
+                 spec: dict | None = None, *,
+                 calendar: Calendar | None = None) -> tuple[pl.DataFrame, list[str]]:
     if stride_s <= 0:
         raise ValueError("stride_s must be positive")
     spec = spec or load_spec()
@@ -132,5 +134,8 @@ def build_matrix(rows: pl.DataFrame, target: str, stride_s: int = 10,
                 matrix = matrix.with_columns(expressions)
     matrix = matrix.join(momentum_900s(rows, target, spec), on="tick_ns", how="left")
     matrix = matrix.with_columns(pl.lit(asset).alias("asset")).sort("tick_ns")
+    if spec.get("calendar"):
+        cal = calendar or Calendar.load(spec["calendar"])
+        matrix = matrix.hstack(calendar_features(matrix["tick_ns"], cal))
     features = sorted(c for c in matrix.columns if c not in NON_FEATURES)
     return matrix, features

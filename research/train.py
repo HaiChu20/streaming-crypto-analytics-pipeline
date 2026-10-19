@@ -10,6 +10,7 @@ import lightgbm as lgb
 import numpy as np
 import polars as pl
 
+from research.calendar import Calendar
 from research.dataset import build_matrix, feature_paths, read_features
 from research.labels import NS, load_spec, make_labels, reference_for, reference_present
 
@@ -120,7 +121,8 @@ def train_target(rows: pl.DataFrame, target: str, horizon_s: int, output_root: s
                "status": "skipped", "reference": reference_for(target, spec)}
     if not reference_present(rows, target, spec):
         return dict(skipped, reason="reference instrument has no rows in input")
-    matrix, features = build_matrix(rows, target, stride_s, spec)
+    calendar = Calendar.load(spec["calendar"]) if spec.get("calendar") else None
+    matrix, features = build_matrix(rows, target, stride_s, spec, calendar=calendar)
     labeled = matrix.join(make_labels(rows, target, horizon_s, spec), on="tick_ns", how="left")
     # A delayed emission after the target endpoint cannot be a forecast.
     data = labeled.filter(pl.col("return_pct").is_not_null()
@@ -203,6 +205,8 @@ def train_target(rows: pl.DataFrame, target: str, horizon_s: int, output_root: s
                    "These metrics are not trading P&L; no fees/spread/funding execution backtest.",
         "model_dir": str(directory),
     }
+    if calendar:
+        report["calendar"] = calendar.metadata(int(ticks[-1]))
     (directory / "metadata.json").write_text(json.dumps(report, indent=2, allow_nan=False) + "\n")
     return report
 

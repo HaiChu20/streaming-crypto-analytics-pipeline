@@ -163,6 +163,31 @@ Binance reference and shows directional hit rate for matured, non-flat outcomes
 in the visible range. Roughly nine-hour models verify plumbing only; several
 weeks are needed for meaningful evaluation.
 
+### Event calendar
+
+`config/events.csv` is the shared source for training and live inference. It adds
+UTC hour/weekday clocks, weekday NYSE regular hours (holidays are not modeled),
+minutes to/since CPI, Employment Situation (NFP) and FOMC statements, Deribit
+08:00 UTC expiries, and a provisional 00:00/08:00/16:00 UTC funding clock for
+Binance/OKX BTC/ETH perps. Feed-derived funding times will replace that clock.
+Sources are the [BLS archives and schedule](https://www.bls.gov/schedule/news_release/bls.ics)
+and [Fed meeting calendar](https://www.federalreserve.gov/monetarypolicy/fomccalendars.htm).
+
+Update from the repo root with
+`PYTHON_DOTENV_DISABLED=1 uv run python -m scripts.update_events` (`--dry-run`
+prints the diff). Past release corrections/removals and reduced coverage require
+`--accept-changes`; blocked sources abort without changing the file. The initial
+BLS fetch returned HTTP 403, so the supplied actual dates are complete through
+2026-10-31; future BLS schedules must be refreshed before extending coverage.
+Macro features require seven complete days of schedule on both sides of each
+tick; they are null outside that window. Live predictions use the same margin,
+so `covers_through` must be at least seven days ahead. With the current coverage,
+the final eligible tick is 2026-10-25T00:00:00Z; run `scripts/update_events.py` to
+extend it. Clock, expiry and funding features always compute. Training stores
+the file SHA256, coverage and releases through seven days after training ends.
+Live inference checks these, accepts changes beyond that training lookahead,
+and skips ticks without the required coverage.
+
 ## Daily report
 
 ```bash

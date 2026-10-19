@@ -26,8 +26,10 @@ def row(second, **updates):
 
 
 def metadata(features=None):
+    spec = load_spec()
+    spec.pop("calendar", None)  # Legacy model fixtures use epoch-0 ticks.
     return dict(target="BTC_spot", horizon_s=900, version="test", stride_s=10,
-                label_spec=load_spec(), features=features or ["binance_spot_spread_bps"],
+                label_spec=spec, features=features or ["binance_spot_spread_bps"],
                 engine_version=["test"], replay_modes=["as_live"], classifier_class_order=[-1, 0, 1])
 
 
@@ -60,7 +62,7 @@ def test_parity_full_multinstrument_frame_and_online_ticks():
         rows.append(row(t, exchange="cross", market="cross", symbol="BTC", basis_bps_binance=1.5))
         rows.append(row(t, symbol="ETHUSDT", spread_bps=999.))
     frame = pl.DataFrame(rows, schema=SCHEMA)
-    matrix, features = build_matrix(frame, "BTC_spot")
+    matrix, features = build_matrix(frame, "BTC_spot", spec=metadata()["label_spec"])
     # Deliberately use metadata order and include a producible but absent instrument.
     features = list(reversed(features)) + ["kraken_spot_spread_bps"]
     meta = metadata(features)
@@ -300,7 +302,7 @@ def test_matrices_shared_across_horizons_reindexed_per_model_and_reset_per_tick(
 
 
 @pytest.mark.parametrize('change', [{'target': 'BTC_perp'}, {'stride_s': 20},
-                                   {'label_spec': {**load_spec(), 'version': 'v2'}}])
+                                   {'label_spec': {**metadata()['label_spec'], 'version': 'v2'}}])
 def test_matrix_cache_separates_target_stride_and_spec_version(monkeypatch, change):
     import inference.service as module
     original = module.build_matrix
@@ -337,7 +339,7 @@ def test_asset_field_matches_rust_and_clickhouse():
 
 
 def test_context_trained_models_match_live_vectors_and_missing_context_nulls(tmp_path):
-    spec = {**load_spec(), "context_assets": ["USDT"]}
+    spec = {**metadata()["label_spec"], "context_assets": ["USDT"]}
     rows = []
     for second in range(0, 7201, 10):
         rows.append(row(second, asset="BTC", mid_e9=100 * NS + int(200_000_000 * np.sin(second / 170)),
@@ -392,7 +394,7 @@ def test_context_trained_models_match_live_vectors_and_missing_context_nulls(tmp
 
 def test_matrix_cache_separates_context_settings_with_same_spec_version():
     plain = service().models[0]
-    plain.metadata["label_spec"] = {**load_spec(), "context_assets": []}
+    plain.metadata["label_spec"] = {**metadata()["label_spec"], "context_assets": []}
     context = service().models[0]
     context.metadata["features"] = ["ctx_usdt_binance_spot_premium_bps"]
     captured = []

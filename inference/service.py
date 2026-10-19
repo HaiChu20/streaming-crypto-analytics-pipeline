@@ -18,6 +18,7 @@ import numpy as np
 import polars as pl
 
 from collectors.common.config import kafka_bootstrap
+from research.calendar import Calendar, verify_calendar
 from research.dataset import build_matrix
 from research.labels import NS, load_spec, reference_for
 
@@ -69,6 +70,7 @@ class Model:
     regressor: lgb.Booster
     classifier: lgb.Booster
     warned: bool = False
+    calendar_warned: bool = False
 
 
 def download_models(root, version, targets=None, horizons=None):
@@ -106,6 +108,12 @@ def load_models(root, version, targets=None, horizons=None):
         if ((meta["target"], meta["horizon_s"], meta["version"]) != (target, horizon, version)
                 or not 0 < horizon <= 65535 or type(meta["stride_s"]) is not int or meta["stride_s"] <= 0):
             raise ValueError(f"Invalid model identity/stride: {path}")
+        if meta["label_spec"].get("calendar"):
+            try:
+                verify_calendar(Calendar.load(meta["label_spec"]["calendar"]), meta)
+            except (ValueError, KeyError, OSError) as exc:
+                LOG.error("Refusing model %s: calendar validation failed: %s", path, exc)
+                continue
         features = meta["features"]
         possible = _supported_features(meta)
         if not features or len(set(features)) != len(features) or set(features) - possible:
@@ -121,9 +129,10 @@ def load_models(root, version, targets=None, horizons=None):
     return models
 
 
-def _matrix_for(rows, history, meta):
+def _matrix_for(rows, history, meta, calendar=None):
     frame = pl.DataFrame([*history, *rows], schema=SCHEMA)
-    matrix, _ = build_matrix(frame, meta["target"], meta["stride_s"], meta["label_spec"])
+    options = {"calendar": calendar} if calendar is not None else {}
+    matrix, _ = build_matrix(frame, meta["target"], meta["stride_s"], meta["label_spec"], **options)
     return matrix.filter(pl.col("tick_ns") == rows[0]["tick_ns"])
 
 
@@ -192,7 +201,7 @@ class Service:
             self.history.popleft()
         started = time.perf_counter()
         due = False
-        matrices = {}
+        matrices, calendars = {}, {}
         for model in self.models:
             meta = model.metadata
             if self.tick % (meta["stride_s"] * NS):
@@ -209,6 +218,23 @@ class Service:
                 self.skipped[reason] += 1
                 continue
             try:
+                calendar = None
+                if meta["label_spec"].get("calendar"):
+                    path = meta["label_spec"]["calendar"]
+                    if path not in calendars:
+                        calendars[path] = Calendar.load(path)
+                    calendar = calendars[path]
+                    verify_calendar(calendar, meta)
+                    if not calendar.contains(self.tick):
+                        self.skipped["calendar_coverage"] += 1
+                        if not model.calendar_warned:
+                            LOG.warning("Skipped %s/%s: live tick %s outside calendar coverage %s through %s "
+                                        "with required 7-day margins; run scripts/update_events.py",
+                                        meta["target"], meta["horizon_s"], self.tick,
+                                        calendar.covers_from, calendar.covers_through)
+                            model.calendar_warned = True
+                        continue
+                    model.calendar_warned = False
                 if not model.warned and (any(r["engine_version"] not in meta["engine_version"] for r in rows)
                                          or "as_live" not in meta["replay_modes"]):
                     LOG.warning("Model %s/%s/%s engine_version/replay_mode differs from live rows",
@@ -216,7 +242,8 @@ class Service:
                     model.warned = True
                 key = (meta["target"], meta["stride_s"], json.dumps(meta["label_spec"], sort_keys=True))
                 if key not in matrices:
-                    matrices[key] = _matrix_for(rows, self.history, meta)
+                    matrices[key] = (_matrix_for(rows, self.history, meta, calendar) if calendar is not None
+                                     else _matrix_for(rows, self.history, meta))
                 x = _reindex(matrices[key], meta["features"])
                 predicted = float(model.regressor.predict(x, num_threads=1)[0])
                 probabilities = model.classifier.predict(x, num_threads=1)[0]
