@@ -37,7 +37,7 @@ def test_train_offline_replays_both_fixture_days_and_resumes(tmp_path):
         assert report["output"] == str(feature)
         assert (work / f"logs/{day}.log").is_file()
     report = json.loads((work / "research_report_fixture.json").read_text())
-    assert report["trained"] == 0 and report["skipped"] == 8
+    assert report["trained"] == 0 and report["skipped"] == 12
     assert not (work / "models").exists()
     resumed = run(FIXTURES, work, "--version", "resume")
     assert resumed.returncode == 0, resumed.stdout + resumed.stderr

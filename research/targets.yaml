@@ -1,6 +1,6 @@
 version: "v1"
 calendar: config/events.csv
-horizons_s: [900, 1800]
+horizons_s: [300, 900, 1800]
 # Stablecoin context for the BTC_spot baseline; missing rows remain null.
 context_assets: [USDT]
 references:

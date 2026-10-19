@@ -2,7 +2,7 @@
 
 import argparse
 from collections import Counter, deque
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import json
 import logging
 import math
@@ -21,6 +21,7 @@ from collectors.common.config import kafka_bootstrap
 from research.calendar import Calendar, verify_calendar
 from research.dataset import build_matrix
 from research.labels import NS, load_spec, reference_for
+from research.risk import STOP_NAMES, predict_stops
 
 LOG = logging.getLogger(__name__)
 STRINGS = "exchange market symbol asset engine_version".split()
@@ -76,10 +77,11 @@ class Model:
     classifier: lgb.Booster
     warned: bool = False
     calendar_warned: bool = False
+    stops: dict = field(default_factory=dict)
 
 
 def download_models(root, version, targets=None, horizons=None):
-    """Explicit opt-in; only download the three inference artifacts, never overwrite."""
+    """Explicit opt-in; only download inference artifacts, never overwrite."""
     import boto3
     bucket = os.environ.get("S3_BUCKET")
     if not bucket:
@@ -90,7 +92,8 @@ def download_models(root, version, targets=None, horizons=None):
             parts = obj["Key"].split("/")
             if (len(parts) != 5 or parts[3] != version or parts[1] not in
                 [f"{a}_{m}" for a in load_spec()["references"] for m in ("spot", "perp")]
-                or not parts[2].isdigit() or parts[4] not in ("metadata.json", "regressor.txt", "classifier.txt")):
+                or not parts[2].isdigit() or parts[4] not in ("metadata.json", "regressor.txt", "classifier.txt",
+                                       *(f"{name}.txt" for name in STOP_NAMES))):
                 continue
             if (targets and parts[1] not in targets) or (horizons and int(parts[2]) not in horizons):
                 continue
@@ -128,7 +131,12 @@ def load_models(root, version, targets=None, horizons=None):
             raise ValueError(f"Model feature/class order disagrees with metadata: {path}")
         if meta.get("classifier_class_order") != [-1, 0, 1]:
             raise ValueError("Classifier class order must be [-1, 0, 1]")
-        models.append(Model(meta, reg, clf))
+        stops = {name: lgb.Booster(model_file=str(path / f"{name}.txt"))
+                 for name in STOP_NAMES if (path / f"{name}.txt").is_file()}
+        if any(model.feature_name() != features or model.num_model_per_iteration() != 1
+               for model in stops.values()):
+            raise ValueError(f"Stop model feature order disagrees with metadata: {path}")
+        models.append(Model(meta, reg, clf, stops=stops))
     if not models:
         raise ValueError("No matching models found")
     return models
@@ -254,13 +262,24 @@ class Service:
                 probabilities = model.classifier.predict(x, num_threads=1)[0]
                 if not math.isfinite(predicted) or not np.isfinite(probabilities).all():
                     raise ValueError("nonfinite prediction")
+                stops = predict_stops(model.stops, x, num_threads=1)
+                risk_output = {}
+                mid = reference["mid_e9"] / NS
+                for name in STOP_NAMES:
+                    _, side, quantile = name.split("_")
+                    bps = float(stops[name][0]) if name in stops else None
+                    risk_output[f"stop_{side}_bps_{quantile}"] = bps
+                    risk_output[f"stop_{side}_price_{quantile}"] = (
+                        mid * (1 + (-1 if side == "long" else 1) * bps / 10_000)
+                        if bps is not None else None)
                 available = time.time_ns()
                 if available < max(r["available_ns"] for r in rows):
                     self.skipped["future_available"] += 1
                     continue
                 output = dict(model_version=meta["version"], target=meta["target"],
                               horizon_s=meta["horizon_s"], tick_ns=self.tick, available_ns=available,
-                              pred_return_pct=predicted, direction=int(np.argmax(probabilities)) - 1)
+                              pred_return_pct=predicted, direction=int(np.argmax(probabilities)) - 1,
+                              **risk_output)
                 self.producer.produce("predictions.v1", key=meta["target"], partition=0,
                                       value=json.dumps(output, allow_nan=False), on_delivery=self.delivered)
                 self.counts["predictions"] += 1

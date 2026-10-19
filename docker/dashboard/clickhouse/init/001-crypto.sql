@@ -121,6 +121,14 @@ CREATE TABLE IF NOT EXISTS crypto.predictions
     available_ns Int64,
     pred_return_pct Float64,
     direction Int8,
+    stop_long_bps_q80 Nullable(Float64),
+    stop_long_price_q80 Nullable(Float64),
+    stop_long_bps_q90 Nullable(Float64),
+    stop_long_price_q90 Nullable(Float64),
+    stop_short_bps_q80 Nullable(Float64),
+    stop_short_price_q80 Nullable(Float64),
+    stop_short_bps_q90 Nullable(Float64),
+    stop_short_price_q90 Nullable(Float64),
     ts DateTime64(3, 'UTC') MATERIALIZED fromUnixTimestamp64Nano(tick_ns)
 )
 ENGINE = ReplacingMergeTree
@@ -138,7 +146,15 @@ CREATE TABLE IF NOT EXISTS crypto.predictions_kafka
     tick_ns Int64,
     available_ns Int64,
     pred_return_pct Float64,
-    direction Int8
+    direction Int8,
+    stop_long_bps_q80 Nullable(Float64),
+    stop_long_price_q80 Nullable(Float64),
+    stop_long_bps_q90 Nullable(Float64),
+    stop_long_price_q90 Nullable(Float64),
+    stop_short_bps_q80 Nullable(Float64),
+    stop_short_price_q80 Nullable(Float64),
+    stop_short_bps_q90 Nullable(Float64),
+    stop_short_price_q90 Nullable(Float64)
 )
 ENGINE = Kafka
 SETTINGS

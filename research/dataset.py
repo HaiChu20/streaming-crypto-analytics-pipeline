@@ -6,14 +6,15 @@ import polars as pl
 import pyarrow.parquet as pq
 
 from research.calendar import Calendar, calendar_features
-from research.labels import NS, load_spec, momentum_900s, reference_for, reference_rows
+from research.labels import NS, load_spec, momentum_300s, momentum_900s, reference_for, reference_rows
 
 # Absolute prices are non-stationary. Timestamps/provenance never enter X.
 IDENTITY = {"exchange", "market", "symbol", "tick_ns", "available_ns", "engine_version",
             "replay_mode", "asset"}
 PRICES = {"mid_e9", "mid", "best_bid", "best_ask", "microprice", "mark_price"}
 NON_FEATURES = {"asset", "tick_ns", "available_ns", "engine_version", "replay_mode",
-                "label_end_ns", "label_available_ns", "return_pct", "direction"}
+                "label_end_ns", "label_available_ns", "return_pct", "direction",
+                "adverse_long_bps", "adverse_short_bps", "favorable_long_bps", "favorable_short_bps"}
 
 
 def feature_paths(root: str | Path) -> list[Path]:
@@ -133,6 +134,7 @@ def build_matrix(rows: pl.DataFrame, target: str, stride_s: int = 10,
                     expressions.append(pl.lit(None, dtype=pl.Float64).alias(prefix + "premium_bps"))
                 matrix = matrix.with_columns(expressions)
     matrix = matrix.join(momentum_900s(rows, target, spec), on="tick_ns", how="left")
+    matrix = matrix.join(momentum_300s(rows, target, spec), on="tick_ns", how="left")
     matrix = matrix.with_columns(pl.lit(asset).alias("asset")).sort("tick_ns")
     if spec.get("calendar"):
         cal = calendar or Calendar.load(spec["calendar"])

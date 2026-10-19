@@ -13,6 +13,7 @@ import polars as pl
 from research.calendar import Calendar
 from research.dataset import build_matrix, feature_paths, read_features
 from research.labels import NS, load_spec, make_labels, reference_for, reference_present
+from research.risk import evaluate_stops, fit_stop_models
 
 
 class InsufficientHistory(ValueError):
@@ -141,7 +142,13 @@ def train_target(rows: pl.DataFrame, target: str, horizon_s: int, output_root: s
     x[~np.isfinite(x)] = np.nan
     y = data["return_pct"].to_numpy()
     directions = data["direction"].to_numpy().astype(np.int32)
-    momentum = data["momentum_return_900s"].to_numpy() * (horizon_s / 900)
+    momentum = (data["momentum_return_300s"].to_numpy() if horizon_s == 300 else
+                data["momentum_return_900s"].to_numpy() * (horizon_s / 900))
+    adverse = {side: data[f"adverse_{side}_bps"].to_numpy() for side in ("long", "short")}
+    ref = reference_for(target, spec)
+    rv_column = f"{ref['exchange']}_{ref['market']}_rv_300s"
+    rv = data[rv_column].to_numpy() if rv_column in data.columns else np.full(data.height, np.nan)
+    stop_folds, stop_summary = evaluate_stops(x, adverse, rv, features, folds, rounds)
     results, actuals = [], []
     oof = {name: [] for name in ("regressor", "classifier", "zero", "momentum")}
     class_directions = []
@@ -163,7 +170,7 @@ def train_target(rows: pl.DataFrame, target: str, horizon_s: int, output_root: s
                         "train_feature_available_ns": int(data["available_ns"][train].max()),
                         "test_start_ns": int(ticks[test[0]]), "test_end_ns": int(ticks[test[-1]]),
                         "gap_s": float((ticks[test[0]] - ticks[train[-1]]) / NS),
-                        "metrics": fold_metrics})
+                        "metrics": fold_metrics, "stop_metrics": stop_folds[i - 1]})
         actuals.append(y[test])
         class_directions.append(predicted_direction)
         for name, p in predictions.items():
@@ -177,6 +184,9 @@ def train_target(rows: pl.DataFrame, target: str, horizon_s: int, output_root: s
     directory.mkdir(parents=True, exist_ok=False)
     regressor.save_model(str(directory / "regressor.txt"))
     classifier.save_model(str(directory / "classifier.txt"))
+    stop_models = fit_stop_models(x, adverse, features, rounds)
+    for name, model in stop_models.items():
+        model.save_model(str(directory / f"{name}.txt"))
     data.select("asset", "tick_ns", "available_ns", "label_end_ns", "label_available_ns",
                 "engine_version", "replay_mode").write_parquet(directory / "training_rows.parquet")
     report = {
@@ -192,11 +202,24 @@ def train_target(rows: pl.DataFrame, target: str, horizon_s: int, output_root: s
         "label_coverage_pct": 100 * data.height / matrix.height,
         "stride_s": stride_s, "purge_s": horizon_s if purge_s is None else purge_s,
         "rounds": rounds, "folds": results, "metrics": summary,
+        "stop_models": {name: {"file": f"{name}.txt", "quantile": int(name[-2:]) / 100,
+                               "label": f"adverse_{name.split('_')[1]}_bps"}
+                        for name in stop_models},
+        "stop_labeled_rows": {side: int(np.isfinite(a).sum()) for side, a in adverse.items()},
+        "stop_metrics": stop_summary,
+        "stop_notes": "Positive mid-price excursion in (t,t+h]; every whole second must be valid, "
+                      "non-warm and positive. No spread/slippage. Hit means actual > predicted stop; "
+                      "target hit rate 1-q. Predictions clipped to zero and q90 raised to q80. "
+                      "Baselines and rv_300s terciles fitted on each purged training fold only; "
+                      "k=quantile(adverse/rv_300s) for positive finite rv. Missing/negative rv excluded "
+                      "from volatility baseline/regimes; zero rv predicts zero if k is available. "
+                      "Overall metrics pool held-out rows and their fold-local regime assignments.",
         "classifier_class_order": [-1, 0, 1], "classifier_class_mean_returns": class_means.tolist(),
         "metric_notes": "Returns/MAE/RMSE in percentage points. Classifier implied return = "
                         "probabilities @ training-only class mean returns; direction = argmax. "
                         "Directional accuracy excludes actual flats. Undefined IC is null. "
-                        "Momentum = trailing 900 s return * horizon/900; missing endpoints excluded "
+                        "Momentum = trailing 300 s return for h=300, otherwise 900 s return * horizon/900; "
+                        "missing endpoints excluded "
                         "from its metrics (see n). Zero predicts flat, scoring 0 on non-flat directions.",
         "availability": "Prediction time is max available_ns of same-tick inputs. "
                         "No later tick enters X. Train labels must be emitted before test tick.",
@@ -230,7 +253,7 @@ def main(argv=None):
     parser.add_argument("root", type=Path, help="Contains features/date=D/features.parquet")
     parser.add_argument("--output-root", type=Path)
     parser.add_argument("--target", action="append", choices=["BTC_spot", "BTC_perp", "ETH_spot", "ETH_perp"])
-    parser.add_argument("--horizon-s", action="append", type=int, choices=[900, 1800])
+    parser.add_argument("--horizon-s", action="append", type=int, choices=[300, 900, 1800])
     parser.add_argument("--stride-s", type=int, default=10)
     parser.add_argument("--folds", type=int, default=3)
     parser.add_argument("--purge-s", type=int)

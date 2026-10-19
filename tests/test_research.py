@@ -41,17 +41,18 @@ def write_parquet(tmp_path, rows, mode="ideal", name="features.parquet"):
 def synthetic_path(tmp_path):
     # More than one horizon of training history before either test fold.
     rows = []
-    for t in range(0, 7201):
+    for t in range(0, 10801):
         mid = 100_000_000_005 + int(100_000_000 * np.sin(t / 170)) + t * 1000
         rows.append(row(t, mid, warmup=t < 300,
-                        ret_60s=float(np.sin(t / 170) - np.sin((t - 60) / 170))))
+                        ret_60s=float(np.sin(t / 170) - np.sin((t - 60) / 170)),
+                        rv_300s=float(1 + abs(np.sin(t / 170)))))
     return write_parquet(tmp_path, rows)
 
 
 def test_spec_freezes_all_four_references_and_horizons():
     spec = load_spec()
     assert spec["version"] == "v1"
-    assert spec["horizons_s"] == [900, 1800]
+    assert spec["horizons_s"] == [300, 900, 1800]
     for asset in ("BTC", "ETH"):
         for market in ("spot", "perp"):
             assert spec["references"][asset][market] == dict(
@@ -161,7 +162,7 @@ def test_trailing_momentum_uses_exact_past_and_never_future(tmp_path):
     assert trailing["momentum_return_900s"][1] == exact_return_pct(100_000_000_005, 101_000_000_005)
 
 
-@pytest.mark.parametrize("horizon", [900, 1800])
+@pytest.mark.parametrize("horizon", [300, 900, 1800])
 def test_walk_forward_order_expansion_and_purge_no_overlapping_labels(horizon):
     ticks = np.arange(0, 30000, 10, dtype=np.int64) * NS
     # Some labels are emitted even later than the normal endpoint + 250ms.
@@ -226,10 +227,11 @@ def test_metrics_ties_flats_missing_predictions_and_undefined_ic():
     assert metrics([1, -1], [1, -1], [-1, 1])["directional_accuracy"] == 0
 
 
-def test_tiny_end_to_end_cli_models_metadata_and_row_modes(tmp_path, synthetic_path):
+@pytest.mark.parametrize("horizon", [300, 900, 1800])
+def test_tiny_end_to_end_cli_models_metadata_and_row_modes(tmp_path, synthetic_path, horizon):
     output = tmp_path / "output"
     result = main([str(synthetic_path), "--output-root", str(output), "--target", "BTC_spot",
-                   "--horizon-s", "900", "--folds", "2", "--rounds", "3", "--version", "test"])
+                   "--horizon-s", str(horizon), "--folds", "2", "--rounds", "3", "--version", "test"])
     report = result["results"][0]
     assert report["labeled_rows"] > 0 and len(report["folds"]) == 2
     assert report["replay_modes"] == ["ideal"]
@@ -245,6 +247,24 @@ def test_tiny_end_to_end_cli_models_metadata_and_row_modes(tmp_path, synthetic_p
     assert lgb.Booster(model_file=str(directory / "regressor.txt")).predict(x).shape == (2,)
     assert lgb.Booster(model_file=str(directory / "classifier.txt")).predict(x).shape == (2, 3)
     assert set(report["metrics"]) == {"regressor", "classifier", "zero", "momentum"}
+    from research.risk import STOP_NAMES
+    assert set(report["stop_models"]) == set(STOP_NAMES)
+    assert set(report["stop_metrics"]) == set(STOP_NAMES)
+    for name in STOP_NAMES:
+        assert lgb.Booster(model_file=str(directory / f"{name}.txt")).predict(x, num_threads=2).shape == (2,)
+        assert report["stop_metrics"][name]["model"]["n"] > 0
+        assert report["stop_metrics"][name]["volatility_scaled"]["n"] > 0
+    # The momentum baseline uses unscaled 300-second returns only at h=300.
+    from research.labels import make_labels
+    data = matrix.join(make_labels(read_features([synthetic_path]), "BTC_spot", horizon), on="tick_ns").filter(
+        pl.col("return_pct").is_not_null() & (pl.col("available_ns") < pl.col("label_end_ns")))
+    folds = walk_forward_folds(data["tick_ns"].to_numpy(), horizon, 2,
+                               label_available_ns=data["label_available_ns"].to_numpy(),
+                               feature_available_ns=data["available_ns"].to_numpy())
+    test = np.concatenate([test for _, test in folds])
+    momentum = (data["momentum_return_300s"].to_numpy() if horizon == 300 else
+                data["momentum_return_900s"].to_numpy() * horizon / 900)
+    assert report["metrics"]["momentum"] == metrics(data["return_pct"].to_numpy()[test], momentum[test])
     assert report["metrics"]["zero"]["directional_accuracy"] == 0
     assert (output / "research_report_test.json").is_file()
     for fold in report["folds"]:
@@ -252,7 +272,7 @@ def test_tiny_end_to_end_cli_models_metadata_and_row_modes(tmp_path, synthetic_p
         assert fold["train_label_end_ns"] < fold["test_start_ns"]
         assert fold["train_feature_available_ns"] < fold["test_start_ns"]
     with pytest.raises(FileExistsError):
-        train_target(read_features([synthetic_path]), "BTC_spot", 900, output,
+        train_target(read_features([synthetic_path]), "BTC_spot", horizon, output,
                      "test", n_folds=2, rounds=1)
 
 
@@ -283,7 +303,7 @@ def test_no_targets_or_too_few_labels_is_a_reported_success(tmp_path, capsys):
     path = write_parquet(tmp_path, [row(0), row(900)])
     output = tmp_path / "no-labels"
     result = main([str(path), "--output-root", str(output), "--version", "tiny"])
-    assert result["trained"] == 0 and result["skipped"] == 8
+    assert result["trained"] == 0 and result["skipped"] == 12
     assert all(report["status"] == "skipped" for report in result["results"])
     assert "not enough labeled rows" in result["results"][0]["reason"]
     assert not (output / "models").exists()

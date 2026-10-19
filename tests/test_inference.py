@@ -150,7 +150,10 @@ def test_load_and_predict_tiny_native_models(tmp_path):
     feed(svc, row(10), row(11))
     assert svc.counts["predictions"] == 1
     expected = float(reg.predict([[2.]], num_threads=2)[0])
-    assert json.loads(svc.producer.messages[0][1]["value"])["pred_return_pct"] == expected
+    payload = json.loads(svc.producer.messages[0][1]["value"])
+    assert payload["pred_return_pct"] == expected
+    assert models[0].stops == {}
+    assert all(value is None for key, value in payload.items() if key.startswith("stop_"))
     meta["features"] = ["impossible"]
     (path / "metadata.json").write_text(json.dumps(meta))
     with pytest.raises(ValueError, match="cannot produce"):
@@ -248,7 +251,8 @@ def test_explicit_download_filters_artifacts_and_preserves_existing(tmp_path, mo
     import boto3
     from inference.service import download_models
     keys = ["models/BTC_spot/900/test/" + name for name in
-            ("metadata.json", "regressor.txt", "classifier.txt", "training_rows.parquet")]
+            ("metadata.json", "regressor.txt", "classifier.txt", "stop_long_q80.txt", "stop_long_q90.txt",
+             "stop_short_q80.txt", "stop_short_q90.txt", "training_rows.parquet")]
     keys += ["models/BTC_spot/1800/test/metadata.json", "models/ETH_spot/900/test/metadata.json",
              "models/BTC_spot/900/other/metadata.json", "models/../../test/metadata.json"]
     calls = []
@@ -262,7 +266,7 @@ def test_explicit_download_filters_artifacts_and_preserves_existing(tmp_path, mo
     monkeypatch.setenv("S3_BUCKET", "fixture-bucket")
     monkeypatch.setattr(boto3, "client", lambda name: client)
     download_models(tmp_path, "test", ["BTC_spot"], [900])
-    assert {key for _, key in calls} == set(keys[:3])
+    assert {key for _, key in calls} == set(keys[:7])
     with pytest.raises(FileExistsError):
         download_models(tmp_path, "test", ["BTC_spot"], [900])
 
@@ -415,3 +419,50 @@ def test_memory_features_are_numeric_and_reach_the_training_matrix():
                  "rv_900s", "microprice_dev_bps"):
         assert f"binance_spot_{name}" in features
         assert matrix[f"binance_spot_{name}"][0] == rows[0][name]
+
+
+def test_five_minute_trained_stop_models_and_live_vector_parity(tmp_path):
+    from research.risk import STOP_NAMES, predict_stops
+    spec = metadata()["label_spec"]
+    rows = [row(t, mid_e9=100 * NS + int(200_000_000 * np.sin(t / 130)),
+                rv_300s=float(1 + abs(np.sin(t / 130)))) for t in range(4501)]
+    frame = pl.DataFrame(rows, schema=SCHEMA)
+    report = train_target(frame, "BTC_spot", 300, tmp_path, "risk", n_folds=2, rounds=3, spec=spec)
+    models = load_models(tmp_path, "risk", horizons=[300])
+    assert set(models[0].stops) == set(STOP_NAMES)
+    assert report["stop_labeled_rows"]["long"] == report["labeled_rows"]
+    matrix, features = build_matrix(frame, "BTC_spot", spec=spec)
+    expected = matrix.filter(pl.col("tick_ns") == 300 * NS).select(features).to_numpy().astype(float)
+    svc = Service(models, Producer())
+    feed(svc, *rows[:302])
+    np.testing.assert_array_equal(vector_for([rows[300]], rows[:300], models[0].metadata), expected)
+    payload = next(json.loads(m["value"]) for _, m in svc.producer.messages
+                   if json.loads(m["value"])["tick_ns"] == 300 * NS)
+    predicted = predict_stops(models[0].stops, expected, num_threads=1)
+    mid = rows[300]["mid_e9"] / NS
+    for side in ("long", "short"):
+        for q in (80, 90):
+            bps = payload[f"stop_{side}_bps_q{q}"]
+            assert bps == predicted[f"stop_{side}_q{q}"][0]
+            assert payload[f"stop_{side}_price_q{q}"] == mid * (1 + (-1 if side == "long" else 1) * bps / 10000)
+        assert payload[f"stop_{side}_bps_q90"] >= payload[f"stop_{side}_bps_q80"] >= 0
+    assert payload["horizon_s"] == 300
+    assert np.isfinite(expected[0, features.index("momentum_return_300s")])
+    # Stop artifacts must obey the same frozen feature order as return models.
+    path = Path(report["model_dir"]) / "stop_long_q80.txt"
+    path.write_text(path.read_text().replace("binance_spot_rv_300s", "binance_spot_rv_999s"))
+    with pytest.raises(ValueError, match="Stop model feature order"):
+        load_models(tmp_path, "risk")
+
+
+def test_live_stops_clip_and_do_not_cross_using_reference_mid():
+    svc = service()
+    values = {"stop_long_q80": -2, "stop_long_q90": -4, "stop_short_q80": 20, "stop_short_q90": 10}
+    svc.models[0].stops = {name: SimpleNamespace(predict=lambda x, v=v, **kw: np.array([v]))
+                           for name, v in values.items()}
+    feed(svc, row(10, mid_e9=200 * NS, mid=999.), row(10, exchange="okx", mid_e9=500 * NS), row(11))
+    payload = json.loads(svc.producer.messages[0][1]["value"])
+    assert payload["stop_long_bps_q80"] == payload["stop_long_bps_q90"] == 0
+    assert payload["stop_short_bps_q80"] == payload["stop_short_bps_q90"] == 20
+    assert payload["stop_long_price_q90"] == 200
+    assert payload["stop_short_price_q90"] == 200 * 1.002
