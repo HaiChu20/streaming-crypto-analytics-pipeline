@@ -3,7 +3,7 @@
 set -euo pipefail
 
 usage() {
-    echo "Usage: $0 <archive_root> <work_dir> [--jobs N] [--from YYYY-MM-DD] [--to YYYY-MM-DD] [--version V] [--allow-missing-days] [--rebuild-stale] [research.train flags: --lockbox-pct/--lockbox-from/--embargo-days, --fold-days/--min-train-days/--fold-embargo-s/--max-folds, --shuffle-test, --max-memory-gb, --open-lockbox/--i-understand-lockbox-reuse]" >&2
+    echo "Usage: $0 <archive_root> <work_dir> [--jobs N] [--from YYYY-MM-DD] [--to YYYY-MM-DD] [--version V] [--allow-missing-days] [--rebuild-stale] [--replay-only] [research.train flags: --threads, --lockbox-pct/--lockbox-from/--embargo-days, --fold-days/--min-train-days/--fold-embargo-s/--max-folds, --shuffle-test, --max-memory-gb, --open-lockbox/--i-understand-lockbox-reuse]" >&2
 }
 fail() { echo "train_offline: $*" >&2; exit 1; }
 [[ $# -ge 2 ]] || { usage; exit 2; }
@@ -22,6 +22,7 @@ lockbox_from=""
 embargo_days=1
 open_lockbox=0
 version_set=0
+replay_only=0
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --jobs|--from|--to|--version)
@@ -33,13 +34,14 @@ while [[ $# -gt 0 ]]; do
                 --version) version=$2; version_set=1 ;;
             esac
             shift 2 ;;
-        --lockbox-pct|--lockbox-from|--embargo-days|--fold-days|--min-train-days|--fold-embargo-s|--max-folds|--max-memory-gb|--stride-s|--target|--horizon-s|--rounds|--purge-s)
+        --threads|--lockbox-pct|--lockbox-from|--embargo-days|--fold-days|--min-train-days|--fold-embargo-s|--max-folds|--max-memory-gb|--stride-s|--target|--horizon-s|--rounds|--purge-s)
             [[ $# -ge 2 && -n $2 ]] || fail "$1 requires a value"
             train_args+=("$1" "$2")
             case "$1" in
                 --lockbox-pct) lockbox_pct=$2 ;;
                 --lockbox-from) lockbox_from=$2 ;;
                 --embargo-days) embargo_days=$2 ;;
+                --threads) [[ $2 =~ ^[1-9][0-9]*$ ]] || fail "--threads must be a positive integer" ;;
             esac
             shift 2 ;;
         --shuffle-test|--open-lockbox|--i-understand-lockbox-reuse)
@@ -48,6 +50,7 @@ while [[ $# -gt 0 ]]; do
             shift ;;
         --allow-missing-days) allow_missing=1; shift ;;
         --rebuild-stale) rebuild_stale=1; shift ;;
+        --replay-only) replay_only=1; shift ;;
         *) usage; fail "unknown option: $1" ;;
     esac
 done
@@ -75,7 +78,7 @@ if [[ $open_lockbox -eq 1 ]]; then
 fi
 command -v cargo >/dev/null 2>&1 || fail "cargo is missing. Install Rust with rustup (https://rustup.rs), then restart your shell."
 if [[ -z $jobs ]]; then
-    jobs=$("${python_cmd[@]}" -c 'import os; print(max(1, (os.cpu_count() or 2) // 2))')
+    jobs=$("${python_cmd[@]}" -c 'from research.threads import available_cpus; print(max(1, available_cpus() // 2))')
 fi
 [[ $jobs =~ ^[1-9][0-9]*$ ]] || fail "--jobs must be a positive integer"
 logs="$work_dir/logs"
@@ -277,6 +280,10 @@ done < "$replay_plan"
 wait_batch
 if [[ $failures -gt 0 ]]; then
     echo "WARNING: --allow-missing-days: training without failed days:$failed_days" >&2
+fi
+if [[ $replay_only -eq 1 ]]; then
+    echo "Replay complete (--replay-only); training skipped"
+    exit 0
 fi
 # Discovered successful outputs are the only published feature files; training
 # reads all complete days in work_dir, including successful earlier invocations.

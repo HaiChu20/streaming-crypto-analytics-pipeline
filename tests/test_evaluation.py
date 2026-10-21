@@ -113,7 +113,7 @@ def test_shuffle_destroys_planted_label_feature_on_same_weekly_folds():
     rng = np.random.default_rng(42)
     ticks = np.arange(80 * 80, dtype=np.int64) * (1080 * NS)
     y = rng.normal(size=len(ticks))
-    x = np.column_stack([y, rng.normal(size=(len(y), 12))]).astype(np.float32)  # planted leak plus ordinary noise
+    x = np.column_stack([y, rng.normal(size=(len(y), 12))]).astype(np.float64)  # planted leak plus ordinary noise
     features = ['leak'] + [f'noise_{i}' for i in range(12)]
     normal, shuffled, actual = [], [], []
     for i, (train, test) in enumerate(walk_forward_folds(ticks, 300, max_folds=12)):
@@ -141,32 +141,29 @@ def test_leak_flag_synthetic_numbers_threshold_and_undefined():
 def test_memory_guard_before_allocation_and_physical_default(monkeypatch, capsys):
     monkeypatch.setattr('research.evaluation.os.sysconf', lambda key: {'SC_PHYS_PAGES': 1024**2, 'SC_PAGE_SIZE': 4096}[key])
     estimate = memory_estimate(100, 50)
-    assert estimate['bytes'] == 100 * 50 * 4 and estimate['max_memory_gb'] == pytest.approx(2.8)
+    assert estimate['bytes'] == 100 * 50 * 8 and estimate['dtype'] == 'float64'
+    assert estimate['max_memory_gb'] == pytest.approx(2.8)
     with pytest.raises(ValueError, match='stride-s.*fewer days'):
         memory_estimate(10**9, 100, .001)
-    assert '4 bytes' in capsys.readouterr().out
+    assert '8 bytes' in capsys.readouterr().out
 
 
-def test_float32_live_training_vector_parity_and_predictions():
+def test_float64_live_training_vector_parity_and_predictions():
     from inference.service import _reindex
     rng = np.random.default_rng(3)
     frame = pl.DataFrame({'a': rng.normal(size=400), 'b': rng.normal(size=400)})
     features = ['b', 'a', 'missing']
     training = feature_array(frame, features)
     live = _reindex(frame, features)
-    assert training.dtype == live.dtype == np.float32
+    assert training.dtype == live.dtype == np.float64
     np.testing.assert_array_equal(training, live)
     y = frame['a'].to_numpy() * 2 + frame['b'].to_numpy()
     reg, clf, _ = fit_models(training, y, np.sign(y).astype(int), features, 10)
+    raw = frame.select('b', 'a').with_columns(pl.lit(None, dtype=pl.Float64).alias('missing')).to_numpy()
+    np.testing.assert_array_equal(training, raw)
     for model in (reg, clf):
-        np.testing.assert_allclose(model.predict(training, num_threads=2),
-                                   model.predict(training.astype(np.float64), num_threads=2), rtol=0, atol=0)
-        raw = frame.select('b', 'a').with_columns(pl.lit(None, dtype=pl.Float64).alias('missing')).to_numpy()
-        np.testing.assert_allclose(model.predict(training, num_threads=2), model.predict(raw, num_threads=2), rtol=1e-6, atol=1e-8)
-    reg64, clf64, _ = fit_models(raw, y, np.sign(y).astype(int), features, 10)
-    for model32, model64 in ((reg, reg64), (clf, clf64)):
-        np.testing.assert_allclose(model32.predict(training, num_threads=2),
-                                   model64.predict(raw, num_threads=2), rtol=1e-6, atol=1e-8)
+        np.testing.assert_array_equal(model.predict(training, num_threads=2),
+                                      model.predict(live, num_threads=2))
     special = feature_array(pl.DataFrame({'a': [float('inf'), None, 2.]}), ['a'])
     assert np.isnan(special[:2]).all()
 
@@ -174,7 +171,7 @@ def test_float32_live_training_vector_parity_and_predictions():
 def test_importance_multiclass_shapes_sample_limit_and_groups():
     rng = np.random.default_rng(7)
     features = ['binance_perp_rv_300s', 'binance_perp_rv_900s', 'cal_hour_sin', 'ctx_usdt_spread_60s', 'cross_cross_basis_bps_binance']
-    x = rng.normal(size=(300, len(features))).astype(np.float32)
+    x = rng.normal(size=(300, len(features))).astype(np.float64)
     y = x[:, 0] + x[:, 1]
     reg, clf, _ = fit_models(x, y, np.sign(y).astype(int), features, 3)
     for model in (reg, clf):
@@ -272,6 +269,17 @@ def test_lockbox_frozen_models_ledger_and_cross_version_reuse_guard(tmp_path, sp
     assert not calls and 'no longer untouched' in capsys.readouterr().out
     open_lockbox(rows, tmp_path, 'v1', acknowledge_reuse=True)
     assert len(ledger.read_text().splitlines()) == 2
+
+
+def test_open_lockbox_without_input_days_rejects_missing_frozen_day(tmp_path, sparse_evaluation):
+    rows, spec, _ = sparse_evaluation
+    trained = train_target(rows, 'BTC_spot', 300, tmp_path, 'v1', spec=spec, rounds=2)
+    lockbox = trained['date_split']['lockbox']
+    missing_day = stamp(lockbox['first_day']) // (24 * 3600 * NS)
+    incomplete = rows.filter((pl.col('tick_ns') // (24 * 3600 * NS)) != missing_day)
+
+    with pytest.raises(ValueError, match='Lockbox feature dates differ'):
+        open_lockbox(incomplete, tmp_path, 'v1')
 
 
 def test_regimes_utc_hours_weekend_and_training_edges():

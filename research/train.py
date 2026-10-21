@@ -12,11 +12,12 @@ import numpy as np
 import polars as pl
 
 from research.calendar import Calendar, verify_calendar
-from research.dataset import build_matrix, feature_paths, read_features
+from research.dataset import build_matrix, feature_dates, feature_paths, read_features
 from research.labels import NS, load_spec, make_labels, reference_for, reference_present
 from research.risk import evaluate_stops, fit_stop_models, predict_stops, stop_metrics
 from research.evaluation import (DAY_NS, date_split, feature_array, memory_estimate,
                                  day_block_permutation, leak_check_metrics, model_importance)
+from research.threads import available_cpus, resolve_threads
 
 
 class InsufficientHistory(ValueError):
@@ -99,8 +100,9 @@ def metrics(actual, predicted, predicted_direction=None) -> dict:
     return result
 
 
-def fit_models(x, y, directions, features, rounds: int):
-    params = {"verbosity": -1, "num_threads": 2, "seed": 17, "deterministic": True,
+def fit_models(x, y, directions, features, rounds: int, num_threads=None):
+    num_threads = resolve_threads(num_threads)
+    params = {"verbosity": -1, "num_threads": num_threads, "seed": 17, "deterministic": True,
               "force_col_wise": True, "num_leaves": 15, "learning_rate": 0.05,
               "min_data_in_leaf": 20, "feature_pre_filter": False}
     regressor = lgb.train(
@@ -164,7 +166,8 @@ def train_target(rows: pl.DataFrame, target: str, horizon_s: int, output_root: s
                  purge_s: int | None = None, rounds: int = 100,
                  spec: dict | None = None, *, split=None, lockbox_pct=20, lockbox_from=None,
                  embargo_days=1, fold_days=7, min_train_days=14, fold_embargo_s=None,
-                 max_folds=12, shuffle_test=False, max_memory_gb=None) -> dict:
+                 max_folds=12, shuffle_test=False, max_memory_gb=None, num_threads=None) -> dict:
+    num_threads = resolve_threads(num_threads)
     spec = spec or load_spec()
     if horizon_s not in spec["horizons_s"]:
         raise ValueError("Horizon is not in the versioned label spec")
@@ -213,7 +216,7 @@ def train_target(rows: pl.DataFrame, target: str, horizon_s: int, output_root: s
     ref = reference_for(target, spec)
     rv_column = f"{ref['exchange']}_{ref['market']}_rv_300s"
     rv = data[rv_column].to_numpy() if rv_column in data.columns else np.full(data.height, np.nan)
-    stop_folds, stop_summary = evaluate_stops(x, adverse, rv, features, folds, rounds)
+    stop_folds, stop_summary = evaluate_stops(x, adverse, rv, features, folds, rounds, num_threads=num_threads)
     results, actuals = [], []
     oof = {name: [] for name in ("regressor", "classifier", "zero", "momentum")}
     class_directions, regimes = [], []
@@ -221,11 +224,11 @@ def train_target(rows: pl.DataFrame, target: str, horizon_s: int, output_root: s
     shuffled_directions, shuffled_test_days = [], []
     for i, (train, test) in enumerate(folds, 1):
         regressor, classifier, class_means = fit_models(
-            x[train], y[train], directions[train], features, rounds
+            x[train], y[train], directions[train], features, rounds, num_threads=num_threads
         )
-        probabilities = classifier.predict(x[test], num_threads=2)
+        probabilities = classifier.predict(x[test], num_threads=num_threads)
         predicted_direction = np.argmax(probabilities, axis=1) - 1
-        predictions = {"regressor": regressor.predict(x[test], num_threads=2),
+        predictions = {"regressor": regressor.predict(x[test], num_threads=num_threads),
                        "classifier": probabilities @ class_means,
                        "zero": np.zeros(len(test)), "momentum": momentum[test]}
         fold_metrics = {name: metrics(y[test], p, predicted_direction if name == "classifier" else None)
@@ -249,9 +252,9 @@ def train_target(rows: pl.DataFrame, target: str, horizon_s: int, output_root: s
             else:
                 permutation = day_block_permutation(ticks[train], seed=17 + i)
                 shuffled_reg, shuffled_clf, means = fit_models(
-                    x[train], y[train][permutation], directions[train][permutation], features, rounds)
-                probs = shuffled_clf.predict(x[test], num_threads=2)
-                shuffled_oof['regressor'].append(shuffled_reg.predict(x[test], num_threads=2))
+                    x[train], y[train][permutation], directions[train][permutation], features, rounds, num_threads=num_threads)
+                probs = shuffled_clf.predict(x[test], num_threads=num_threads)
+                shuffled_oof['regressor'].append(shuffled_reg.predict(x[test], num_threads=num_threads))
                 shuffled_oof['classifier'].append(probs @ means)
                 shuffled_directions.append(np.argmax(probs, axis=1) - 1)
                 shuffled_test_days.extend((ticks[test] // DAY_NS).tolist())
@@ -272,24 +275,24 @@ def train_target(rows: pl.DataFrame, target: str, horizon_s: int, output_root: s
         shuffle_summary = {name: leak_check_metrics(dict(metrics(np.concatenate(actuals),
             np.concatenate(values), np.concatenate(shuffled_directions) if name == 'classifier' else None),
             effective_days=effective_days)) for name, values in shuffled_oof.items()}
-    regressor, classifier, class_means = fit_models(x, y, directions, features, rounds)
+    regressor, classifier, class_means = fit_models(x, y, directions, features, rounds, num_threads=num_threads)
     directory = Path(output_root) / "models" / target / str(horizon_s) / version
     directory.mkdir(parents=True, exist_ok=False)
     regressor.save_model(str(directory / "regressor.txt"))
     classifier.save_model(str(directory / "classifier.txt"))
-    stop_models = fit_stop_models(x, adverse, features, rounds)
+    stop_models = fit_stop_models(x, adverse, features, rounds, num_threads=num_threads)
     for name, model in stop_models.items():
         model.save_model(str(directory / f"{name}.txt"))
     data.select("asset", "tick_ns", "available_ns", "label_end_ns", "label_available_ns",
                 "engine_version", "replay_mode").write_parquet(directory / "training_rows.parquet")
     report = {
         "target": target, "horizon_s": horizon_s, "version": version, "status": "trained",
-        "date_split": split, "memory": memory,
-        "feature_dtype": "float32; shared research.evaluation.feature_array in training and inference; labels float64",
+        "date_split": split, "memory": memory, "num_threads": num_threads,
+        "feature_dtype": "float64; shared research.evaluation.feature_array in training and inference; labels float64",
         "regimes": regime_summary, "shuffle_test": shuffle_summary,
         "fold_config": {"fold_days": fold_days, "min_train_days": min_train_days, "max_folds": max_folds,
                         "fold_embargo_s": horizon_s if fold_embargo_s is None else fold_embargo_s},
-        "importance": {name: model_importance(model, x, features) for name, model in
+        "importance": {name: model_importance(model, x, features, num_threads=num_threads) for name, model in
                        {"regressor": regressor, "classifier": classifier, **stop_models}.items()},
         "risk_calibration": risk_calibration(adverse, rv),
         "volatility_edges": volatility_edges(rv),
@@ -353,8 +356,9 @@ def upload_model(directory: str | Path, output_root: str | Path, bucket: str | N
 
 
 def open_lockbox(rows, output, version, targets=None, horizons=None, acknowledge_reuse=False,
-                 max_memory_gb=None):
+                 max_memory_gb=None, num_threads=None, input_days=None):
     """Evaluate saved boosters and frozen calibration only. No fitting code here."""
+    num_threads = resolve_threads(num_threads)
     import fcntl
     from research.report import write_model_report, generate_report
 
@@ -388,8 +392,15 @@ def open_lockbox(rows, output, version, targets=None, horizons=None, acknowledge
                 end_ns = ((stop_day - date(1970, 1, 1)).days + 1) * DAY_NS
                 held = rows.filter((pl.col('tick_ns') >= split['lockbox_start_ns'])
                                    & (pl.col('tick_ns') < end_ns))
-                observed = date_split(held['tick_ns'].to_numpy(), lockbox_from=split['lockbox']['first_day'],
-                                      max_horizon_s=max(spec['horizons_s']))['lockbox'] if held.height else None
+                observed = None
+                if input_days is not None:
+                    days = [day for day in input_days
+                            if split['lockbox']['first_day'] <= day <= split['lockbox']['last_day']]
+                    observed = ({'first_day': days[0], 'last_day': days[-1], 'days': len(days)} if days else None)
+                elif held.height:
+                    observed = date_split(held['tick_ns'].to_numpy(),
+                                          lockbox_from=split['lockbox']['first_day'],
+                                          max_horizon_s=max(spec['horizons_s']))['lockbox']
                 if observed != split['lockbox']:
                     raise ValueError('Lockbox feature dates differ from the frozen training split')
                 calendar = Calendar.load(spec['calendar']) if spec.get('calendar') else None
@@ -405,11 +416,11 @@ def open_lockbox(rows, output, version, targets=None, horizons=None, acknowledge
                 reg = lgb.Booster(model_file=str(directory / 'regressor.txt'))
                 clf = lgb.Booster(model_file=str(directory / 'classifier.txt'))
                 y = data['return_pct'].to_numpy()
-                probs = clf.predict(x, num_threads=2) if len(x) else np.empty((0, 3))
+                probs = clf.predict(x, num_threads=num_threads) if len(x) else np.empty((0, 3))
                 h = report['horizon_s']
                 momentum = (data['momentum_return_300s'].to_numpy() if h == 300 else
                             data['momentum_return_900s'].to_numpy() * h / 900)
-                predictions = {'regressor': reg.predict(x, num_threads=2) if len(x) else np.array([]),
+                predictions = {'regressor': reg.predict(x, num_threads=num_threads) if len(x) else np.array([]),
                                'classifier': probs @ report['classifier_class_mean_returns'],
                                'zero': np.zeros(len(x)), 'momentum': momentum}
                 directions = np.argmax(probs, axis=1) - 1
@@ -420,7 +431,7 @@ def open_lockbox(rows, output, version, targets=None, horizons=None, acknowledge
                 rv = data[rv_col].to_numpy() if rv_col in data.columns else np.full(len(x), np.nan)
                 stop_models = {name: lgb.Booster(model_file=str(directory / config['file']))
                                for name, config in report['stop_models'].items()}
-                stops = predict_stops(stop_models, x) if len(x) else {n: np.array([]) for n in stop_models}
+                stops = predict_stops(stop_models, x, num_threads=num_threads) if len(x) else {n: np.array([]) for n in stop_models}
                 risk = {}
                 for name, p in stops.items():
                     side, q = name.split('_')[1], int(name[-2:]) / 100
@@ -433,6 +444,7 @@ def open_lockbox(rows, output, version, targets=None, horizons=None, acknowledge
                                   **{key: stop_metrics(actual, values, q, groups) for key, values in
                                      [('model', p), ('unconditional', constant), ('volatility_scaled', scaled)]}}
                 report['lockbox_results'] = {'range': split['lockbox'], 'metrics': measured, 'stop_metrics': risk,
+                    'num_threads': num_threads,
                     'regimes': direction_regimes(y, {n: [p] for n, p in predictions.items()}, [directions],
                         [regime_assignments(data['tick_ns'].to_numpy(), rv, report['volatility_edges'])]),
                     'notes': 'Saved models only; no refit or tuning; baseline calibration frozen on development.'}
@@ -465,6 +477,8 @@ def main(argv=None):
     parser.add_argument('--output-root', type=Path)
     parser.add_argument('--target', action='append', choices=['BTC_spot', 'BTC_perp', 'ETH_spot', 'ETH_perp'])
     parser.add_argument('--horizon-s', action='append', type=int, choices=[300, 900, 1800])
+    parser.add_argument('--threads', type=int, default=available_cpus(),
+                        help='LightGBM CPU threads; defaults to the CPUs available to this process')
     parser.add_argument('--stride-s', type=int, default=10)
     parser.add_argument('--purge-s', type=int)
     parser.add_argument('--rounds', type=int, default=100)
@@ -488,22 +502,28 @@ def main(argv=None):
     if not args.version or Path(args.version).name != args.version or args.version in {'.', '..'}:
         parser.error('--version must be a single directory name')
     output = args.output_root or (args.root.parent if args.root.is_file() else args.root)
+    num_threads = resolve_threads(args.threads)
     paths = feature_paths(args.root)
-    rows, spec = read_features(paths), load_spec()
+    spec = load_spec()
+    targets = args.target or [f'{asset}_{market}' for asset, markets in spec['references'].items() for market in markets]
+    rows = read_features(paths, targets=targets, spec=spec)
+    input_days = feature_dates(paths, rows['tick_ns'].to_numpy())
     if args.open_lockbox:
         return open_lockbox(rows, output, args.version, args.target, args.horizon_s,
-                            args.i_understand_lockbox_reuse, args.max_memory_gb)
+                            args.i_understand_lockbox_reuse, args.max_memory_gb,
+                            num_threads=num_threads, input_days=input_days)
     split = date_split(rows['tick_ns'].to_numpy(), args.lockbox_pct, args.lockbox_from,
-                       args.embargo_days, max(spec['horizons_s']))
+                       args.embargo_days, max(spec['horizons_s']), input_days=input_days)
     print('Date split (UTC): ' + json.dumps(split), flush=True)
     reports = []
-    for target in args.target or [f'{asset}_{market}' for asset, markets in spec['references'].items() for market in markets]:
+    for target in targets:
         for horizon in args.horizon_s or spec['horizons_s']:
             report = train_target(rows, target, horizon, output, args.version, args.stride_s,
                                   args.purge_s, args.rounds, spec, split=split,
                                   fold_days=args.fold_days, min_train_days=args.min_train_days,
                                   fold_embargo_s=args.fold_embargo_s, max_folds=args.max_folds,
-                                  shuffle_test=args.shuffle_test, max_memory_gb=args.max_memory_gb)
+                                  shuffle_test=args.shuffle_test, max_memory_gb=args.max_memory_gb,
+                                  num_threads=num_threads)
             reports.append(report)
             if report['status'] == 'skipped':
                 print(f"Skipped {target}/{horizon}: {report['reason']}", flush=True)

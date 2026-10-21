@@ -91,6 +91,9 @@ import sys
 if sys.argv[1:3] == ['-m', 'research.train']:
     (Path(sys.argv[3]) / 'trained').write_text('trained')
     (Path(sys.argv[3]) / 'train-args.json').write_text(__import__('json').dumps(sys.argv[4:]))
+elif len(sys.argv) >= 3 and sys.argv[1] == '-c' and 'available_cpus' in sys.argv[2]:
+    print(4)
+    (Path(__file__).resolve().parents[2] / 'jobs-helper-called').write_text('yes')
 else:
     os.execv({sys.executable!r}, [{sys.executable!r}, *sys.argv[1:]])
 ''')
@@ -135,9 +138,13 @@ print(json.dumps({{'output': str(output)}}))
     work = tmp_path / "work"
     work.mkdir()
 
-    def launch(*args):
+    def launch(*args, default_jobs=False):
+        command = ["bash", str(script), str(archive), str(work)]
+        if not default_jobs:
+            command += ["--jobs", "1"]
+        command += list(args)
         return subprocess.run(
-            ["bash", str(script), str(archive), str(work), "--jobs", "1", *args],
+            command,
             env=dict(os.environ, BASH_ENV=str(bash_env), PYTHON_DOTENV_DISABLED="1"),
             text=True, capture_output=True, timeout=30,
         )
@@ -272,3 +279,20 @@ def test_open_lockbox_skips_build_and_replay_and_requires_version(launcher):
     assert 'Building release replay' not in result.stdout
     passed = json.loads((work / 'train-args.json').read_text())
     assert '--open-lockbox' in passed and '--i-understand-lockbox-reuse' in passed
+
+
+def test_replay_only_skips_training(launcher):
+    work, launch = launcher
+    result = launch('--replay-only')
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert len(list(work.glob('features/date=*/features.parquet'))) == 2
+    assert 'training skipped' in result.stdout
+    assert not (work / 'trained').exists()
+
+
+def test_default_jobs_uses_process_cpu_affinity_helper(launcher):
+    work, launch = launcher
+    result = launch('--replay-only', default_jobs=True)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert (work.parent / 'repo/jobs-helper-called').read_text() == 'yes'
+    assert len(list(work.glob('features/date=*/features.parquet'))) == 2

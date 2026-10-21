@@ -205,7 +205,7 @@ def test_live_calendar_coverage_and_vector_parity(caplog):
     complete_tick(svc, '2025-10-24T12:30:00Z')
     assert len(produced) == 1
     import numpy as np
-    expected = features('2025-10-24T12:30:00Z').select(svc.models[0].metadata['features']).to_numpy().astype(np.float32)
+    expected = features('2025-10-24T12:30:00Z').select(svc.models[0].metadata['features']).to_numpy().astype(np.float64)
     np.testing.assert_array_equal(vectors[0], expected)
     complete_tick(svc, '2026-11-01T00:00:00Z')
     complete_tick(svc, '2026-11-01T00:00:10Z')

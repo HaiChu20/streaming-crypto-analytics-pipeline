@@ -3,15 +3,18 @@
 import lightgbm as lgb
 import numpy as np
 
+from research.threads import resolve_threads
+
 QUANTILES = (0.8, 0.9)
 STOP_NAMES = tuple(f"stop_{side}_q{int(q * 100)}" for side in ("long", "short") for q in QUANTILES)
-PARAMS = {"verbosity": -1, "num_threads": 2, "seed": 17, "deterministic": True,
+PARAMS = {"verbosity": -1, "seed": 17, "deterministic": True,
           "force_col_wise": True, "num_leaves": 15, "learning_rate": 0.05,
           "min_data_in_leaf": 20, "feature_pre_filter": False}
 
 
-def fit_stop_models(x, adverse, features, rounds):
+def fit_stop_models(x, adverse, features, rounds, num_threads=None):
     """Fit each side on its non-null path labels; missing volatility is allowed."""
+    num_threads = resolve_threads(num_threads)
     models = {}
     for side, actual in adverse.items():
         keep = np.isfinite(actual)
@@ -20,7 +23,7 @@ def fit_stop_models(x, adverse, features, rounds):
         for q in QUANTILES:
             name = f"stop_{side}_q{int(q * 100)}"
             models[name] = lgb.train(
-                dict(PARAMS, objective="quantile", alpha=q),
+                dict(PARAMS, num_threads=num_threads, objective="quantile", alpha=q),
                 lgb.Dataset(x[keep], label=actual[keep], feature_name=features),
                 num_boost_round=rounds,
             )
@@ -40,7 +43,8 @@ def guard_stop_predictions(predictions):
     return result
 
 
-def predict_stops(models, x, num_threads=2):
+def predict_stops(models, x, num_threads=None):
+    num_threads = resolve_threads(num_threads)
     return guard_stop_predictions({name: model.predict(x, num_threads=num_threads)
                                    for name, model in models.items()})
 
@@ -61,7 +65,7 @@ def stop_metrics(actual, predicted, q, terciles=None):
     return result
 
 
-def evaluate_stops(x, adverse, rv, features, folds, rounds):
+def evaluate_stops(x, adverse, rv, features, folds, rounds, num_threads=None):
     """Out-of-fold risk metrics using the return models' exact purged splits.
 
     k is the training quantile of adverse/rv for positive finite reference rv.
@@ -69,12 +73,13 @@ def evaluate_stops(x, adverse, rv, features, folds, rounds):
     regime assignment. Tercile edges use only this side's valid training labels.
     Overall regime metrics pool rows assigned using their own fold's edges.
     """
+    num_threads = resolve_threads(num_threads)
     rv = np.asarray(rv, dtype=float)
     oof = {name: [] for name in STOP_NAMES}
     reports = []
     for train, test in folds:
-        models = fit_stop_models(x[train], {s: a[train] for s, a in adverse.items()}, features, rounds)
-        predictions = predict_stops(models, x[test])
+        models = fit_stop_models(x[train], {s: a[train] for s, a in adverse.items()}, features, rounds, num_threads=num_threads)
+        predictions = predict_stops(models, x[test], num_threads=num_threads)
         metrics = {}
         for side, actual in adverse.items():
             valid_train = train[np.isfinite(actual[train])]

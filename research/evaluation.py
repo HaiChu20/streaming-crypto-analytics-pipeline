@@ -7,6 +7,8 @@ import re
 import numpy as np
 import polars as pl
 
+from research.threads import resolve_threads
+
 DAY_NS = 86_400_000_000_000
 
 
@@ -14,13 +16,16 @@ def utc_day(tick):
     return datetime.fromtimestamp(int(tick) // 1_000_000_000, timezone.utc).date().isoformat()
 
 
-def date_split(ticks, lockbox_pct=20, lockbox_from=None, embargo_days=1, max_horizon_s=1800):
-    """Use dates present across ALL input instruments, before target selection/labels."""
+def date_split(ticks, lockbox_pct=20, lockbox_from=None, embargo_days=1, max_horizon_s=1800,
+               input_days=None):
+    """Use input feature dates, independent of target selection and labels."""
     if not 0 < lockbox_pct < 100:
         raise ValueError('lockbox_pct must be between 0 and 100')
     if embargo_days < math.ceil(max_horizon_s / 86400):
         raise ValueError('embargo_days must be >= maximum horizon rounded up to days')
-    days = np.unique(np.asarray(ticks, dtype=np.int64) // DAY_NS)
+    days = (np.unique(np.asarray([(date.fromisoformat(day) - date(1970, 1, 1)).days
+                                  for day in input_days], dtype=np.int64)) if input_days is not None
+            else np.unique(np.asarray(ticks, dtype=np.int64) // DAY_NS))
     if not len(days):
         raise ValueError('No feature days')
     if lockbox_from:
@@ -46,25 +51,25 @@ def date_split(ticks, lockbox_pct=20, lockbox_from=None, embargo_days=1, max_hor
 
 
 def feature_array(matrix, features):
-    """Identical float32 conversion for training and live, including missing/inf."""
-    x = matrix.select([(pl.col(c) if c in matrix.columns else pl.lit(None)).cast(pl.Float32).alias(c)
+    """Identical Float64 conversion for training and live, including missing/inf."""
+    x = matrix.select([(pl.col(c) if c in matrix.columns else pl.lit(None)).cast(pl.Float64).alias(c)
                        for c in features]).to_numpy().copy()
     x[~np.isfinite(x)] = np.nan
     return x
 
 
 def memory_estimate(rows, features, max_memory_gb=None):
-    estimated = int(rows) * int(features) * np.dtype(np.float32).itemsize
+    estimated = int(rows) * int(features) * np.dtype(np.float64).itemsize
     if max_memory_gb is None:
         max_memory_gb = .7 * os.sysconf('SC_PHYS_PAGES') * os.sysconf('SC_PAGE_SIZE') / 1024**3
     if not math.isfinite(max_memory_gb) or max_memory_gb <= 0:
         raise ValueError('max_memory_gb must be positive and finite')
-    print(f'X memory estimate: {rows:,} rows × {features:,} features × 4 bytes = '
-          f'{estimated / 1024**3:.3f} GiB (float32); limit {max_memory_gb:.3f} GiB', flush=True)
+    print(f'X memory estimate: {rows:,} rows × {features:,} features × 8 bytes = '
+          f'{estimated / 1024**3:.3f} GiB (float64); limit {max_memory_gb:.3f} GiB', flush=True)
     if estimated > max_memory_gb * 1024**3:
         raise ValueError('X exceeds --max-memory-gb; increase --stride-s or use fewer days. '
                          'Estimate covers X only; input frames and LightGBM need additional RAM.')
-    return {'rows': rows, 'features': features, 'bytes': estimated, 'dtype': 'float32',
+    return {'rows': rows, 'features': features, 'bytes': estimated, 'dtype': 'float64',
             'max_memory_gb': max_memory_gb}
 
 
@@ -109,12 +114,13 @@ def feature_groups(name):
     return group, source
 
 
-def model_importance(model, x, features, sample_size=50_000):
+def model_importance(model, x, features, sample_size=50_000, num_threads=None):
+    num_threads = resolve_threads(num_threads)
     # Chunk contribution tensors (multiclass has three copies) to bound scratch RAM.
     indices = np.sort(np.random.default_rng(17).choice(len(x), min(len(x), sample_size, 50_000), replace=False))
     total = np.zeros(len(features))
     for start in range(0, len(indices), 1024):
-        values = np.asarray(model.predict(x[indices[start:start + 1024]], pred_contrib=True, num_threads=2))
+        values = np.asarray(model.predict(x[indices[start:start + 1024]], pred_contrib=True, num_threads=num_threads))
         values = values.reshape(len(values), -1, len(features) + 1)
         total += np.abs(values[:, :, :-1]).mean(axis=1).sum(axis=0)
     shap = total / max(1, len(indices))

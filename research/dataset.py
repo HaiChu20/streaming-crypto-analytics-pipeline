@@ -1,6 +1,8 @@
 """Same-tick wide matrices with per-row replay provenance and availability."""
 
+from datetime import date
 from pathlib import Path
+import re
 
 import polars as pl
 import pyarrow.parquet as pq
@@ -25,14 +27,28 @@ def feature_paths(root: str | Path) -> list[Path]:
     return paths
 
 
-def read_features(paths: list[Path]) -> pl.DataFrame:
+def read_features(paths: list[Path], targets=None, spec: dict | None = None) -> pl.DataFrame:
+    """Lazily load only target/context instruments; leave cross rows with their base asset."""
+    spec = spec or load_spec()
+    assets = ({target.rsplit('_', 1)[0] for target in targets} |
+              set(spec.get('context_assets', []))) if targets else None
     frames = []
     for path in paths:
         metadata = pq.read_metadata(path).metadata or {}
         mode = metadata.get(b"mode", metadata.get(b"replay_mode", b"")).decode()
         if mode not in {"as_live", "ideal"}:
             raise ValueError(f"Missing/unknown replay mode in {path}: {mode!r}")
-        frame = pl.read_parquet(path).with_columns(pl.lit(mode).alias("replay_mode"))
+        query = pl.scan_parquet(path)
+        if assets:
+            derived = asset_expr()
+            keep = derived.is_in(sorted(assets))
+            if 'asset' in query.collect_schema().names():
+                instrument_asset = (pl.when(pl.col('asset').is_not_null() & (pl.col('asset') != ''))
+                                    .then(pl.col('asset')).otherwise(derived))
+                keep = instrument_asset.is_in(sorted(assets)) | (
+                    (pl.col('exchange') == 'cross') & derived.is_in(sorted(assets)))
+            query = query.filter(keep)
+        frame = query.with_columns(pl.lit(mode).alias("replay_mode")).collect()
         version = metadata.get(b"engine_version", b"").decode()
         if version and frame.filter(pl.col("engine_version") != version).height:
             raise ValueError(f"Engine version disagrees with metadata in {path}")
@@ -45,6 +61,22 @@ def read_features(paths: list[Path]) -> pl.DataFrame:
                    (pl.col("available_ns") < pl.col("tick_ns"))).height:
         raise ValueError("Feature ticks must be whole seconds and available_ns >= tick_ns")
     return rows
+
+
+def feature_dates(paths: list[Path], ticks=None) -> list[str]:
+    """UTC dates from features/date= paths, independent of target availability."""
+    parsed = []
+    for path in paths:
+        match = re.fullmatch(r'date=(\d{4}-\d{2}-\d{2})', path.parent.name)
+        if match:
+            parsed.append(date.fromisoformat(match.group(1)))
+    if parsed and len(parsed) == len(paths):
+        return sorted({day.isoformat() for day in parsed})
+    if ticks is None:
+        raise ValueError('Feature inputs must use features/date=D paths')
+    import numpy as np
+    from research.evaluation import utc_day
+    return sorted({utc_day(tick) for tick in np.asarray(ticks, dtype=np.int64)})
 
 
 def asset_expr() -> pl.Expr:

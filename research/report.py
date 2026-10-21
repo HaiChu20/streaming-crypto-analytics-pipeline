@@ -94,7 +94,7 @@ def target_section(r):
          for name, span in r.get('date_split', {}).items() if name in ('development', 'embargo', 'lockbox')])
     if r.get('memory'):
         memory = r['memory']
-        result += f"<p>X: {memory['rows']:,} rows × {memory['features']:,} features × 4 bytes = {memory['bytes']/1024**3:.3f} GiB; float32.</p>"
+        result += f"<p>X: {memory['rows']:,} rows × {memory['features']:,} features × 8 bytes = {memory['bytes']/1024**3:.3f} GiB; float64.</p>"
     if r.get('status') != 'trained':
         return result + '<p>Skipped: ' + escape(r.get('reason', '')) + '</p></article>'
     result += '<p>' + escape(r.get('feature_dtype', '')) + '</p><p>' + escape(r.get('warning', '')) + '</p>'

@@ -208,6 +208,18 @@ retention does not expire S3 objects, so the report shows growing S3 monthly run
 
 ## Train on another machine (GPU server)
 
+`--threads N` configures every offline LightGBM fit, prediction, and importance
+calculation. It defaults to the CPUs available to the process and is recorded as `num_threads` in
+model metadata. `deterministic=True` remains enabled; results can differ slightly
+across thread counts. Inference uses its own setting.
+
+Training loads only the target assets, configured context assets, and their
+cross rows. Lazy Parquet scans apply this instrument filter before materializing
+the data. The development/embargo/lockbox date split comes from the input
+`features/date=D/` paths, so it stays the same when requested targets change.
+`--replay-only` lets `train_offline.sh` replay on one machine and leave training
+for another machine with the generated feature files.
+
 Clone this repository, install [uv](https://docs.astral.sh/uv/getting-started/installation/)
 and [Rust via rustup](https://rustup.rs), then run:
 
@@ -243,10 +255,8 @@ Opening uses the saved split, models and development-only baseline calibration;
 range across versions warns and requires `--i-understand-lockbox-reuse`.
 The launcher passes these flags through and skips replay when opening a lockbox.
 
-X is float32 in both training and inference through the same conversion helper;
-labels stay float64. Tree decisions normally agree with float64 to prediction
-precision; values at a split threshold can differ, which is why live uses the
-same float32 path. Before allocating X, training prints rows × features × 4 bytes.
+X is float64 in both training and inference through the same conversion helper;
+labels stay float64. Before allocating X, training prints rows × features × 8 bytes.
 `--max-memory-gb` defaults to 70% of physical RAM; exceed it and training stops
 with advice to raise `--stride-s` or use fewer days. This is an X allocation guard,
 not an upper bound on total RAM: input frames, labels and LightGBM need more.

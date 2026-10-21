@@ -1,6 +1,7 @@
 """Offline research contracts: exact labels, same-tick features, purged folds, native LGBM."""
 
 from fractions import Fraction
+from datetime import datetime, timezone, timedelta
 import json
 from pathlib import Path
 
@@ -10,7 +11,7 @@ import polars as pl
 import pyarrow.parquet as pq
 import pytest
 
-from research.dataset import build_matrix, read_features
+from research.dataset import build_matrix, feature_dates, feature_paths, read_features
 from research.labels import NS, exact_return_pct, load_spec, make_labels, momentum_900s
 from research.train import average_ranks, main, metrics, train_target, upload_model, walk_forward_folds
 
@@ -127,6 +128,42 @@ def test_same_tick_wide_features_drop_prices_keep_cross_and_availability(tmp_pat
     assert matrix.equals(other)
 
 
+def test_lazy_target_loading_keeps_context_cross_and_input_date_split(tmp_path):
+    root = tmp_path / 'features'
+    start = int(datetime(2026, 1, 1, tzinfo=timezone.utc).timestamp())
+    for offset in range(10):
+        day = (datetime(2026, 1, 1, tzinfo=timezone.utc) + timedelta(days=offset)).date().isoformat()
+        rows = []
+        for second in (0, 10, 300, 900):
+            tick = start + offset * 86400 + second
+            rows += [row(tick, symbol='BTCUSDT'),
+                     row(tick, symbol='ETHUSDT', mid=200.0),
+                     row(tick, symbol='USDTUSD', mid=1.0, asset='USDT'),
+                     row(tick, exchange='cross', market='cross', symbol='BTC', asset='')]
+        path = root / f'date={day}' / 'features.parquet'
+        write_parquet(path.parent, rows)
+    paths = feature_paths(tmp_path)
+    spec = {k: v for k, v in load_spec().items() if k != 'calendar'}
+    btc = read_features(paths, ['BTC_spot'], spec)
+    both = read_features(paths, ['BTC_spot', 'ETH_spot'], spec)
+    assert set(btc['symbol'].unique().to_list()) == {'BTCUSDT', 'USDTUSD', 'BTC'}
+    assert 'ETHUSDT' in both['symbol'].unique().to_list()
+    assert btc.filter(pl.col('exchange') == 'cross').height == 40
+    btc_days = feature_dates(paths, btc['tick_ns'].to_numpy())
+    both_days = feature_dates(paths, both['tick_ns'].to_numpy())
+    assert btc_days == both_days == [f'2026-01-{day:02d}' for day in range(1, 11)]
+    btc_split = __import__('research.evaluation', fromlist=['date_split']).date_split(
+        btc['tick_ns'].to_numpy(), input_days=btc_days)
+    both_split = __import__('research.evaluation', fromlist=['date_split']).date_split(
+        both['tick_ns'].to_numpy(), input_days=both_days)
+    assert btc_split == both_split
+    assert_frame_equal = pytest.importorskip('polars.testing').assert_frame_equal
+    btc_matrix, btc_features = build_matrix(btc, 'BTC_spot', spec=spec)
+    both_matrix, both_features = build_matrix(both, 'BTC_spot', spec=spec)
+    assert btc_features == both_features
+    assert_frame_equal(btc_matrix, both_matrix)
+
+
 def test_provenance_records_mode_per_row_across_files(tmp_path):
     paths = [write_parquet(tmp_path, [row(0)], "ideal", "a.parquet"),
              write_parquet(tmp_path, [row(10)], "as_live", "b.parquet")]
@@ -228,7 +265,9 @@ def test_metrics_ties_flats_missing_predictions_and_undefined_ic():
 
 
 @pytest.mark.parametrize("horizon", [300, 900, 1800])
-def test_tiny_end_to_end_cli_models_metadata_and_row_modes(tmp_path, synthetic_path, horizon, compact_folds):
+def test_tiny_end_to_end_cli_models_metadata_and_row_modes(tmp_path, synthetic_path, horizon,
+                                                         compact_folds, monkeypatch):
+    monkeypatch.setattr('research.train.available_cpus', lambda: 4)
     output = tmp_path / "output"
     result = main([str(synthetic_path), "--output-root", str(output), "--target", "BTC_spot",
                    "--horizon-s", str(horizon), "--lockbox-from", "1970-01-03", "--rounds", "3", "--version", "test"])
@@ -239,6 +278,8 @@ def test_tiny_end_to_end_cli_models_metadata_and_row_modes(tmp_path, synthetic_p
     metadata = json.loads((directory / "metadata.json").read_text())
     assert metadata["label_spec_version"] == "v1"
     assert metadata["engine_version"] == ["test-v1"]
+    assert metadata['num_threads'] == 4
+    assert metadata['memory']['dtype'] == 'float64'
     audit = pl.read_parquet(directory / "training_rows.parquet")
     assert audit.height == report["labeled_rows"]
     assert audit["replay_mode"].unique().to_list() == ["ideal"]
