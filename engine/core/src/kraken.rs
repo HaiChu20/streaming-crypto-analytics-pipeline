@@ -336,6 +336,48 @@ impl L3Book {
 mod flow_tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn l3_delete_ignores_zero_nonzero_or_missing_quantity() {
+        let order = |id: &str, price: &str, qty: &str| {
+            json!({"order_id":id,"limit_price":price,"order_qty":qty,
+                "timestamp":"2026-07-15T00:00:00.000000001Z"})
+        };
+        let remaining = json!({
+            "bids":[order("b", "10.0", "0.02000000")],
+            "asks":[order("c", "11.0", "0.03000000")]
+        });
+        let snapshot = json!({
+            "bids":[order("a", "10.0", "0.00811129"), order("b", "10.0", "0.02000000")],
+            "asks":remaining["asks"]
+        });
+        let mut expected = L3Book::new(100);
+        expected.apply(&remaining, true).unwrap();
+        for qty in [Some("0.00000000"), Some("0.00811129"), None] {
+            let mut book = L3Book::new(100);
+            book.apply(&snapshot, true).unwrap();
+            let mut delete = json!({"event":"delete","order_id":"a","limit_price":"10.0"});
+            if let Some(qty) = qty {
+                delete["order_qty"] = json!(qty);
+            }
+            let counts = book
+                .apply_counted(&json!({"bids":[delete]}), false)
+                .unwrap();
+            assert_eq!(counts, [0, 0, 1], "delete qty: {qty:?}");
+            assert_eq!(book.side_counts(), [0, 0, 1, 0]);
+            assert_eq!(book.where_, expected.where_);
+            assert_eq!(
+                serde_json::to_value(&book.sides).unwrap(),
+                serde_json::to_value(&expected.sides).unwrap()
+            );
+            assert_eq!(
+                serde_json::to_value(book.book().unwrap()).unwrap(),
+                serde_json::to_value(expected.book().unwrap()).unwrap()
+            );
+            assert_eq!(book.checksum(), expected.checksum(), "delete qty: {qty:?}");
+        }
+    }
+
     #[test]
     fn side_event_counts_use_top_ten_and_stored_delete_side() {
         let order = |id: &str, price: i64, event: &str| {

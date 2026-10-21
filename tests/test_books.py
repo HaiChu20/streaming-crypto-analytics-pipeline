@@ -1,6 +1,7 @@
 """Continuity and checksum rules (plan.md §5.2): synthetic cases, Kraken's documented examples,
 and replays of live fixtures captured by scripts/probe_feeds.py."""
 
+from copy import deepcopy
 from pathlib import Path
 
 import orjson
@@ -81,7 +82,8 @@ def test_kraken_l3_documented_checksum():
     assert book.checksum() == 1063832831
 
 
-def test_kraken_l3_events_keep_queue_order_and_truncate():
+@pytest.mark.parametrize("delete_qty", ["0", "1.0"])
+def test_kraken_l3_events_keep_queue_order_and_truncate(delete_qty):
     book = L3Book(depth=2)
     book.apply(
         {"bids": [{"order_id": "a", "limit_price": "10.0", "order_qty": "1.0", "timestamp": "2026-10-16T00:00:00.000000001Z"},
@@ -94,8 +96,13 @@ def test_kraken_l3_events_keep_queue_order_and_truncate():
     bids = book.sides["bids"]
     assert [str(order[3]) for order in bids[max(bids)]] == ["0.5", "2.0"]  # a keeps its place
     assert len(bids) == 2  # 8.0 truncated (depth 2)
-    book.apply({"bids": [{"event": "delete", "order_id": "c", "limit_price": "9.0", "order_qty": "0"}]}, snapshot=False)
+    expected = deepcopy(book)
+    expected.apply({"bids": [{"event": "delete", "order_id": "c"}]}, snapshot=False)
+    book.apply({"bids": [{"event": "delete", "order_id": "c", "limit_price": "9.0", "order_qty": delete_qty}]}, snapshot=False)
     assert len(bids) == 1
+    assert book.sides == expected.sides
+    assert book.where == expected.where
+    assert book.checksum() == expected.checksum()
 
 
 def _l3_queue_excerpt():

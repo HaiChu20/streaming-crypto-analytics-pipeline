@@ -585,11 +585,11 @@ pub fn discover_filtered(
             return Ok(());
         }
         for entry in fs::read_dir(path)? {
-            let entry = entry?;
-            if entry.file_type()?.is_dir() {
-                walk(&entry.path(), depth - 1, files)?;
-            } else if entry.file_type()?.is_file() {
-                files.push(entry.path());
+            let path = entry?.path();
+            if path.is_dir() {
+                walk(&path, depth - 1, files)?;
+            } else if path.is_file() {
+                files.push(path);
             }
         }
         Ok(())

@@ -373,6 +373,72 @@ fn gzip_open_complete_lines_discovery_and_bad_dates() {
     assert!(day_bounds("2024-02-29").is_ok());
     assert!(day_bounds("../../secret").is_err());
 }
+#[cfg(unix)]
+#[test]
+fn symlinked_archive_pairs_and_files_replay_identically_and_skip_broken_links() {
+    use std::os::unix::fs::symlink;
+
+    let dir = scratch();
+    let real = dir.join("real");
+    let linked = dir.join("linked");
+    let day = "2026-10-17";
+    let (_, end) = day_bounds(day).unwrap();
+    let start = end - 3 * SECOND;
+    let snapshot = raw_path(&real, "BTCUSDT", "snapshot");
+    let trades = raw_path(&real, "BTCUSDT", "trades");
+    fs::write(&snapshot, format!("{}\n", raw(snap(start, "100", "102")))).unwrap();
+    fs::write(&trades, format!("{}\n", raw(trade(start + 1, 1, true)))).unwrap();
+
+    let target = dir.join("pair-target");
+    fs::create_dir_all(&target).unwrap();
+    fs::copy(&snapshot, target.join(snapshot.file_name().unwrap())).unwrap();
+    symlink(&trades, target.join(trades.file_name().unwrap())).unwrap();
+    symlink(
+        dir.join("missing.jsonl"),
+        target.join("20261017_bookticker.jsonl"),
+    )
+    .unwrap();
+    let pair = linked.join("raw/binance/spot/BTCUSDT");
+    fs::create_dir_all(pair.parent().unwrap()).unwrap();
+    symlink(&target, &pair).unwrap();
+    assert_eq!(
+        discover(&linked, day, false).unwrap(),
+        vec![
+            pair.join("20261017_snapshot.jsonl"),
+            pair.join("20261017_trades.jsonl")
+        ]
+    );
+
+    let replay = |root: &std::path::Path| {
+        let result = std::process::Command::new(env!("CARGO_BIN_EXE_engine-replay"))
+            .arg("--root")
+            .arg(root)
+            .args(["--date", day])
+            .output()
+            .unwrap();
+        assert!(
+            result.status.success(),
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        let report: Value = serde_json::from_slice(&result.stdout).unwrap();
+        assert_eq!(report["records"], 2);
+        assert_eq!(report["rows"], 6);
+        assert_eq!(report["book_breaks"], 0);
+        assert_eq!(report["books"]["binance/spot/BTCUSDT/l2"]["valid"], true);
+        let reader =
+            SerializedFileReader::new(File::open(report["output"].as_str().unwrap()).unwrap())
+                .unwrap();
+        let rows = reader
+            .get_row_iter(None)
+            .unwrap()
+            .map(|row| row_json(row.unwrap()))
+            .collect::<Vec<_>>();
+        (report["row_counts"].clone(), report["books"].clone(), rows)
+    };
+    assert_eq!(replay(&linked), replay(&real));
+}
+
 #[test]
 fn parquet_optional_columns_metadata_and_atomic_publish() {
     let out = scratch().join("features.parquet");

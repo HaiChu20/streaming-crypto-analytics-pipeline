@@ -5,6 +5,55 @@ use serde_json::Value;
 use std::{collections::BTreeSet, fs::File, path::PathBuf};
 
 #[test]
+fn archived_kraken_l3_july_delete_quantities_replay_without_breaks() {
+    use engine_core::{Fixed, Kind, features::Engine};
+
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/fixtures/archive_kraken_l3_2026_07");
+    let mut merge = Merge::new(discover(&root, "2026-07-15", false).unwrap()).unwrap();
+    let mut engine = Engine::default();
+    let mut zero_qty_deletes = 0;
+    let mut nonzero_qty_deletes = 0;
+    while let Some(record) = merge.pop().unwrap() {
+        if record.feed == "l3" && record.kind == Kind::Update {
+            let payload: Value = serde_json::from_str(&record.payload).unwrap();
+            for data in payload["data"].as_array().unwrap() {
+                for side in ["bids", "asks"] {
+                    if let Some(orders) = data[side].as_array() {
+                        for order in orders {
+                            if order["event"] == "delete" {
+                                let qty: Fixed =
+                                    order["order_qty"].as_str().unwrap().parse().unwrap();
+                                if qty.0 == 0 {
+                                    zero_qty_deletes += 1;
+                                } else {
+                                    nonzero_qty_deletes += 1;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        engine.consume(&record).unwrap();
+    }
+    assert!(
+        zero_qty_deletes > 0,
+        "fixture must contain zero-qty deletes"
+    );
+    assert!(
+        nonzero_qty_deletes > 0,
+        "fixture must contain non-zero-qty deletes"
+    );
+    let reports = engine.book_reports();
+    let book = &reports["kraken/spot/BTC/USD/l3"];
+    assert_eq!(book.counters.checksum_failures, 0, "{book:?}");
+    assert_eq!(book.counters.breaks, 0, "{book:?}");
+    assert!(book.counters.checksums_verified > 0, "{book:?}");
+    assert!(book.valid, "{book:?}");
+}
+
+#[test]
 fn users_v3_archive_replays_every_pair_and_validates_all_books() {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/archive");
     let scratch = PathBuf::from(
