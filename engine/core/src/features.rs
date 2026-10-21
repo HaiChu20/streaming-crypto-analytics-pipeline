@@ -357,7 +357,7 @@ impl Instrument {
                     if id == "null" {
                         return Err(error("missing trade ID"));
                     }
-                    if !self.remember(id) || r.kind == Kind::Snapshot {
+                    if !self.remember(id) || r.kind == Kind::Snapshot || qty == 0 {
                         continue;
                     }
                     let bucket = self
@@ -404,7 +404,7 @@ impl Instrument {
             }
             "ticker" => {
                 self.extras_source = Some("ticker".into());
-                self.funding = number(&payload["funding_rate"]);
+                self.funding = number(&payload["relative_funding_rate"]);
                 self.mark = number(&payload["markPrice"]);
                 self.oi = number(&payload["openInterest"]);
                 self.next_funding_ms = number(&payload["next_funding_rate_time"]);
@@ -1508,6 +1508,78 @@ mod tests {
         assert_eq!(row.liq_base_1s, Some(0.3));
     }
     #[test]
+    fn binance_zero_quantity_trades_seed_dedup_without_flow() {
+        for maker in [false, true] {
+            let mut state = Instrument::default();
+            let trade = |id, price, qty, maker, kind| {
+                message(
+                    "binance",
+                    "perp",
+                    "trades",
+                    "trade",
+                    "A",
+                    SECOND,
+                    json!({"t":id,"p":price,"q":qty,"m":maker,"X":kind}),
+                )
+            };
+            for record in [
+                trade(1, "100", "2.5", false, "MARKET"),
+                trade(2, "0", "0", maker, "NA"),
+                trade(3, "100", "1.25", true, "MARKET"),
+                trade(2, "0", "0", maker, "NA"),
+                // Even a positive-quantity replay must find the placeholder's ID.
+                trade(2, "100", "100", maker, "MARKET"),
+            ] {
+                state.consume(&record, None).unwrap();
+            }
+            assert_eq!(state.ids.len(), 3);
+            assert_eq!(state.fifo.len(), 3);
+            assert!(state.ids.contains("2"));
+            let row = state
+                .row(&("binance".into(), "perp".into(), "BTCUSDT".into()), SECOND)
+                .unwrap();
+            assert_eq!(row.trade_count, Some(2));
+            assert_eq!(row.volume_base, Some(3.75));
+            assert_eq!(row.taker_buy_base, Some(2.5));
+            assert_eq!(row.taker_sell_base, Some(1.25));
+        }
+    }
+    #[test]
+    fn zero_quantity_trades_skip_other_venues_and_liquidations() {
+        for (exchange, market, payload) in [
+            (
+                "okx",
+                "spot",
+                json!({"data":[{"tradeId":"1","sz":"0","side":"buy"}]}),
+            ),
+            (
+                "okx",
+                "perp",
+                json!({"data":[{"tradeId":"1","sz":"0","side":"sell"}]}),
+            ),
+            (
+                "kraken",
+                "spot",
+                json!({"data":[{"trade_id":1,"qty":"0","side":"buy"}]}),
+            ),
+            (
+                "kraken",
+                "perp",
+                json!({"uid":"1","qty":"0","side":"sell","type":"liquidation"}),
+            ),
+        ] {
+            let mut state = Instrument::default();
+            state
+                .consume(
+                    &message(exchange, market, "trades", "trade", "A", SECOND, payload),
+                    None,
+                )
+                .unwrap();
+            assert_eq!(state.ids.len(), 1, "{exchange}/{market}");
+            assert!(state.buckets.is_empty(), "{exchange}/{market}");
+        }
+    }
+    #[test]
     fn kraken_liquidation_is_forced_taker_side_and_still_a_trade() {
         let mut state = Instrument::default();
         let trade = |conn, id, side, qty, kind| {
@@ -1550,6 +1622,55 @@ mod tests {
         }
     }
     #[test]
+    fn kraken_ticker_uses_relative_funding_and_clears_when_missing() {
+        let key = ("kraken".into(), "perp".into(), "PF_XBTUSD".into());
+        let mut state = Instrument::default();
+        // Rate fields from archive/KrakenRaw/Futurev6/PF_XBTUSD/20261008_ticker.jsonl.gz.
+        let mut payload = json!({
+            "funding_rate":"1.3911361257310142",
+            "relative_funding_rate":"0.000016940145833333"
+        });
+        state
+            .consume(
+                &message(
+                    "kraken",
+                    "perp",
+                    "ticker",
+                    "update",
+                    "A",
+                    SECOND,
+                    payload.clone(),
+                ),
+                None,
+            )
+            .unwrap();
+        assert_eq!(
+            state.row(&key, SECOND).unwrap().funding_rate,
+            Some(0.000016940145833333)
+        );
+        payload
+            .as_object_mut()
+            .unwrap()
+            .remove("relative_funding_rate");
+        state
+            .consume(
+                &message(
+                    "kraken",
+                    "perp",
+                    "ticker",
+                    "update",
+                    "A",
+                    2 * SECOND,
+                    payload,
+                ),
+                None,
+            )
+            .unwrap();
+        let row = state.row(&key, 2 * SECOND).unwrap();
+        assert_eq!(row.funding_rate, None);
+        assert!(serde_json::to_value(row).unwrap()["funding_rate"].is_null());
+    }
+    #[test]
     fn funding_countdown_same_message_gap_and_freshness() {
         for (ex, feed) in [("binance", "mark"), ("kraken", "ticker")] {
             let key = (ex.into(), "perp".into(), "BTCUSDT".into());
@@ -1557,7 +1678,7 @@ mod tests {
             let payload = if ex == "binance" {
                 json!({"data":{"r":"0.1","p":"101","i":"100","T":120000}})
             } else {
-                json!({"funding_rate":"0.1","markPrice":"101","index":"100","next_funding_rate_time":120000})
+                json!({"relative_funding_rate":"0.1","markPrice":"101","index":"100","next_funding_rate_time":120000})
             };
             state
                 .consume(

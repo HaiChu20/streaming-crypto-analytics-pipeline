@@ -110,7 +110,8 @@ recoverable symbol use it; wholly corrupt envelopes invalidate the observed feed
 instruments conservatively.
 
 Rows are sorted by `(tick_ns, exchange, market, symbol, engine_version)`. The
-version is the shared `engine_core::ENGINE_VERSION`.
+version is the shared `engine_core::ENGINE_VERSION`, currently `0.1.0-features-v6`.
+Checkpoints from earlier versions are rejected.
 
 - L2 supplies book features. Invalid, empty or crossed books have null book values.
   Midpoint source values remain exact fixed point. `mid_e9` is an exact i64
@@ -130,7 +131,10 @@ version is the shared `engine_core::ENGINE_VERSION`.
   ID remains eligible for the following start/book snapshot or first trade. The
   crash still counts as a book break and remains UNCERTAIN in `check_raw` reports.
   Historical trade snapshots seed IDs but
-  contribute no new one-second volume. Window membership is receive time in
+  contribute no new one-second volume. On every venue, trades with exactly zero
+  fixed-point quantity also seed IDs but contribute no count, volume, buy/sell
+  flow or liquidations (including Binance perp's `X="NA"` placeholders).
+  Window membership is receive time in
   `(T-1s,T]`, clamped to the processing tick for late/backward records, independent
   of exchange timestamps. Absent optional feeds have null
   metrics; a seen feed with no events in the window has zero metrics.
@@ -180,8 +184,11 @@ version is the shared `engine_core::ENGINE_VERSION`.
   them. Dashboard SQL stays unchanged: ClickHouse's Kafka engine defaults to
   skipping unknown JSON fields, so dashboard ingestion tolerates new features
   ([upstream implementation](https://github.com/ClickHouse/ClickHouse/blob/master/src/Storages/Kafka/StorageKafkaUtils.cpp)).
-- Funding values are the native fields requested by the spec, without assuming
-  identical exchange units/periods. Kraken ticker mark/open interest and Binance
+- `funding_rate` is a relative fraction per venue funding period: Kraken's
+  hourly `relative_funding_rate` and Binance's 8-hourly markPrice `r`. Periods
+  are not normalized. Missing Kraken `relative_funding_rate` yields null; its
+  absolute USD-per-contract `funding_rate` is never used as a fallback.
+  Kraken ticker mark/open interest and Binance
   mark/funding are carried until their active stream ends or its receive age
   exceeds 60 seconds. Liquidation flow counts
   pushed sampled forceOrder messages and uses `z`, cumulative filled quantity,
@@ -263,7 +270,7 @@ its temporary file for diagnosis and does not publish a partial final file.
   and [futures trades](https://docs.kraken.com/exchange/api-reference/futures-websocket/trade)
   explicitly define `side` as taker side. Their snapshots contain prior trades.
 - [Kraken futures ticker](https://docs.kraken.com/exchange/api-reference/futures-websocket/ticker)
-  documents `funding_rate`, `markPrice`, and `openInterest`.
+  documents `relative_funding_rate`, `markPrice`, and `openInterest`.
   [Kraken L3](https://docs.kraken.com/exchange/api-reference/spot-websocket-v2/level3)
   documents order events, per-event prices and quantities, top-ten checksums and
   truncation after a frame.
@@ -337,9 +344,8 @@ reached 10.1% (spot) and 16.1% (futures); aggregate medians meet the 10% thresho
 
 ## Deribit DVOL (features v5)
 
-`ENGINE_VERSION` ends in `-features-v5`; checkpoints from earlier versions are
-rejected. The five new nullable DOUBLE columns are appended after existing
-Parquet columns and also appear in JSON/live output and inference's raw schema.
+Features v5 introduced five nullable DOUBLE columns. They are appended after
+existing Parquet columns and also appear in JSON/live output and inference's raw schema.
 They populate only the `cross/cross/BTC` and `cross/cross/ETH` rows. DVOL never
 creates an index market row, and existing market features retain their values.
 If several Binance spot pairs have the same asset, the first native symbol with

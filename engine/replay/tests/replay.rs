@@ -617,7 +617,7 @@ fn kraken_trade_sides_and_snapshots_and_perp_extras() {
         "ticker",
         "update",
         SECOND,
-        json!({"funding_rate":0.000000000123,"markPrice":100.123456789,"openInterest":123}),
+        json!({"relative_funding_rate":0.000000000123,"markPrice":100.123456789,"openInterest":123}),
     )))
     .unwrap();
     let r = row(&mut e, SECOND);
@@ -773,7 +773,7 @@ fn extras_expire_independently_and_flows_remain_zero_when_silent() {
         (
             "kraken",
             "ticker",
-            json!({"funding_rate":0.001,"markPrice":100,"openInterest":3}),
+            json!({"relative_funding_rate":0.001,"markPrice":100,"openInterest":3}),
         ),
     ] {
         let mut e = Engine::default();

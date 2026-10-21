@@ -220,6 +220,11 @@ the data. The development/embargo/lockbox date split comes from the input
 `--replay-only` lets `train_offline.sh` replay on one machine and leave training
 for another machine with the generated feature files.
 
+The current engine version is `0.1.0-features-v6`: zero-quantity trades seed
+deduplication IDs without contributing features, and Kraken funding uses the
+relative fraction per hourly period (Binance retains its 8-hourly period).
+Earlier checkpoints are rejected; see the [engine field contract](engine/replay/README.md).
+
 Clone this repository, install [uv](https://docs.astral.sh/uv/getting-started/installation/)
 and [Rust via rustup](https://rustup.rs), then run:
 
@@ -339,7 +344,7 @@ metadata checksum mismatches and existing open/gzip counterparts are refused.
 Writes use exclusive creation and fsync; interrupted partial files are preserved
 and cause a later run to refuse, for operator review.
 
-Features v5 appends five nullable float columns to each asset's `cross` row:
+Features v5 introduced five nullable float columns on each asset's `cross` row:
 `dvol`, `dvol_chg_300s`, `dvol_chg_900s`, `dvol_chg_3600s`, `dvol_rv_gap`.
 See the [engine field contract](engine/replay/README.md#deribit-dvol-features-v5)
 for timing and units. Existing market row values are unchanged; their DVOL

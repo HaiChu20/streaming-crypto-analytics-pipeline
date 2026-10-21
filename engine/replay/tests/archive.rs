@@ -288,6 +288,12 @@ fn archived_kraken_ticker_funding_is_an_epoch_millisecond_timestamp() {
         let expected = (1791471600000.0 - tick as f64 / 1_000_000.0) / 60000.0;
         assert_eq!(row.funding_min_to_next, Some(expected));
         assert!((0.0..60.0).contains(&expected));
+        let relative: f64 = payload["relative_funding_rate"]
+            .as_str()
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert_eq!(row.funding_rate, Some(relative));
         let mark: f64 = payload["markPrice"].as_str().unwrap().parse().unwrap();
         let index: f64 = payload["index"].as_str().unwrap().parse().unwrap();
         assert_eq!(row.mark_index_bps, Some((mark - index) / index * 10000.0));

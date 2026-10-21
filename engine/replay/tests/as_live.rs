@@ -286,7 +286,7 @@ fn from_state_preserves_full_hour_windows_and_pending_flow() {
             "ticker",
             "update",
             json!({"openInterest":1000+t,"markPrice":"100.1",
-            "index":"100","funding_rate":"0.01","next_funding_rate_time":(start/1_000_000)+(t+60)*1000}),
+            "index":"100","relative_funding_rate":"0.01","next_funding_rate_time":(start/1_000_000)+(t+60)*1000}),
         );
         let trade = kraken(
             "trades",
