@@ -1,9 +1,9 @@
 """Mid-price stop quantiles, shared guards, and training-only risk baselines."""
 
-import lightgbm as lgb
 import numpy as np
 
 from research.threads import resolve_threads
+from research.fitting import fit_booster
 
 QUANTILES = (0.8, 0.9)
 STOP_NAMES = tuple(f"stop_{side}_q{int(q * 100)}" for side in ("long", "short") for q in QUANTILES)
@@ -12,22 +12,24 @@ PARAMS = {"verbosity": -1, "seed": 17, "deterministic": True,
           "min_data_in_leaf": 20, "feature_pre_filter": False}
 
 
-def fit_stop_models(x, adverse, features, rounds, num_threads=None):
+def fit_stop_models(x, adverse, features, rounds, num_threads=None, *, params=None,
+                    inner=None, early_stopping=False, early_stopping_rounds=50, return_selection=False):
     """Fit each side on its non-null path labels; missing volatility is allowed."""
     num_threads = resolve_threads(num_threads)
-    models = {}
+    models, selected = {}, {}
+    params = dict(PARAMS, **(params or {}), num_threads=num_threads)
     for side, actual in adverse.items():
         keep = np.isfinite(actual)
         if not keep.any():
+            for q in QUANTILES:
+                selected[f'stop_{side}_q{int(q * 100)}'] = {'rounds': None, 'status': 'no_training_labels'}
             continue
         for q in QUANTILES:
             name = f"stop_{side}_q{int(q * 100)}"
-            models[name] = lgb.train(
-                dict(PARAMS, num_threads=num_threads, objective="quantile", alpha=q),
-                lgb.Dataset(x[keep], label=actual[keep], feature_name=features),
-                num_boost_round=rounds,
-            )
-    return models
+            models[name], selected[name], _ = fit_booster(x, actual, features,
+                dict(params, objective='quantile', alpha=q), rounds, inner=inner,
+                early_stopping=early_stopping, patience=early_stopping_rounds, metric='quantile')
+    return (models, selected) if return_selection else models
 
 
 def guard_stop_predictions(predictions):
@@ -69,7 +71,8 @@ def pinball_losses(actual, predicted, q):
     return np.maximum(q * error, (q - 1) * error)
 
 
-def evaluate_stops(x, adverse, rv, features, folds, rounds, num_threads=None, *, return_oof=False):
+def evaluate_stops(x, adverse, rv, features, folds, rounds, num_threads=None, *, return_oof=False,
+                    params=None, inner_splits=None, early_stopping=False, early_stopping_rounds=50):
     """Out-of-fold risk metrics using the return models' exact purged splits.
 
     k is the training quantile of adverse/rv for positive finite reference rv.
@@ -83,8 +86,11 @@ def evaluate_stops(x, adverse, rv, features, folds, rounds, num_threads=None, *,
     oof = {name: [] for name in STOP_NAMES}
     fold_predictions = []
     reports = []
-    for train, test in folds:
-        models = fit_stop_models(x[train], {s: a[train] for s, a in adverse.items()}, features, rounds, num_threads=num_threads)
+    for i, (train, test) in enumerate(folds):
+        models, selected = fit_stop_models(x[train], {s: a[train] for s, a in adverse.items()},
+            features, rounds, num_threads=num_threads, params=params,
+            inner=inner_splits[i] if inner_splits is not None else None, early_stopping=early_stopping,
+            early_stopping_rounds=early_stopping_rounds, return_selection=True)
         predictions = predict_stops(models, x[test], num_threads=num_threads)
         saved = {column: np.full(len(test), np.nan) for name in STOP_NAMES
                  for column in (name, name + '_unconditional', name + '_volatility_scaled')}
@@ -103,7 +109,7 @@ def evaluate_stops(x, adverse, rv, features, folds, rounds, num_threads=None, *,
             for q in QUANTILES:
                 name = f"stop_{side}_q{int(q * 100)}"
                 if name not in predictions:
-                    metrics[name] = {"train_rows": 0, "status": "no_training_labels"}
+                    metrics[name] = {"train_rows": 0, "status": "no_training_labels", 'selection': selected[name]}
                     continue
                 constant = float(np.quantile(actual[valid_train], q))
                 k = float(np.quantile(actual[positive_rv] / rv[positive_rv], q)) if len(positive_rv) else None
@@ -115,6 +121,7 @@ def evaluate_stops(x, adverse, rv, features, folds, rounds, num_threads=None, *,
                               name + '_volatility_scaled': scaled, name + '_volatility_tercile': groups})
                 oof[name].append(values)
                 metrics[name] = {
+                    'selection': selected[name],
                     "train_rows": len(valid_train), "quantile": q, "target_hit_rate": 1 - q,
                     "training_quantile_bps": constant, "volatility_k": k,
                     "volatility_tercile_edges": edges.tolist() if edges is not None else None,

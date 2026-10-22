@@ -96,6 +96,11 @@ def target_section(r):
     if r.get('memory'):
         memory = r['memory']
         result += f"<p>X: {memory['rows']:,} rows × {memory['features']:,} features × 8 bytes = {memory['bytes']/1024**3:.3f} GiB; float64.</p>"
+    if 'exclusions' in r:
+        excluded = r['exclusions']['excluded']
+        result += f"<p>Feature exclusions: {len(excluded)} removed; {r.get('feature_count', 0)} retained.</p>"
+        if excluded:
+            result += '<details><summary>Excluded names</summary><pre>' + escape('\n'.join(excluded)) + '</pre></details>'
     if r.get('status') != 'trained':
         return result + '<p>Skipped: ' + escape(r.get('reason', '')) + '</p></article>'
     result += '<p>' + escape(r.get('feature_dtype', '')) + '</p><p>' + escape(r.get('warning', '')) + '</p>'
@@ -106,6 +111,15 @@ def target_section(r):
           timestamp(f['test_end_ns']), f['train_rows'], f['test_rows'], f.get('test_flat_labels'), f['gap_s']] for f in folds])
     if 'flat_labels' in r:
         result += f"<p>Exact-flat labels: {r['flat_labels']} total; {r.get('oof_flat_labels', 0)} held out.</p>"
+    if r.get('chosen_rounds'):
+        selections = [(str(f['fold']), name, chosen) for f in folds for name, chosen in f.get('chosen_rounds', {}).items()]
+        selections += [('Final', name, chosen) for name, chosen in r['chosen_rounds'].items()]
+        result += '<details><summary>Chosen rounds per model</summary>' + table(
+            ['Fold', 'Model', 'Rounds', 'Selection'],
+            [[fold, name, chosen.get('rounds'), chosen['status']] for fold, name, chosen in selections]) + '</details>'
+    if r.get('ridge'):
+        result += '<p>Ridge uses training-only median imputation, missing indicators and standardisation. '
+        result += 'Alpha = factor × training rows / 1000; factors 1, 10, 100, 1000 use inner validation when available, otherwise factor 100.</p>'
     result += '<p>Each model learns from earlier rows only; labels and feature emissions must be available before the test block.</p>'
     for metric, title in [('directional_accuracy', 'Direction hit rate per fold'), ('spearman_ic', 'IC per fold')]:
         result += chart(title, [(f"Fold {f['fold']} {name}", m.get(metric), COLORS[i % 4])

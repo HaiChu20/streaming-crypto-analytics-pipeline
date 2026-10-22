@@ -505,7 +505,7 @@ def test_oof_file_reproduces_direction_risk_regimes_bootstrap_and_shuffle(tmp_pa
     assert set(report['bootstrap']['blocks']) == {'1', '3', '7'}
     assert report['bootstrap']['draws'] == 1000
     for block in report['bootstrap']['blocks'].values():
-        assert len(block) == 8
+        assert len(block) == 9
         assert block['classifier_vs_reversal_directional_accuracy']['paired_rows'] > 0
         y = frame['return_pct'].to_numpy()
         directions = frame['direction'].to_numpy()
@@ -562,7 +562,7 @@ def test_lockbox_disjoint_interval_allowed_and_acknowledged_reuse_marked(tmp_pat
     ledger.write_text(json.dumps({'version': 'older', 'lockbox_range': {
         'first_day': '2025-01-01', 'last_day': '2025-12-31'}}) + '\n')
     first = open_lockbox(rows, tmp_path, 'v1', lockbox_ledger=ledger, num_threads=2)
-    assert set(first['results'][0]['lockbox_results']['metrics']) == {'regressor', 'classifier', 'zero', 'momentum', 'reversal', 'prior'}
+    assert set(first['results'][0]['lockbox_results']['metrics']) == {'regressor', 'classifier', 'zero', 'momentum', 'reversal', 'prior', 'ridge'}
     entries = [json.loads(line) for line in ledger.read_text().splitlines()]
     assert entries[-1]['reused'] is False
     open_lockbox(rows, tmp_path, 'v1', acknowledge_reuse=True, lockbox_ledger=ledger, num_threads=2)

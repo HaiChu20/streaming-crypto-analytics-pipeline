@@ -19,6 +19,45 @@ NON_FEATURES = {"asset", "tick_ns", "available_ns", "engine_version", "replay_mo
                 "label_end_ns", "label_available_ns", "return_pct", "direction",
                 "adverse_long_bps", "adverse_short_bps", "favorable_long_bps", "favorable_short_bps"}
 
+FEATURE_GROUPS = {
+    'calendar': r'^cal_',
+    'liquidations': r'_liq_',
+    'l3': r'_l3_',
+    'flow': r'_(?:flow|ofi1|ofi10|trades|vol)_\d+s$|_(?:taker_buy_base|taker_sell_base|trade_count|volume_base)$',
+    'returns': r'_(?:ret|return)_\d+s$|^momentum_',
+    'volatility': r'_(?:rv|range_bps)_\d+s$|_dvol(?:$|_chg_\d+s$|_rv_gap$)',
+    'book': r'_(?:spread_bps|imbalance10|microprice_dev_bps|ask_depth10|bid_depth10|depth_(?:ask|bid)_\d+bps|book_age_ms)$',
+    'positioning': r'_(?:funding_|open_interest$|oi_chg_pct_|mark_index_bps$|basis_bps_)',
+    'cross': r'^cross_cross_',
+    'quality': r'_(?:book_valid|warmup|cov_\d+s)$',
+    'venue_kraken': r'^kraken_',
+    'venue_binance': r'^binance_',
+    'context': r'^ctx_',
+}
+
+
+def select_features(features, exclude_groups=(), exclude_features=()):
+    """Preserve saved feature order; every requested exclusion must match input."""
+    excluded = set()
+    patterns = []
+    for name in exclude_groups:
+        if name not in FEATURE_GROUPS:
+            raise ValueError(f'Unknown feature group: {name}')
+        patterns.append((name, FEATURE_GROUPS[name]))
+    patterns.extend((pattern, pattern) for pattern in exclude_features)
+    for name, pattern in patterns:
+        try:
+            matches = {f for f in features if re.search(pattern, f)}
+        except re.error as exc:
+            raise ValueError(f'Invalid feature exclusion regex {pattern!r}: {exc}') from exc
+        if not matches:
+            raise ValueError(f'Feature exclusion matches nothing: {name}')
+        excluded.update(matches)
+    retained = [f for f in features if f not in excluded]
+    if not retained and patterns:
+        raise ValueError('Feature exclusions remove every feature')
+    return retained, {'groups': list(exclude_groups), 'patterns': list(exclude_features), 'excluded': sorted(excluded)}
+
 
 def feature_paths(root: str | Path) -> list[Path]:
     path = Path(root)

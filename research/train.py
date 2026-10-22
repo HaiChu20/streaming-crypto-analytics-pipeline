@@ -8,6 +8,7 @@ import math
 import os
 from pathlib import Path
 import resource
+import re
 import subprocess
 import sys
 
@@ -16,7 +17,9 @@ import numpy as np
 import polars as pl
 
 from research.calendar import Calendar, verify_calendar
-from research.dataset import build_matrix, feature_dates, feature_paths, read_features
+from research.dataset import (FEATURE_GROUPS, build_matrix, feature_dates, feature_paths,
+                              read_features, select_features)
+from research.fitting import fit_booster, inner_split, parse_params, shrinkage_coefficient
 from research.labels import NS, load_spec, make_labels, reference_for, reference_present
 from research.risk import (PARAMS as STOP_PARAMS, STOP_NAMES, evaluate_stops, fit_stop_models,
                            pinball_losses, predict_stops, stop_metrics)
@@ -25,10 +28,32 @@ from research.evaluation import (DAY_NS, date_split, feature_array, memory_estim
                                  leak_check_metrics, model_importance, paired_day_block_bootstrap,
                                  probability_losses, probability_scores)
 from research.threads import available_cpus, resolve_threads
+from research.linear import fit_ridge, ridge_predict
 
 PARAMS = {"verbosity": -1, "seed": 17, "deterministic": True,
           "force_col_wise": True, "num_leaves": 15, "learning_rate": 0.05,
           "min_data_in_leaf": 20, "feature_pre_filter": False}
+
+
+def effective_model_params(params, risk_params, num_threads):
+    direction = dict(PARAMS, **(params or {}), num_threads=num_threads)
+    risk = dict(STOP_PARAMS, **(risk_params or {}), num_threads=num_threads)
+    return {'direction': direction, 'risk': risk, 'num_threads': num_threads,
+            'regressor': dict(direction, objective='regression'),
+            'classifier': dict(direction, objective='multiclass', num_class=3),
+            'stops': {name: dict(risk, objective='quantile', alpha=int(name[-2:]) / 100) for name in STOP_NAMES}}
+
+
+def feature_schema(features):
+    return {'feature_count': len(features),
+            'feature_sha256': hashlib.sha256(json.dumps(features, separators=(',', ':')).encode()).hexdigest()}
+
+
+def params_argument(value):
+    try:
+        return parse_params(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(str(exc)) from exc
 
 
 class InsufficientHistory(ValueError):
@@ -117,22 +142,28 @@ def metrics(actual, predicted, predicted_direction=None) -> dict:
     return result
 
 
-def fit_models(x, y, directions, features, rounds: int, num_threads=None):
+def fit_models(x, y, directions, features, rounds: int, num_threads=None, *, params=None,
+               inner=None, early_stopping=False, early_stopping_rounds=50, return_selection=False):
     num_threads = resolve_threads(num_threads)
-    params = dict(PARAMS, num_threads=num_threads)
-    regressor = lgb.train(
-        dict(params, objective="regression"),
-        lgb.Dataset(x, label=y, feature_name=features), num_boost_round=rounds,
-    )
-    classifier = lgb.train(
-        dict(params, objective="multiclass", num_class=3),
-        lgb.Dataset(x, label=directions + 1, feature_name=features), num_boost_round=rounds,
-    )
+    params = dict(PARAMS, **(params or {}), num_threads=num_threads)
+    regressor, reg_selection, validation = fit_booster(x, y, features, dict(params, objective='regression'),
+        rounds, inner=inner, early_stopping=early_stopping, patience=early_stopping_rounds, metric='l2')
+    classifier, cls_selection, _ = fit_booster(x, directions + 1, features,
+        dict(params, objective='multiclass', num_class=3), rounds, inner=inner,
+        early_stopping=early_stopping, patience=early_stopping_rounds, metric='multi_logloss')
     # Classifier has no native % return. Its implied return is probability times
     # each class's mean return, estimated ONLY on this training fold.
     class_means = np.array([y[directions == d].mean() if np.any(directions == d) else 0.0
                             for d in (-1, 0, 1)])
-    return regressor, classifier, class_means
+    result = (regressor, classifier, class_means)
+    if return_selection:
+        shrinkage = None
+        if early_stopping:
+            shrinkage = {'coefficient': shrinkage_coefficient(y[validation[0]], validation[1])
+                          if validation is not None else 1.,
+                         'status': 'selected' if validation is not None else 'fallback_identity'}
+        return (*result, {'regressor': reg_selection, 'classifier': cls_selection}, shrinkage)
+    return result
 
 
 def volatility_edges(rv):
@@ -179,6 +210,7 @@ def oof_forecasts(frame):
     predictions = {name: frame[column].to_numpy() for name, column in {
         'regressor': 'regressor', 'classifier': 'classifier_expected', 'zero': 'zero',
         'momentum': 'momentum', 'reversal': 'reversal', 'prior': 'prior_expected'}.items()}
+    predictions.update({name: frame[name].to_numpy() for name in ('ridge', 'regressor_shrunk') if name in frame.columns})
     probabilities = {name: frame.select([prefix + 'p_' + c for c in ('down', 'flat', 'up')]).to_numpy()
                      for name, prefix in [('classifier', ''), ('prior', 'prior_')]}
     return predictions, probabilities
@@ -200,6 +232,9 @@ def bootstrap_comparisons(frame):
         'regressor_vs_zero_mse': (y - predictions['regressor']) ** 2 - (y - predictions['zero']) ** 2,
         'classifier_expected_vs_zero_mse': (y - predictions['classifier']) ** 2 - (y - predictions['zero']) ** 2,
     }
+    for name in ('ridge', 'regressor_shrunk'):
+        if name in predictions:
+            differences[name + '_vs_zero_mse'] = (y - predictions[name]) ** 2 - (y - predictions['zero']) ** 2
     for name in STOP_NAMES:
         actual = frame[f'adverse_{name.split("_")[1]}_bps'].to_numpy()
         q = int(name[-2:]) / 100
@@ -227,8 +262,13 @@ def train_target(rows: pl.DataFrame, target: str, horizon_s: int, output_root: s
                  purge_s: int | None = None, rounds: int = 100,
                  spec: dict | None = None, *, split=None, lockbox_pct=20, lockbox_from=None,
                  embargo_days=1, fold_days=7, min_train_days=14, fold_embargo_s=None,
-                 max_folds=12, shuffle_test=False, max_memory_gb=None, num_threads=None) -> dict:
+                 max_folds=12, shuffle_test=False, max_memory_gb=None, num_threads=None,
+                 params=None, risk_params=None, early_stopping=False, inner_valid_days=7,
+                 early_stopping_rounds=50, exclude_groups=(), exclude_features=()) -> dict:
     num_threads = resolve_threads(num_threads)
+    params, risk_params = parse_params(params), parse_params(risk_params)
+    if inner_valid_days < 1 or early_stopping_rounds < 1:
+        raise ValueError('inner_valid_days and early_stopping_rounds must be positive')
     spec = spec or load_spec()
     if horizon_s not in spec["horizons_s"]:
         raise ValueError("Horizon is not in the versioned label spec")
@@ -243,12 +283,16 @@ def train_target(rows: pl.DataFrame, target: str, horizon_s: int, output_root: s
     # Neither label endpoints nor path labels can borrow embargo/lockbox rows.
     rows = rows.filter(pl.col('tick_ns') < split['development_end_ns'])
     skipped = {"target": target, "horizon_s": horizon_s, "version": version,
-               "status": "skipped", "reference": reference_for(target, spec), "date_split": split, "labeled_rows": 0, "matrix_rows": 0}
+               "status": "skipped", "reference": reference_for(target, spec), "date_split": split,
+               'model_params': effective_model_params(params, risk_params, num_threads),
+               "labeled_rows": 0, "matrix_rows": 0}
     if not reference_present(rows, target, spec):
         return dict(skipped, reason="not enough labeled rows: no development reference rows" if split["development"] is None
                     else "reference instrument has no rows in input")
     calendar = Calendar.load(spec["calendar"]) if spec.get("calendar") else None
     matrix, features = build_matrix(rows, target, stride_s, spec, calendar=calendar)
+    features, exclusions = select_features(features, exclude_groups, exclude_features)
+    skipped.update(features=features, exclusions=exclusions, **feature_schema(features))
     labeled = matrix.join(make_labels(rows, target, horizon_s, spec), on="tick_ns", how="left")
     # A delayed emission after the target endpoint cannot be a forecast.
     data = labeled.filter(pl.col("return_pct").is_not_null()
@@ -278,19 +322,37 @@ def train_target(rows: pl.DataFrame, target: str, horizon_s: int, output_root: s
     ref = reference_for(target, spec)
     rv_column = f"{ref['exchange']}_{ref['market']}_rv_300s"
     rv = data[rv_column].to_numpy() if rv_column in data.columns else np.full(data.height, np.nan)
+    def choose_inner(indices):
+        if not early_stopping:
+            return None
+        return inner_split(ticks[indices], data['label_end_ns'].to_numpy()[indices],
+            data['label_available_ns'].to_numpy()[indices], horizon_s, inner_valid_days,
+            purge_s=purge_s, embargo_s=fold_embargo_s,
+            feature_available_ns=data['available_ns'].to_numpy()[indices])
+
+    inner_splits = [choose_inner(train) for train, _ in folds]
+    fitting = dict(params=params, early_stopping=early_stopping, early_stopping_rounds=early_stopping_rounds)
     stop_folds, stop_summary, stop_oof = evaluate_stops(
-        x, adverse, rv, features, folds, rounds, num_threads=num_threads, return_oof=True)
+        x, adverse, rv, features, folds, rounds, num_threads=num_threads, return_oof=True,
+        params=risk_params, inner_splits=inner_splits, early_stopping=early_stopping,
+        early_stopping_rounds=early_stopping_rounds)
     results, oof_frames = [], []
     for i, (train, test) in enumerate(folds, 1):
-        regressor, classifier, class_means = fit_models(
-            x[train], y[train], directions[train], features, rounds, num_threads=num_threads
+        inner = inner_splits[i - 1]
+        ridge, ridge_info = fit_ridge(x, y, train, tuple(train[v] for v in inner) if inner is not None else None)
+        regressor, classifier, class_means, selected, shrinkage = fit_models(
+            x[train], y[train], directions[train], features, rounds, num_threads=num_threads,
+            inner=inner, return_selection=True, **fitting
         )
         probabilities = classifier.predict(x[test], num_threads=num_threads)
         prior = np.tile(class_prior(directions[train]), (len(test), 1))
         predictions = {"regressor": regressor.predict(x[test], num_threads=num_threads),
                        "classifier": probabilities @ class_means,
                        "zero": np.zeros(len(test)), "momentum": momentum[test],
-                       "reversal": -momentum[test], "prior": prior @ class_means}
+                       "reversal": -momentum[test], "prior": prior @ class_means,
+                       'ridge': ridge_predict(ridge, x, test)}
+        if shrinkage is not None:
+            predictions['regressor_shrunk'] = predictions['regressor'] * shrinkage['coefficient']
         class_probs = {'classifier': probabilities, 'prior': prior}
         fold_metrics = forecast_metrics(y[test], predictions, class_probs)
         edges = volatility_edges(rv[train])
@@ -300,6 +362,7 @@ def train_target(rows: pl.DataFrame, target: str, horizon_s: int, output_root: s
                  'reversal': predictions['reversal'], 'prior_expected': predictions['prior'],
                  'p_up_minus_down': probabilities[:, 2] - probabilities[:, 0],
                  **regimes, **stop_oof[i - 1]}
+        saved.update({name: predictions[name] for name in ('ridge', 'regressor_shrunk') if name in predictions})
         for prefix, probs in [('', probabilities), ('prior_', prior)]:
             saved.update({prefix + 'p_' + name: probs[:, j] for j, name in enumerate(('down', 'flat', 'up'))})
         results.append({"fold": i, "train_rows": len(train), "test_rows": len(test),
@@ -312,7 +375,9 @@ def train_target(rows: pl.DataFrame, target: str, horizon_s: int, output_root: s
                         "train_flat_labels": int((directions[train] == 0).sum()),
                         "test_flat_labels": int((directions[test] == 0).sum()),
                         "metrics": fold_metrics, "stop_metrics": stop_folds[i - 1],
-                        'volatility_tercile_edges': edges})
+                        'volatility_tercile_edges': edges,
+                        'chosen_rounds': dict(selected, **{name: stop_folds[i - 1][name]['selection'] for name in STOP_NAMES}),
+                        'ridge': ridge_info, 'regressor_shrinkage': shrinkage})
         if shuffle_test:
             shuffle_probs = np.full((len(test), 3), np.nan)
             shuffle_predictions = {name: np.full(len(test), np.nan) for name in ('regressor', 'classifier')}
@@ -321,7 +386,8 @@ def train_target(rows: pl.DataFrame, target: str, horizon_s: int, output_root: s
             else:
                 permutation = day_block_permutation(ticks[train], seed=17 + i)
                 shuffled_reg, shuffled_clf, means = fit_models(
-                    x[train], y[train][permutation], directions[train][permutation], features, rounds, num_threads=num_threads)
+                    x[train], y[train][permutation], directions[train][permutation], features, rounds,
+                    num_threads=num_threads, inner=inner, **fitting)
                 shuffle_probs = shuffled_clf.predict(x[test], num_threads=num_threads)
                 shuffle_predictions = {'regressor': shuffled_reg.predict(x[test], num_threads=num_threads),
                                        'classifier': shuffle_probs @ means}
@@ -350,12 +416,21 @@ def train_target(rows: pl.DataFrame, target: str, horizon_s: int, output_root: s
         shuffle_summary = {name: leak_check_metrics(dict(value, effective_days=effective_days))
                            for name, value in forecast_metrics(actuals, shuffled_predictions,
                                                               {'classifier': shuffled_probs}).items()}
-    regressor, classifier, class_means = fit_models(x, y, directions, features, rounds, num_threads=num_threads)
+    all_rows = np.arange(len(x))
+    final_inner = choose_inner(all_rows)
+    ridge, ridge_info = fit_ridge(x, y, all_rows, final_inner)
+    regressor, classifier, class_means, final_selection, final_shrinkage = fit_models(
+        x, y, directions, features, rounds, num_threads=num_threads,
+        inner=final_inner, return_selection=True, **fitting)
     directory = Path(output_root) / "models" / target / str(horizon_s) / version
     directory.mkdir(parents=True, exist_ok=False)
     regressor.save_model(str(directory / "regressor.txt"))
     classifier.save_model(str(directory / "classifier.txt"))
-    stop_models = fit_stop_models(x, adverse, features, rounds, num_threads=num_threads)
+    stop_models, stop_selection = fit_stop_models(x, adverse, features, rounds, num_threads=num_threads,
+        params=risk_params, inner=final_inner, early_stopping=early_stopping,
+        early_stopping_rounds=early_stopping_rounds, return_selection=True)
+    final_selection.update(stop_selection)
+    np.savez(directory / 'ridge.npz', **ridge)
     print_peak_rss(f'fitting ({target}/{horizon_s})')
     for name, model in stop_models.items():
         model.save_model(str(directory / f"{name}.txt"))
@@ -369,7 +444,12 @@ def train_target(rows: pl.DataFrame, target: str, horizon_s: int, output_root: s
         "regimes": regime_summary, "shuffle_test": shuffle_summary, "bootstrap": bootstrap,
         "oof_file": "oof.parquet", "oof_rows": oof.height,
         "flat_labels": int((directions == 0).sum()), "oof_flat_labels": int((oof["direction"] == 0).sum()),
-        "model_params": {"direction": PARAMS, "risk": STOP_PARAMS, "num_threads": num_threads},
+        "model_params": effective_model_params(params, risk_params, num_threads),
+        'exclusions': exclusions, **feature_schema(features),
+        'early_stopping': {'enabled': early_stopping, 'inner_valid_days': inner_valid_days,
+                           'patience': early_stopping_rounds},
+        'chosen_rounds': final_selection, 'ridge': ridge_info, 'ridge_file': 'ridge.npz',
+        'regressor_shrinkage': final_shrinkage,
         "fold_config": {"fold_days": fold_days, "min_train_days": min_train_days, "max_folds": max_folds,
                         "fold_embargo_s": horizon_s if fold_embargo_s is None else fold_embargo_s},
         "importance": {name: model_importance(model, x, features, num_threads=num_threads) for name, model in
@@ -516,6 +596,11 @@ def open_lockbox(rows, output, version, targets=None, horizons=None, acknowledge
                 predictions = {'regressor': reg.predict(x, num_threads=num_threads) if len(x) else np.array([]),
                                'classifier': probs @ report['classifier_class_mean_returns'],
                                'zero': np.zeros(len(x)), 'momentum': momentum, 'reversal': -momentum}
+                if report.get('ridge_file'):
+                    with np.load(directory / report['ridge_file'], allow_pickle=False) as saved_ridge:
+                        predictions['ridge'] = ridge_predict(dict(saved_ridge), x)
+                if report.get('regressor_shrinkage') is not None:
+                    predictions['regressor_shrunk'] = predictions['regressor'] * report['regressor_shrinkage']['coefficient']
                 class_probs = {'classifier': probs}
                 if 'classifier_class_prior' in report:
                     class_probs['prior'] = np.tile(report['classifier_class_prior'], (len(x), 1))
@@ -581,7 +666,7 @@ def write_experiment(output, args, argv, targets, horizons, reports, split, rows
         pass
     by_key = {(r['target'], r['horizon_s']): r for r in reports}
     models = []
-    pairs = list(by_key) if args.open_lockbox and by_key else [(t, h) for t in targets for h in horizons]
+    pairs = list(by_key) if (args.open_lockbox or args.list_feature_groups) and by_key else [(t, h) for t in targets for h in horizons]
     for target, horizon in pairs:
         report = by_key.get((target, horizon), {})
         features = report.get('features')
@@ -592,6 +677,7 @@ def write_experiment(output, args, argv, targets, horizons, reports, split, rows
             'stop_metrics': measured.get('stop_metrics'), 'split': report.get('date_split'),
             'stride_s': report.get('stride_s', args.stride_s), 'rounds': report.get('rounds', args.rounds),
             'params': report.get('model_params'),
+            'exclusions': report.get('exclusions'), 'chosen_rounds': report.get('chosen_rounds'),
             'feature_count': len(features) if features is not None else None,
             'feature_sha256': hashlib.sha256(json.dumps(features, separators=(',', ':')).encode()).hexdigest()
                               if features is not None else None})
@@ -599,9 +685,10 @@ def write_experiment(output, args, argv, targets, horizons, reports, split, rows
         splits = [r.get('date_split') for r in reports]
         split = splits[0] if all(s == splits[0] for s in splits) else splits
     entry = {'version': args.version, 'utc_time': datetime.now(timezone.utc).isoformat(), 'git': git,
-             'argv': list(argv), 'mode': 'open_lockbox' if args.open_lockbox else 'train',
+             'argv': list(argv), 'mode': 'list_feature_groups' if args.list_feature_groups else ('open_lockbox' if args.open_lockbox else 'train'),
              'targets': targets, 'horizons_s': horizons, 'stride_s': args.stride_s, 'rounds': args.rounds,
-             'params': {'direction': PARAMS, 'risk': STOP_PARAMS, 'num_threads': num_threads},
+             'params': effective_model_params(args.params, args.risk_params, num_threads),
+             'exclude_groups': args.exclude_group, 'exclude_features': args.exclude_features,
              'split': split, 'engine_versions': sorted(rows['engine_version'].unique().drop_nulls().to_list())
                        if rows is not None else [], 'status': 'failed' if error else 'completed',
              'error': error, 'results': models}
@@ -625,6 +712,14 @@ def main(argv=None):
     parser.add_argument('--stride-s', type=int, default=10)
     parser.add_argument('--purge-s', type=int)
     parser.add_argument('--rounds', type=int, default=100)
+    parser.add_argument('--params', type=params_argument, default={}, help='Inline JSON object or .json file; return/direction parameters')
+    parser.add_argument('--risk-params', type=params_argument, default={}, help='Inline JSON object or .json file; stop parameters')
+    parser.add_argument('--early-stopping', action='store_true')
+    parser.add_argument('--inner-valid-days', type=int, default=7)
+    parser.add_argument('--early-stopping-rounds', type=int, default=50)
+    parser.add_argument('--exclude-group', action='append', default=[], choices=sorted(FEATURE_GROUPS))
+    parser.add_argument('--exclude-features', action='append', default=[], metavar='REGEX')
+    parser.add_argument('--list-feature-groups', action='store_true')
     parser.add_argument('--version')
     parser.add_argument('--lockbox-pct', type=float, default=20)
     parser.add_argument('--lockbox-from')
@@ -678,6 +773,28 @@ def main(argv=None):
             load_paths = [p for p in paths if feature_dates([p])[0] < split['embargo']['first_day']]
             # Preserve the input schema for the ordinary no-development-days skip.
             load_paths = load_paths or paths[:1]
+        if args.list_feature_groups:
+            target, path = targets[0], load_paths[0]
+            if input_days is not None:
+                first = (date.fromisoformat(feature_dates([path])[0]) - date(1970, 1, 1)).days * DAY_NS
+            else:
+                first = pl.scan_parquet(path).select(pl.col('tick_ns').min()).collect().item()
+                if first is None:
+                    raise ValueError('No feature rows to list')
+            end = (first // DAY_NS + 1) * DAY_NS
+            rows = read_features([path], targets=[target], spec=spec, stride_s=args.stride_s,
+                                 before_ns=min(end, before_ns) if before_ns is not None else end)
+            _, features = build_matrix(rows, target, args.stride_s, spec)
+            features, exclusions = select_features(features, args.exclude_group, args.exclude_features)
+            counts = {name: sum(bool(re.search(pattern, f)) for f in features) for name, pattern in FEATURE_GROUPS.items()}
+            for name, count in counts.items():
+                print(f'{name}: {count}', flush=True)
+            print('Groups may overlap (e.g. cross-venue DVOL is in volatility and cross); '
+                  'interpret ablations per group, not by summing group results.', flush=True)
+            listing = {'target': target, 'horizon_s': None, 'status': 'listed', 'features': features,
+                       'feature_groups': counts, 'exclusions': exclusions, **feature_schema(features)}
+            targets, horizons, reports = [target], [], [listing]
+            return listing
         rows = read_features(load_paths, targets=targets, spec=spec,
                              stride_s=load_stride if input_days is not None or args.open_lockbox else None,
                              before_ns=before_ns)
@@ -704,7 +821,10 @@ def main(argv=None):
                                       fold_days=args.fold_days, min_train_days=args.min_train_days,
                                       fold_embargo_s=args.fold_embargo_s, max_folds=args.max_folds,
                                       shuffle_test=args.shuffle_test, max_memory_gb=args.max_memory_gb,
-                                      num_threads=num_threads)
+                                      num_threads=num_threads, params=args.params, risk_params=args.risk_params,
+                                      early_stopping=args.early_stopping, inner_valid_days=args.inner_valid_days,
+                                      early_stopping_rounds=args.early_stopping_rounds,
+                                      exclude_groups=args.exclude_group, exclude_features=args.exclude_features)
                 reports.append(report)
                 if report['status'] == 'skipped':
                     print(f"Skipped {target}/{horizon}: {report['reason']}", flush=True)

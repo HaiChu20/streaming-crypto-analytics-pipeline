@@ -294,7 +294,7 @@ def test_tiny_end_to_end_cli_models_metadata_and_row_modes(tmp_path, synthetic_p
     x = matrix.select(features).head(2).to_numpy().astype(float)
     assert lgb.Booster(model_file=str(directory / "regressor.txt")).predict(x).shape == (2,)
     assert lgb.Booster(model_file=str(directory / "classifier.txt")).predict(x).shape == (2, 3)
-    assert set(report["metrics"]) == {"regressor", "classifier", "zero", "momentum", "reversal", "prior"}
+    assert set(report["metrics"]) == {"regressor", "classifier", "zero", "momentum", "reversal", "prior", "ridge"}
     from research.risk import STOP_NAMES
     assert set(report["stop_models"]) == set(STOP_NAMES)
     assert set(report["stop_metrics"]) == set(STOP_NAMES)
