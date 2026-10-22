@@ -2,7 +2,7 @@ use engine_core::{Kind, Record};
 use engine_replay::{
     ENGINE_VERSION, SECOND,
     features::Engine,
-    input::{Merge, day_bounds, discover},
+    input::{Merge, StreamPath, day_bounds, discover},
     output::Writer,
     row::Row,
 };
@@ -437,6 +437,109 @@ fn symlinked_archive_pairs_and_files_replay_identically_and_skip_broken_links() 
         (report["row_counts"].clone(), report["books"].clone(), rows)
     };
     assert_eq!(replay(&linked), replay(&real));
+}
+
+#[test]
+fn snapshot_error_accepts_any_event_but_unknown_markers_and_events_still_error() {
+    let stream = StreamPath::new(std::path::Path::new(
+        "BinanceTest/Futures/ETHUSDT/20260625_snapshot.jsonl.gz",
+    ))
+    .unwrap();
+    for event in [Some("anchor"), Some("periodic"), Some("other"), None] {
+        let marker = json!({"marker":"snapshot_error","event":event,"symbol":"ETHUSDT","error":"DNS failure","recv_time_ns":1792416661792110820i64});
+        assert!(stream.parse(&marker.to_string()).unwrap().is_none());
+    }
+    assert!(
+        stream
+            .parse(r#"{"marker":"snapshot_error"}"#)
+            .unwrap()
+            .is_none()
+    );
+    for marker in [
+        json!({"marker":"something_else","event":"anchor"}),
+        json!({"marker":"ws_event","event":"something_else"}),
+    ] {
+        let error = stream.parse(&marker.to_string()).unwrap_err().to_string();
+        assert!(error.contains("unknown v3 marker/event"), "{error}");
+    }
+}
+
+#[test]
+fn snapshot_errors_leave_binance_replay_sync_and_output_unchanged() {
+    let dir = scratch();
+    let day = "2026-10-17";
+    let (_, end) = day_bounds(day).unwrap();
+    let start = end - 6 * SECOND;
+    let replay = |with_errors: bool| {
+        let root = dir.join(if with_errors {
+            "with-errors"
+        } else {
+            "baseline"
+        });
+        let pair = root.join("raw/BinanceTest/Futures/ETHUSDT");
+        fs::create_dir_all(&pair).unwrap();
+        let depth = [
+            json!({"marker":"ws_event","event":"connected","conn":"depth","recv_time_ns":start}),
+            json!({"channel":"depth","recv_time_ns":start + 100_000_000,"data":{"U":10,"u":11,"pu":9,"b":[["100","3"]],"a":[]}}),
+            json!({"channel":"depth","recv_time_ns":start + 4 * SECOND,"data":{"U":12,"u":12,"pu":11,"b":[["100","4"]],"a":[]}}),
+        ];
+        fs::write(
+            pair.join("20261017_depth.jsonl"),
+            depth.iter().map(|v| format!("{v}\n")).collect::<String>(),
+        )
+        .unwrap();
+        let mut encoder = flate2::write::GzEncoder::new(
+            File::create(pair.join("20261017_snapshot.jsonl.gz")).unwrap(),
+            flate2::Compression::default(),
+        );
+        if with_errors {
+            writeln!(encoder, "{}", json!({"marker":"snapshot_error","event":"anchor","symbol":"ETHUSDT","error":"DNS failure","recv_time_ns":start + 50_000_000})).unwrap();
+        }
+        writeln!(encoder, "{}", json!({"channel":"snapshot","event":"anchor","symbol":"ETHUSDT","recv_time_ns":start + 2 * SECOND,"data":{"lastUpdateId":10,"bids":[["100","2"]],"asks":[["102","1"]]}})).unwrap();
+        if with_errors {
+            writeln!(encoder, "{}", json!({"marker":"snapshot_error","event":"periodic","symbol":"ETHUSDT","error":"DNS failure","recv_time_ns":start + 3 * SECOND})).unwrap();
+        }
+        writeln!(encoder, "{}", json!({"channel":"snapshot","event":"periodic","symbol":"ETHUSDT","recv_time_ns":start + 5 * SECOND,"data":{"lastUpdateId":0,"bids":[],"asks":[]}})).unwrap();
+        encoder.finish().unwrap();
+
+        let result = std::process::Command::new(env!("CARGO_BIN_EXE_engine-replay"))
+            .arg("--root")
+            .arg(&root)
+            .args(["--date", day])
+            .output()
+            .unwrap();
+        assert!(
+            result.status.success(),
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        let report: Value = serde_json::from_slice(&result.stdout).unwrap();
+        assert_eq!(report["records"], 5);
+        assert_eq!(report["book_breaks"], 0);
+        assert_eq!(report["books"]["binance/perp/ETHUSDT/l2"]["valid"], true);
+        let reader =
+            SerializedFileReader::new(File::open(report["output"].as_str().unwrap()).unwrap())
+                .unwrap();
+        let rows = reader
+            .get_row_iter(None)
+            .unwrap()
+            .map(|r| row_json(r.unwrap()))
+            .collect::<Vec<_>>();
+        let books = rows
+            .iter()
+            .filter(|r| r["exchange"] == "binance")
+            .collect::<Vec<_>>();
+        assert_eq!(books.len(), 6);
+        for (i, book) in books.iter().enumerate() {
+            assert_eq!(book["book_valid"], i >= 2);
+            if i >= 2 {
+                assert_eq!(book["mid_e9"], 101000000000i64);
+                assert_eq!(book["bid_depth10"], if i < 4 { 3.0 } else { 4.0 });
+            }
+        }
+        (report["books"].clone(), rows)
+    };
+    assert_eq!(replay(true), replay(false));
 }
 
 #[test]

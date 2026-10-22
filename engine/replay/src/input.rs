@@ -105,7 +105,10 @@ impl StreamPath {
             data: Option<&'a serde_json::value::RawValue>,
         }
         let meta: Meta<'_> = serde_json::from_str(line)?;
-        if matches!(meta.marker, Some("rollover" | "gap")) || meta.event == Some("gap") {
+        // A failed REST snapshot leaves the depth stream and book unchanged.
+        if matches!(meta.marker, Some("rollover" | "gap" | "snapshot_error"))
+            || meta.event == Some("gap")
+        {
             return Ok(None);
         }
         // A user's marker conn is a recorder label reused on reconnect. Explicit
