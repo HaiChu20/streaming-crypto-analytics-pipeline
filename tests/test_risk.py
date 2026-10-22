@@ -163,3 +163,21 @@ def test_empty_excursion_training_and_missing_volatility_are_reported():
     assert reports[0]["stop_long_q90"]["status"] == "no_training_labels"
     assert overall["stop_short_q90"]["model"]["n"] == 100
     assert overall["stop_short_q90"]["volatility_scaled"]["n"] == 0
+
+
+def test_stop_oof_values_remain_aligned_when_a_fold_has_no_training_labels():
+    x = np.arange(300, dtype=np.float64)[:, None]
+    adverse = {'long': np.r_[np.full(100, np.nan), np.linspace(1, 20, 200)],
+               'short': np.linspace(1, 20, 300)}
+    folds = [(np.arange(100), np.arange(100, 200)), (np.arange(200), np.arange(200, 300))]
+    reports, overall, saved = evaluate_stops(x, adverse, np.ones(300), ['x'], folds,
+                                            rounds=1, num_threads=2, return_oof=True)
+    assert len(saved) == len(folds)
+    assert all(len(values) == 100 for fold in saved for values in fold.values())
+    assert np.isnan(saved[0]['stop_long_q80']).all()
+    assert np.isfinite(saved[1]['stop_long_q80']).all()
+    for name in STOP_NAMES:
+        actual = np.concatenate([adverse[name.split('_')[1]][test] for _, test in folds])
+        prediction = np.concatenate([fold[name] for fold in saved])
+        q = int(name[-2:]) / 100
+        assert overall[name]['model']['pinball_loss'] == stop_metrics(actual, prediction, q)['pinball_loss']

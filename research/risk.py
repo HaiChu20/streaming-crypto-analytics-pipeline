@@ -53,9 +53,8 @@ def stop_metrics(actual, predicted, q, terciles=None):
     actual, predicted = np.asarray(actual), np.asarray(predicted)
     keep = np.isfinite(actual) & np.isfinite(predicted)
     y, p = actual[keep], predicted[keep]
-    error = y - p
     result = {"n": int(keep.sum()), "hit_rate": float(np.mean(y > p)) if len(y) else None,
-              "pinball_loss": float(np.mean(np.maximum(q * error, (q - 1) * error))) if len(y) else None}
+              "pinball_loss": float(np.mean(pinball_losses(y, p, q))) if len(y) else None}
     if terciles is not None:
         groups = np.asarray(terciles)
         result["by_volatility_tercile"] = {
@@ -65,21 +64,32 @@ def stop_metrics(actual, predicted, q, terciles=None):
     return result
 
 
-def evaluate_stops(x, adverse, rv, features, folds, rounds, num_threads=None):
+def pinball_losses(actual, predicted, q):
+    error = np.asarray(actual, dtype=np.float64) - np.asarray(predicted, dtype=np.float64)
+    return np.maximum(q * error, (q - 1) * error)
+
+
+def evaluate_stops(x, adverse, rv, features, folds, rounds, num_threads=None, *, return_oof=False):
     """Out-of-fold risk metrics using the return models' exact purged splits.
 
     k is the training quantile of adverse/rv for positive finite reference rv.
     Zero rv predicts zero; missing/negative rv has no volatility baseline or
     regime assignment. Tercile edges use only this side's valid training labels.
     Overall regime metrics pool rows assigned using their own fold's edges.
+    return_oof adds fold-aligned prediction/baseline vectors, with NaN for unavailable models.
     """
     num_threads = resolve_threads(num_threads)
     rv = np.asarray(rv, dtype=float)
     oof = {name: [] for name in STOP_NAMES}
+    fold_predictions = []
     reports = []
     for train, test in folds:
         models = fit_stop_models(x[train], {s: a[train] for s, a in adverse.items()}, features, rounds, num_threads=num_threads)
         predictions = predict_stops(models, x[test], num_threads=num_threads)
+        saved = {column: np.full(len(test), np.nan) for name in STOP_NAMES
+                 for column in (name, name + '_unconditional', name + '_volatility_scaled')}
+        saved.update({name + '_volatility_tercile': np.full(len(test), -1, dtype=np.int8)
+                      for name in STOP_NAMES})
         metrics = {}
         for side, actual in adverse.items():
             valid_train = train[np.isfinite(actual[train])]
@@ -101,6 +111,8 @@ def evaluate_stops(x, adverse, rv, features, folds, rounds, num_threads=None):
                 if k is not None:
                     scaled[known_rv] = k * rv[test][known_rv]
                 values = (actual[test], predictions[name], np.full(len(test), constant), scaled, groups)
+                saved.update({name: predictions[name], name + '_unconditional': values[2],
+                              name + '_volatility_scaled': scaled, name + '_volatility_tercile': groups})
                 oof[name].append(values)
                 metrics[name] = {
                     "train_rows": len(valid_train), "quantile": q, "target_hit_rate": 1 - q,
@@ -110,6 +122,7 @@ def evaluate_stops(x, adverse, rv, features, folds, rounds, num_threads=None):
                        for key, prediction in zip(("model", "unconditional", "volatility_scaled"), values[1:4])},
                 }
         reports.append(metrics)
+        fold_predictions.append(saved)
     overall = {}
     for name, records in oof.items():
         q = int(name[-2:]) / 100
@@ -120,4 +133,4 @@ def evaluate_stops(x, adverse, rv, features, folds, rounds, num_threads=None):
             **{key: stop_metrics(actual, prediction, q, groups)
                for key, prediction in zip(("model", "unconditional", "volatility_scaled"), (model, constant, scaled))},
         }
-    return reports, overall
+    return (reports, overall, fold_predictions) if return_oof else (reports, overall)

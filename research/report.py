@@ -47,8 +47,9 @@ def direction_charts(values, title='Direction'):
         ('spearman_ic', 'Rank correlation (IC)',
          'IC measures whether larger forecasts tend to precede larger returns; zero means no ranking skill.')]:
         result += chart(label, [(name, m.get(key), COLORS[i % 4]) for i, (name, m) in enumerate(values.items())], caption)
-    result += table(['Model', 'Rows', 'Hit rate', 'IC', 'MAE', 'RMSE'], [
-        [name, m.get('n'), m.get('directional_accuracy'), m.get('spearman_ic'), m.get('mae'), m.get('rmse')]
+    result += table(['Model', 'Rows', 'Hit rate', 'IC', 'MAE', 'RMSE', 'Log loss', 'Brier'], [
+        [name, m.get('n'), m.get('directional_accuracy'), m.get('spearman_ic'), m.get('mae'), m.get('rmse'),
+         m.get('log_loss'), m.get('brier_score')]
         for name, m in values.items()])
     return result
 
@@ -100,19 +101,30 @@ def target_section(r):
     result += '<p>' + escape(r.get('feature_dtype', '')) + '</p><p>' + escape(r.get('warning', '')) + '</p>'
     folds = r.get('folds', [])
     result += '<h3>Walk-forward folds</h3>' + table(
-        ['Fold', 'Train start UTC', 'Train end UTC', 'Test start UTC', 'Test end UTC', 'Train rows', 'Test rows', 'Gap seconds'],
+        ['Fold', 'Train start UTC', 'Train end UTC', 'Test start UTC', 'Test end UTC', 'Train rows', 'Test rows', 'Test flats', 'Gap seconds'],
         [[f['fold'], timestamp(f['train_start_ns']), timestamp(f['train_end_ns']), timestamp(f['test_start_ns']),
-          timestamp(f['test_end_ns']), f['train_rows'], f['test_rows'], f['gap_s']] for f in folds])
+          timestamp(f['test_end_ns']), f['train_rows'], f['test_rows'], f.get('test_flat_labels'), f['gap_s']] for f in folds])
+    if 'flat_labels' in r:
+        result += f"<p>Exact-flat labels: {r['flat_labels']} total; {r.get('oof_flat_labels', 0)} held out.</p>"
     result += '<p>Each model learns from earlier rows only; labels and feature emissions must be available before the test block.</p>'
     for metric, title in [('directional_accuracy', 'Direction hit rate per fold'), ('spearman_ic', 'IC per fold')]:
         result += chart(title, [(f"Fold {f['fold']} {name}", m.get(metric), COLORS[i % 4])
                        for f in folds for i, (name, m) in enumerate(f['metrics'].items())],
-                       'Compare the model with zero and momentum in every held-out period; consistent performance matters more than one good week.')
+                       'Compare the model with zero, momentum, reversal and the training prior in every held-out period.')
     result += direction_charts(r.get('metrics', {}), 'Pooled out-of-fold direction')
+    if r.get('bootstrap'):
+        bootstrap = r['bootstrap']
+        result += '<h3>Paired day-block bootstrap</h3><p>' + escape(
+            f"{bootstrap['test_days']} UTC test days; {bootstrap['draws']} draws. "
+            'Whole ordered days are resampled in moving blocks. Positive accuracy differences and negative loss '
+            'differences favor the model; paired rows are identical within each comparison.') + '</p>'
+        result += table(['Comparison', 'Block days', 'Paired rows', 'Mean difference', '2.5%', '50%', '97.5%'], [
+            [name, length, values['paired_rows'], values['mean_difference'], values['p2_5'], values['p50'], values['p97_5']]
+            for length, scores in bootstrap['blocks'].items() for name, values in scores.items()])
     result += '<h3>Regime breakdown</h3><p>Volatility groups use training-fold terciles; clock buckets are UTC; weekends are Saturday and Sunday.</p>'
     for axis, groups in r.get('regimes', {}).items():
-        result += f'<h4>{escape(axis)}</h4>' + table(['Group', 'Model', 'Rows', 'Hit rate', 'IC'], [
-            [group, name, m['n'], m['directional_accuracy'], m['spearman_ic']]
+        result += f'<h4>{escape(axis)}</h4>' + table(['Group', 'Model', 'Rows', 'Hit rate', 'IC', 'Log loss', 'Brier'], [
+            [group, name, m['n'], m['directional_accuracy'], m['spearman_ic'], m.get('log_loss'), m.get('brier_score')]
             for group, models in groups.items() for name, m in models.items()])
     result += stop_section(r.get('stop_metrics', {}))
     result += '<details><summary>Stop metrics per fold</summary>' + table(

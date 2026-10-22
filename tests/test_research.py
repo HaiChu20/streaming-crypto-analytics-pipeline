@@ -2,6 +2,7 @@
 
 from fractions import Fraction
 from datetime import datetime, timezone, timedelta
+import hashlib
 import json
 from pathlib import Path
 
@@ -285,11 +286,15 @@ def test_tiny_end_to_end_cli_models_metadata_and_row_modes(tmp_path, synthetic_p
     audit = pl.read_parquet(directory / "training_rows.parquet")
     assert audit.height == report["labeled_rows"]
     assert audit["replay_mode"].unique().to_list() == ["ideal"]
+    oof = pl.read_parquet(directory / 'oof.parquet')
+    assert oof.height == sum(f['test_rows'] for f in report['folds'])
+    assert not any(c.startswith('shuffle_') for c in oof.columns)
+    np.testing.assert_array_equal(oof['reversal'].to_numpy(), -oof['momentum'].to_numpy())
     matrix, features = build_matrix(read_features([synthetic_path]), "BTC_spot")
     x = matrix.select(features).head(2).to_numpy().astype(float)
     assert lgb.Booster(model_file=str(directory / "regressor.txt")).predict(x).shape == (2,)
     assert lgb.Booster(model_file=str(directory / "classifier.txt")).predict(x).shape == (2, 3)
-    assert set(report["metrics"]) == {"regressor", "classifier", "zero", "momentum"}
+    assert set(report["metrics"]) == {"regressor", "classifier", "zero", "momentum", "reversal", "prior"}
     from research.risk import STOP_NAMES
     assert set(report["stop_models"]) == set(STOP_NAMES)
     assert set(report["stop_metrics"]) == set(STOP_NAMES)
@@ -310,6 +315,14 @@ def test_tiny_end_to_end_cli_models_metadata_and_row_modes(tmp_path, synthetic_p
     assert report["metrics"]["momentum"] == metrics(data["return_pct"].to_numpy()[test], momentum[test])
     assert report["metrics"]["zero"]["directional_accuracy"] == 0
     assert (output / "research_report_test.json").is_file()
+    experiment = json.loads((output / 'experiments.jsonl').read_text())
+    assert experiment['status'] == 'completed'
+    assert experiment['results'][0]['status'] == 'trained'
+    assert experiment['results'][0]['metrics'] == report['metrics']
+    assert experiment['results'][0]['feature_count'] == len(report['features'])
+    assert experiment['results'][0]['feature_sha256'] == hashlib.sha256(
+        json.dumps(report['features'], separators=(',', ':')).encode()).hexdigest()
+    assert experiment['engine_versions'] == ['test-v1']
     for fold in report["folds"]:
         assert fold["train_label_available_ns"] < fold["test_start_ns"]
         assert fold["train_label_end_ns"] < fold["test_start_ns"]
@@ -351,6 +364,9 @@ def test_no_targets_or_too_few_labels_is_a_reported_success(tmp_path, capsys):
     assert "not enough labeled rows" in result["results"][0]["reason"]
     assert not (output / "models").exists()
     assert (output / "research_report_tiny.json").is_file()
+    experiment = json.loads((output / 'experiments.jsonl').read_text())
+    assert experiment['status'] == 'completed' and len(experiment['results']) == 12
+    assert all(r['status'] == 'skipped' and r['reason'] for r in experiment['results'])
     assert "No targets could train" in capsys.readouterr().out
     only_perp = read_features([write_parquet(tmp_path, [row(0, exchange="kraken", market="perp",
                                                              symbol="PF_XBTUSD")], name="perp.parquet")])
@@ -590,3 +606,29 @@ def test_peak_rss_uses_platform_units(platform, peak, monkeypatch, capsys):
     monkeypatch.setattr('research.train.resource.getrusage', lambda who: SimpleNamespace(ru_maxrss=peak))
     print_peak_rss('loading')
     assert capsys.readouterr().out == 'Peak RSS after loading: 1.250 GiB\n'
+
+
+def test_experiment_ledger_records_failed_invocation_when_git_is_unavailable(tmp_path, monkeypatch):
+    path = write_parquet(tmp_path, [row(0), row(900)])
+    output = tmp_path / 'output'
+
+    def fail_read(*args, **kwargs):
+        raise ValueError('invalid fixture')
+
+    def no_git(*args, **kwargs):
+        raise FileNotFoundError('git missing')
+
+    monkeypatch.setattr('research.train.read_features', fail_read)
+    monkeypatch.setattr('research.train.subprocess.run', no_git)
+    argv = [str(path), '--output-root', str(output), '--version', 'failed',
+            '--target', 'BTC_spot', '--horizon-s', '900']
+    for _ in range(2):
+        with pytest.raises(ValueError, match='invalid fixture'):
+            main(argv)
+    entries = [json.loads(line) for line in (output / 'experiments.jsonl').read_text().splitlines()]
+    assert len(entries) == 2
+    for entry in entries:
+        assert entry['git'] == {'sha': None, 'dirty': None}
+        assert entry['status'] == 'failed' and entry['argv'] == argv
+        assert entry['results'][0]['status'] == 'failed'
+        assert entry['results'][0]['reason'] == 'ValueError: invalid fixture'

@@ -13,6 +13,84 @@ from research.threads import available_cpus, resolve_threads
 DAY_NS = 86_400_000_000_000
 
 
+def class_prior(directions):
+    """Add-one training frequencies, in the saved [-1, 0, 1] class order."""
+    counts = np.bincount(np.asarray(directions, dtype=np.int64) + 1, minlength=3)
+    return (counts.astype(np.float64) + 1) / (counts.sum() + 3)
+
+
+def probability_losses(directions, probabilities):
+    """Per-row natural log loss and multiclass Brier (sum over three classes)."""
+    directions = np.asarray(directions)
+    probabilities = np.asarray(probabilities, dtype=np.float64)
+    if probabilities.shape != (len(directions), 3):
+        raise ValueError('Need one probability for each of [-1, 0, 1] per row')
+    valid = np.isin(directions, [-1, 0, 1]) & np.isfinite(probabilities).all(axis=1)
+    log_loss, brier = np.full(len(directions), np.nan), np.full(len(directions), np.nan)
+    classes = directions[valid].astype(np.int64) + 1
+    probs = probabilities[valid]
+    log_loss[valid] = -np.log(np.clip(probs[np.arange(len(classes)), classes], 1e-15, 1))
+    brier[valid] = np.sum((probs - np.eye(3, dtype=np.float64)[classes]) ** 2, axis=1)
+    return log_loss, brier
+
+
+def probability_scores(directions, probabilities):
+    losses, brier = probability_losses(directions, probabilities)
+    valid = np.isfinite(losses)
+    return {'probability_n': int(valid.sum()),
+            'log_loss': float(losses[valid].mean()) if valid.any() else None,
+            'brier_score': float(brier[valid].mean()) if valid.any() else None}
+
+
+def moving_day_blocks(day_count, block_days, draws=1000, seed=17):
+    """Indices of whole ordered test days; the last block is trimmed to day_count."""
+    if min(day_count, block_days, draws) < 1:
+        raise ValueError('Need positive day count, block length and draws')
+    length = min(block_days, day_count)
+    starts = np.random.default_rng(seed).integers(
+        0, day_count - length + 1, size=(draws, math.ceil(day_count / length)))
+    return (starts[:, :, None] + np.arange(length)).reshape(draws, -1)[:, :day_count]
+
+
+def paired_day_block_bootstrap(ticks, differences, block_lengths=(1, 3, 7), draws=1000, seed=17):
+    """Bootstrap paired row-score differences by UTC days, never individual rows.
+
+    All comparisons share the same sampled days. Aggregate sums/counts keep
+    unequal day sizes and each comparison's paired finite-row mask intact.
+    Positive accuracy differences favor the model; negative loss differences do.
+    """
+    ticks = np.asarray(ticks, dtype=np.int64)
+    days, inverse = np.unique(ticks // DAY_NS, return_inverse=True)
+    daily = {}
+    for name, values in differences.items():
+        values = np.asarray(values, dtype=np.float64)
+        if values.shape != ticks.shape:
+            raise ValueError('Paired differences must align with test ticks')
+        valid = np.isfinite(values)
+        daily[name] = (np.bincount(inverse, weights=np.where(valid, values, 0), minlength=len(days)),
+                       np.bincount(inverse, weights=valid, minlength=len(days)))
+    blocks = {}
+    for length in block_lengths:
+        sampled = moving_day_blocks(len(days), length, draws, seed) if len(days) else None
+        scores = {}
+        for name, (sums, counts) in daily.items():
+            sampled_counts = counts[sampled].sum(axis=1) if sampled is not None else np.array([])
+            usable = sampled_counts > 0
+            means = sums[sampled].sum(axis=1)[usable] / sampled_counts[usable] if usable.any() else np.array([])
+            quantiles = np.quantile(means, [.025, .5, .975]).tolist() if len(means) else [None] * 3
+            scores[name] = {'mean_difference': float(sums.sum() / counts.sum()) if counts.sum() else None,
+                            'p2_5': quantiles[0], 'p50': quantiles[1], 'p97_5': quantiles[2],
+                            'paired_rows': int(counts.sum()), 'paired_days': int((counts > 0).sum()),
+                            'valid_draws': int(usable.sum())}
+        blocks[str(length)] = scores
+    return {'test_days': len(days), 'draws': draws, 'seed': seed, 'blocks': blocks}
+
+
+def date_intervals_overlap(left, right):
+    """Inclusive UTC date intervals: a shared endpoint consumes the lockbox."""
+    return left['first_day'] <= right['last_day'] and right['first_day'] <= left['last_day']
+
+
 def utc_day(tick):
     return datetime.fromtimestamp(int(tick) // 1_000_000_000, timezone.utc).date().isoformat()
 

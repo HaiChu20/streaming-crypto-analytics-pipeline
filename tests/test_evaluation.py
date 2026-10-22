@@ -10,7 +10,9 @@ import polars as pl
 import pytest
 
 from research.evaluation import (DAY_NS, date_split, day_block_permutation, feature_array,
-                                 feature_groups, leak_check_metrics, memory_estimate, model_importance)
+                                 class_prior, date_intervals_overlap, feature_groups, leak_check_metrics,
+                                 memory_estimate, model_importance, moving_day_blocks,
+                                 paired_day_block_bootstrap, probability_losses, probability_scores)
 from research.labels import NS, load_spec
 from research.train import (fit_models, metrics, open_lockbox, train_target, walk_forward_folds,
                             InsufficientHistory, regime_assignments)
@@ -344,6 +346,266 @@ def test_regimes_utc_hours_weekend_and_training_edges():
     np.testing.assert_array_equal(groups['week_part'], [0, 1])
     np.testing.assert_array_equal(groups['utc_hour_4h'], [0, 5])
     np.testing.assert_array_equal(groups['volatility_tercile'], [0, 2])
+
+
+def test_smoothed_prior_log_loss_brier_and_majority_direction_hand_example():
+    from research.train import forecast_metrics
+    prior = class_prior([-1, -1, 0, 1, 1, 1])
+    np.testing.assert_array_equal(prior, np.array([3., 2., 4.]) / 9)
+    probs = np.array([[.5, .25, .25], [.25, .5, .25], [.1, .2, .7]], dtype=np.float64)
+    directions = np.array([-1, 0, 1])
+    scores = probability_scores(directions, probs)
+    assert scores['log_loss'] == pytest.approx(-np.log([.5, .5, .7]).mean())
+    assert scores['brier_score'] == pytest.approx((.375 + .375 + .14) / 3)
+    assert scores['probability_n'] == 3
+    assert probability_scores([-1], [[0., 0., 1.]])['log_loss'] == -np.log(1e-15)
+    assert probability_scores([], np.empty((0, 3)))['log_loss'] is None
+    assert probability_scores([1], [[np.nan] * 3])['probability_n'] == 0
+    y = np.array([-2., 0., 3.])
+    prior_probs = np.tile(prior, (3, 1))
+    measured = forecast_metrics(y, {'prior': np.ones(3)}, {'prior': prior_probs})['prior']
+    assert measured['directional_accuracy'] == .5
+    assert measured['directional_n'] == 2
+    assert measured['mae'] == metrics(y, np.ones(3))['mae']
+    with pytest.raises(ValueError, match='probability'):
+        probability_losses(directions, np.ones((3, 2)))
+
+
+@pytest.mark.parametrize('length', [1, 3, 7])
+def test_bootstrap_resamples_whole_ordered_days_in_moving_blocks(length):
+    # Unequal rows/day make row sampling or an unweighted mean of days incorrect.
+    sizes = np.arange(1, 10)
+    ticks = np.concatenate([day * DAY_NS + np.arange(size) for day, size in enumerate(sizes)])
+    values = np.arange(len(ticks), dtype=np.float64) / 10
+    samples = moving_day_blocks(len(sizes), length, draws=50, seed=43)
+    np.testing.assert_array_equal(samples, moving_day_blocks(len(sizes), length, draws=50, seed=43))
+    assert not np.array_equal(samples, moving_day_blocks(len(sizes), length, draws=50, seed=44))
+    expected = []
+    for sampled in samples:
+        for start in range(0, len(sizes), length):
+            assert np.all(np.diff(sampled[start:start + length]) == 1)
+        indices = np.concatenate([np.flatnonzero(ticks // DAY_NS == day) for day in sampled])
+        for day in np.unique(sampled):
+            counts = np.bincount(indices, minlength=len(ticks))
+            assert np.all(counts[ticks // DAY_NS == day] == np.sum(sampled == day))
+        expected.append(values[indices].mean())
+    result = paired_day_block_bootstrap(ticks, {'paired': values, 'identical': values - values},
+                                        block_lengths=[length], draws=50, seed=43)
+    assert result == paired_day_block_bootstrap(ticks, {'paired': values, 'identical': values - values},
+                                                block_lengths=[length], draws=50, seed=43)
+    score = result['blocks'][str(length)]['paired']
+    np.testing.assert_allclose([score['p2_5'], score['p50'], score['p97_5']], np.quantile(expected, [.025, .5, .975]))
+    assert score['mean_difference'] == pytest.approx(values.mean())
+    assert result['test_days'] == 9 and score['paired_rows'] == sizes.sum()
+    zero = result['blocks'][str(length)]['identical']
+    assert [zero[k] for k in ('mean_difference', 'p2_5', 'p50', 'p97_5')] == [0.] * 4
+
+
+def test_bootstrap_common_finite_mask_empty_scores_and_short_day_history():
+    ticks = np.repeat(np.arange(2) * DAY_NS, 3)
+    result = paired_day_block_bootstrap(ticks, {'missing': [1., np.nan, 3., np.nan, np.nan, np.nan],
+                                               'empty': np.full(6, np.nan)})
+    for scores in result['blocks'].values():
+        assert scores['missing']['mean_difference'] == 2.
+        assert scores['missing']['paired_rows'] == 2 and scores['missing']['paired_days'] == 1
+        assert scores['empty']['p50'] is None and scores['empty']['valid_draws'] == 0
+    assert paired_day_block_bootstrap([], {'empty': []})['test_days'] == 0
+    with pytest.raises(ValueError, match='align'):
+        paired_day_block_bootstrap(ticks, {'wrong': [0.]})
+
+
+def test_oof_file_reproduces_direction_risk_regimes_bootstrap_and_shuffle(tmp_path, sparse_evaluation):
+    from research.risk import STOP_NAMES, stop_metrics
+    rows, spec, _ = sparse_evaluation
+    # Include exact flats, true past endpoints for momentum and missing momentum rows.
+    rows = rows.with_row_index('i').with_columns(
+        pl.when(pl.col('i') % 11 == 0).then(0.).otherwise(pl.col('oracle')).alias('oracle'),
+        (pl.col('mid_e9') + pl.col('i').cast(pl.Int64) * 100).alias('mid_e9')).drop('i')
+    past = rows.with_columns((pl.col('tick_ns') - 900 * NS).alias('tick_ns'),
+                             (pl.col('available_ns') - 900 * NS).alias('available_ns'),
+                             (pl.col('mid_e9') - 1).alias('mid_e9'))
+    rows = pl.concat([past, rows]).sort('tick_ns')
+    report = train_target(rows, 'BTC_spot', 900, tmp_path, 'oof', spec=spec, rounds=2,
+                           shuffle_test=True, num_threads=2)
+    frame = pl.read_parquet(Path(report['model_dir']) / 'oof.parquet')
+    required = {'tick_ns', 'available_ns', 'label_end_ns', 'label_available_ns', 'fold', 'return_pct',
+                'direction', 'regressor', 'p_down', 'p_flat', 'p_up', 'classifier_expected', 'p_up_minus_down',
+                'zero', 'momentum', 'reversal', 'prior_p_down', 'prior_p_flat', 'prior_p_up', 'prior_expected',
+                'volatility_tercile', 'adverse_long_bps', 'adverse_short_bps',
+                'shuffle_regressor', 'shuffle_classifier_expected', 'shuffle_p_down', 'shuffle_p_flat', 'shuffle_p_up',
+                *STOP_NAMES}
+    assert required <= set(frame.columns)
+    assert frame.height == report['oof_rows'] == sum(f['test_rows'] for f in report['folds'])
+    assert frame['tick_ns'].n_unique() == frame.height
+    assert frame['tick_ns'].is_sorted()
+    assert frame.schema['tick_ns'] == pl.Int64 and frame.schema['direction'] == pl.Int8
+    for name in required - {'tick_ns', 'available_ns', 'label_end_ns', 'label_available_ns', 'fold', 'direction', 'volatility_tercile'}:
+        assert frame.schema[name] == pl.Float64
+    np.testing.assert_array_equal(frame['reversal'].to_numpy(), -frame['momentum'].to_numpy())
+    np.testing.assert_array_equal(frame['p_up_minus_down'].to_numpy(), frame['p_up'].to_numpy() - frame['p_down'].to_numpy())
+
+    def recompute(part, name, column, prefix=None):
+        y, prediction = part['return_pct'].to_numpy(), part[column].to_numpy()
+        probs = part.select([prefix + 'p_' + side for side in ('down', 'flat', 'up')]).to_numpy() if prefix is not None else None
+        result = metrics(y, prediction, np.argmax(probs, axis=1) - 1 if probs is not None else None)
+        if probs is not None:
+            valid = np.isfinite(probs).all(axis=1)
+            classes = part['direction'].to_numpy()[valid] + 1
+            p = probs[valid]
+            result.update(probability_n=int(valid.sum()),
+                log_loss=float(-np.log(np.clip(p[np.arange(len(p)), classes], 1e-15, 1)).mean()) if len(p) else None,
+                brier_score=float(((p - np.eye(3)[classes]) ** 2).sum(axis=1).mean()) if len(p) else None)
+        return result
+
+    def assert_direction(part, recorded):
+        for name, column, prefix in [('regressor', 'regressor', None), ('classifier', 'classifier_expected', ''),
+                                      ('prior', 'prior_expected', 'prior_'), ('zero', 'zero', None),
+                                      ('momentum', 'momentum', None), ('reversal', 'reversal', None)]:
+            assert recorded[name] == recompute(part, name, column, prefix)
+
+    def assert_risk(part, recorded):
+        for name in STOP_NAMES:
+            q = int(name[-2:]) / 100
+            actual = part[f'adverse_{name.split("_")[1]}_bps'].to_numpy()
+            groups = part[name + '_volatility_tercile'].to_numpy()
+            for method, column in [('model', name), ('unconditional', name + '_unconditional'),
+                                    ('volatility_scaled', name + '_volatility_scaled')]:
+                assert recorded[name][method] == stop_metrics(actual, part[column].to_numpy(), q, groups)
+
+    assert_direction(frame, report['metrics'])
+    assert_risk(frame, report['stop_metrics'])
+    for fold in report['folds']:
+        part = frame.filter(pl.col('fold') == fold['fold'])
+        assert_direction(part, fold['metrics'])
+        assert_risk(part, fold['stop_metrics'])
+        assert fold['test_flat_labels'] == (part['direction'] == 0).sum()
+        train_rows = rows.filter(pl.col('tick_ns') <= fold['train_end_ns'])
+        assert fold['train_rows'] == train_rows.height
+        assert fold['train_flat_labels'] == (train_rows['oracle'] == 0).sum()
+        counts = np.bincount(np.sign(train_rows['oracle'].to_numpy()).astype(int) + 1, minlength=3)
+        expected_prior = (counts + 1) / (counts.sum() + 3)
+        np.testing.assert_array_equal(part.select('prior_p_down', 'prior_p_flat', 'prior_p_up').to_numpy(),
+                                      np.tile(expected_prior, (part.height, 1)))
+        training_y = train_rows['oracle'].to_numpy()
+        class_means = np.array([training_y[np.sign(training_y) == d].mean() if np.any(np.sign(training_y) == d) else 0.
+                                for d in (-1, 0, 1)])
+        np.testing.assert_allclose(part['classifier_expected'].to_numpy(),
+            part.select('p_down', 'p_flat', 'p_up').to_numpy() @ class_means, rtol=1e-15, atol=1e-17)
+        np.testing.assert_allclose(part['prior_expected'].to_numpy(),
+            part.select('prior_p_down', 'prior_p_flat', 'prior_p_up').to_numpy() @ class_means, rtol=1e-15, atol=1e-17)
+    assert report['oof_flat_labels'] == (frame['direction'] == 0).sum() > 0
+    trainable = rows.filter(pl.col('tick_ns') <= report['data_window']['end_ns'])
+    assert report['flat_labels'] == (trainable['oracle'] == 0).sum() > 0
+    for axis, labels in report['regimes'].items():
+        for i, recorded in enumerate(labels.values()):
+            assert_direction(frame.filter(pl.col(axis) == i), recorded)
+    for name, column, prefix in [('regressor', 'shuffle_regressor', None), ('classifier', 'shuffle_classifier_expected', 'shuffle_')]:
+        measured = recompute(frame, name, column, prefix)
+        assert measured.items() <= report['shuffle_test'][name].items()
+    assert set(report['bootstrap']['blocks']) == {'1', '3', '7'}
+    assert report['bootstrap']['draws'] == 1000
+    for block in report['bootstrap']['blocks'].values():
+        assert len(block) == 8
+        assert block['classifier_vs_reversal_directional_accuracy']['paired_rows'] > 0
+        y = frame['return_pct'].to_numpy()
+        directions = frame['direction'].to_numpy()
+        cls_direction = np.argmax(frame.select('p_down', 'p_flat', 'p_up').to_numpy(), axis=1) - 1
+        reversal = frame['reversal'].to_numpy()
+        paired = (directions != 0) & np.isfinite(reversal)
+        accuracy_difference = (cls_direction == directions).astype(float) - (np.sign(reversal) == directions)
+        assert block['classifier_vs_reversal_directional_accuracy']['mean_difference'] == pytest.approx(accuracy_difference[paired].mean())
+        assert block['regressor_vs_zero_mse']['mean_difference'] == pytest.approx(np.mean((y - frame['regressor'].to_numpy()) ** 2 - y**2))
+        assert block['classifier_expected_vs_zero_mse']['mean_difference'] == pytest.approx(np.mean((y - frame['classifier_expected'].to_numpy()) ** 2 - y**2))
+        cls_loss = -np.log(np.clip(frame.select('p_down', 'p_flat', 'p_up').to_numpy()[np.arange(len(y)), frame['direction'].to_numpy() + 1], 1e-15, 1))
+        prior_loss = -np.log(frame.select('prior_p_down', 'prior_p_flat', 'prior_p_up').to_numpy()[np.arange(len(y)), frame['direction'].to_numpy() + 1])
+        assert block['classifier_vs_prior_log_loss']['mean_difference'] == pytest.approx((cls_loss - prior_loss).mean())
+        for name in STOP_NAMES:
+            q = int(name[-2:]) / 100
+            actual = frame[f'adverse_{name.split("_")[1]}_bps'].to_numpy()
+            model_error = actual - frame[name].to_numpy()
+            baseline_error = actual - frame[name + '_unconditional'].to_numpy()
+            delta = np.maximum(q * model_error, (q - 1) * model_error) - np.maximum(q * baseline_error, (q - 1) * baseline_error)
+            assert block[name + '_vs_unconditional_pinball']['mean_difference'] == pytest.approx(delta[np.isfinite(delta)].mean())
+    html = (tmp_path / 'models/BTC_spot/900/report_oof.html').read_text()
+    for text in ('reversal', 'prior', 'Log loss', 'Brier', 'Paired day-block bootstrap', 'Exact-flat labels'):
+        assert text in html
+
+
+@pytest.mark.parametrize('previous', [
+    ('2026-02-02', '2026-02-09'),  # exact
+    ('2026-01-30', '2026-02-04'),  # partial
+    ('2026-02-04', '2026-02-06'),  # contained
+    ('2026-01-01', '2026-03-01'),  # contains
+    ('2026-01-30', '2026-02-02'),  # shared first endpoint
+    ('2026-02-09', '2026-02-15'),  # shared last endpoint
+])
+def test_lockbox_refuses_any_inclusive_interval_overlap(tmp_path, monkeypatch, previous):
+    requested = {'first_day': '2026-02-02', 'last_day': '2026-02-09', 'days': 8}
+    prior = dict(zip(('first_day', 'last_day'), previous))
+    assert date_intervals_overlap(requested, prior)
+    assert date_intervals_overlap(prior, requested)
+    ledger = tmp_path / 'custom.jsonl'
+    ledger.write_text(json.dumps({'version': 'different', 'lockbox_range': prior}) + '\n')
+    original = ledger.read_bytes()
+    monkeypatch.setattr('research.train.lockbox_reports',
+                        lambda *args: [{'date_split': {'lockbox': requested}}])
+    with pytest.raises(ValueError, match='i-understand-lockbox-reuse'):
+        open_lockbox(None, tmp_path, 'v1', lockbox_ledger=ledger)
+    assert ledger.read_bytes() == original
+
+
+def test_lockbox_disjoint_interval_allowed_and_acknowledged_reuse_marked(tmp_path, sparse_evaluation):
+    rows, spec, _ = sparse_evaluation
+    report = train_target(rows, 'BTC_spot', 300, tmp_path, 'v1', spec=spec, rounds=1, num_threads=2)
+    ledger = tmp_path / 'ledger/custom.jsonl'
+    ledger.parent.mkdir()
+    ledger.write_text(json.dumps({'version': 'older', 'lockbox_range': {
+        'first_day': '2025-01-01', 'last_day': '2025-12-31'}}) + '\n')
+    first = open_lockbox(rows, tmp_path, 'v1', lockbox_ledger=ledger, num_threads=2)
+    assert set(first['results'][0]['lockbox_results']['metrics']) == {'regressor', 'classifier', 'zero', 'momentum', 'reversal', 'prior'}
+    entries = [json.loads(line) for line in ledger.read_text().splitlines()]
+    assert entries[-1]['reused'] is False
+    open_lockbox(rows, tmp_path, 'v1', acknowledge_reuse=True, lockbox_ledger=ledger, num_threads=2)
+    entries = [json.loads(line) for line in ledger.read_text().splitlines()]
+    assert len(entries) == 3 and entries[-1]['reused'] is True
+    assert entries[-1]['lockbox_range'] == report['date_split']['lockbox']
+    assert not (tmp_path / 'lockbox_ledger.jsonl').exists()
+
+
+@pytest.mark.parametrize('custom', [False, True], ids=['features-root-default', 'explicit-path'])
+def test_lockbox_cli_ledger_location_and_experiment_entry(tmp_path, sparse_evaluation, custom):
+    import pyarrow.parquet as pq
+    from research.train import main
+    rows, spec, _ = sparse_evaluation
+    root, output = tmp_path / 'features-root', tmp_path / 'different-output'
+    report = train_target(rows, 'BTC_spot', 300, output, 'saved', spec=spec, rounds=1, num_threads=2)
+    unopened = {'target': 'ETH_spot', 'horizon_s': 900, 'status': 'skipped',
+                'reason': 'no reference rows', 'date_split': report['date_split']}
+    (output / 'research_report_saved.json').write_text(json.dumps({'results': [report, unopened]}))
+    for day in np.unique(rows['tick_ns'].to_numpy() // DAY_NS):
+        path = root / 'features' / f'date={datetime.fromtimestamp(int(day) * 86400, timezone.utc).date().isoformat()}' / 'features.parquet'
+        path.parent.mkdir(parents=True)
+        frame = rows.filter(pl.col('tick_ns') // DAY_NS == day)
+        pq.write_table(frame.to_arrow().replace_schema_metadata({b'mode': b'ideal', b'engine_version': b'fixture'}), path)
+    ledger = tmp_path / 'custom/ledger.jsonl' if custom else root / 'lockbox_ledger.jsonl'
+    argv = [str(root), '--output-root', str(output), '--open-lockbox', '--version', 'saved',
+            '--target', 'BTC_spot', '--horizon-s', '300', '--threads', '2']
+    if custom:
+        argv += ['--lockbox-ledger', str(ledger)]
+    result = main(argv)
+    assert ledger.is_file() and not (output / 'lockbox_ledger.jsonl').exists()
+    assert len(ledger.read_text().splitlines()) == 1
+    measured = result['results'][0]['lockbox_results']['metrics']
+    assert measured['classifier']['log_loss'] is not None and measured['prior']['brier_score'] is not None
+    entry = json.loads((output / 'experiments.jsonl').read_text())
+    assert entry['mode'] == 'open_lockbox' and entry['status'] == 'completed'
+    assert len(entry['results']) == 1
+    assert entry['targets'] == ['BTC_spot'] and entry['horizons_s'] == [300]
+    assert entry['results'][0]['status'] == 'evaluated'
+    assert entry['results'][0]['metrics'] == measured
+    assert entry['results'][0]['rounds'] == 1
+    assert entry['split'] == report['date_split']
+    assert entry['engine_versions'] == ['fixture']
 
 
 def test_inventory_stat_only_gaps_case_open_sources_and_targets(tmp_path, monkeypatch):
