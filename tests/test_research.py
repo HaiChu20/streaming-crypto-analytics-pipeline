@@ -10,9 +10,11 @@ import numpy as np
 import polars as pl
 import pyarrow.parquet as pq
 import pytest
+from polars.testing import assert_frame_equal
 
 from research.dataset import build_matrix, feature_dates, feature_paths, read_features
-from research.labels import NS, exact_return_pct, load_spec, make_labels, momentum_900s
+from research.labels import (LABEL_INPUTS, NS, exact_return_pct, load_spec, make_labels,
+                             momentum_900s, reference_for)
 from research.train import average_ranks, main, metrics, train_target, upload_model, walk_forward_folds
 
 
@@ -381,7 +383,7 @@ def test_context_assets_same_tick_premium_missing_nulls_and_no_future_leakage(tm
     assert not any(c.startswith("ctx_") for c in columns)
     assert no_context["available_ns"][0] == 250_000_000
     absent, _ = build_matrix(frame.filter(pl.col("symbol") == "BTCUSDT"), "BTC_spot")
-    assert absent["ctx_usdt_binance_spot_premium_bps"].null_count() == 3
+    assert not any(c.startswith('ctx_usdt_') for c in absent.columns)
 
 
 def test_context_assets_apply_mode_version_and_availability_guards(tmp_path):
@@ -400,3 +402,191 @@ def test_context_assets_apply_mode_version_and_availability_guards(tmp_path):
     invalid = frame.with_columns(pl.when(pl.col("symbol") == "USDTUSD").then(False)
                                  .otherwise(pl.col("book_valid")).alias("book_valid"))
     assert build_matrix(invalid, "BTC_spot")[0]["ctx_usdt_binance_spot_premium_bps"].null_count() == 2
+
+
+@pytest.fixture(scope='module', params=[False, True], ids=['absent-context', 'present-context'])
+def lean_paths(tmp_path_factory, request):
+    root = tmp_path_factory.mktemp('lean')
+    midnight = int(datetime(2026, 1, 2, tzinfo=timezone.utc).timestamp())
+    daily = {}
+    # A dense interval across midnight; prices exceed Float64's exact integer range.
+    for offset in range(-1000, 2001):
+        second = midnight + offset
+        day = datetime.fromtimestamp(second, timezone.utc).date().isoformat()
+        rows = daily.setdefault(day, [])
+        for asset in ('BTC', 'ETH'):
+            for market in ('spot', 'perp'):
+                if (asset, market, offset) in {('BTC', 'spot', -23), ('ETH', 'perp', 101)}:
+                    continue
+                rows.append(row(second, 2**53 + 1 + (offset % 151), symbol=f'{asset}USDT',
+                                market=market, warmup=offset == -998, book_valid=offset != 641,
+                                ret_60s=None if offset == 10 else offset / 1000,
+                                available_ns=(second + (19 if offset == -900 else 0)) * NS + 123_456_789))
+        rows.append(row(second, exchange='okx', symbol='BTC-USDT', spread_bps=3.))
+        rows.append(row(second, exchange='cross', market='cross', symbol='BTC', asset='',
+                        available_ns=second * NS + 987_654_321))
+        if request.param:
+            rows.append(row(second, NS + 5, symbol='USDTUSD', asset='USDT'))
+    return [write_parquet(root / 'features' / f'date={day}', rows)
+            for day, rows in daily.items()]
+
+
+@pytest.mark.parametrize('target', ['BTC_spot', 'BTC_perp', 'ETH_spot', 'ETH_perp'])
+@pytest.mark.parametrize('horizon', [300, 900, 1800])
+@pytest.mark.parametrize('multi_target', [False, True], ids=['single', 'multi'])
+def test_lean_matrix_labels_momentum_and_provenance_equal_full(lean_paths, target, horizon, multi_target):
+    spec = dict(load_spec())
+    spec.pop('calendar')
+    targets = ['BTC_spot', 'BTC_perp', 'ETH_spot', 'ETH_perp'] if multi_target else [target]
+    full = read_features(lean_paths, targets, spec)
+    lean = read_features(lean_paths, targets, spec, stride_s=10)
+    # Every reference remains dense; only its non-stride feature payload is null.
+    for requested in targets:
+        ref = reference_for(requested, spec)
+        keep = pl.all_horizontal([pl.col(k) == v for k, v in ref.items()])
+        assert_frame_equal(full.filter(keep).select(LABEL_INPUTS).sort('tick_ns'),
+                           lean.filter(keep).select(LABEL_INPUTS).sort('tick_ns'), check_exact=True)
+    dense = lean.filter(pl.col('tick_ns') % (10 * NS) != 0)
+    assert dense['ret_60s'].null_count() == dense.height
+    assert lean.height < full.height
+    expected, full_features = build_matrix(full, target, spec=spec)
+    actual, lean_features = build_matrix(lean, target, spec=spec)
+    assert lean_features == full_features == sorted(full_features)
+    assert_frame_equal(actual, expected, check_exact=True)
+    # Includes integer endpoint provenance, directions and all four excursions.
+    expected_labels = make_labels(full, target, horizon, spec)
+    actual_labels = make_labels(lean, target, horizon, spec)
+    assert_frame_equal(actual_labels, expected_labels, check_exact=True)
+    assert expected_labels['return_pct'].drop_nulls().len() > 0
+    assert expected_labels['adverse_long_bps'].null_count() > 0
+    from research.evaluation import feature_array
+    x = feature_array(actual, lean_features)
+    assert x.dtype == np.float64
+    np.testing.assert_array_equal(x, feature_array(expected, full_features))
+
+
+@pytest.mark.parametrize('kind', ['dense', 'stride', 'overlap'])
+def test_lean_rejects_duplicate_keys(tmp_path, kind):
+    duplicate = row(1) if kind != 'stride' else row(10, exchange='okx', symbol='BTC-USDT')
+    paths = [write_parquet(tmp_path, [row(0), duplicate, *([] if kind == 'overlap' else [duplicate])])]
+    if kind == 'overlap':
+        paths.append(write_parquet(tmp_path, [duplicate], name='overlap.parquet'))
+    with pytest.raises(ValueError, match='Duplicate'):
+        read_features(paths, ['BTC_spot'], stride_s=10)
+
+
+@pytest.mark.parametrize('changes,message', [
+    ({'tick_ns': NS + 1}, 'whole seconds'),
+    ({'available_ns': NS - 1}, 'whole seconds'),
+    ({'engine_version': 'wrong'}, 'Engine version disagrees'),
+])
+def test_lean_validates_dense_reference_rows(tmp_path, changes, message):
+    path = write_parquet(tmp_path, [row(0), row(1, **changes)])
+    with pytest.raises(ValueError, match=message):
+        read_features([path], ['BTC_spot'], stride_s=10)
+
+
+def test_context_presence_fills_only_observed_assets_missing_venues(tmp_path):
+    rows = [row(0), row(10), row(0, exchange='okx', symbol='BTC-USDT')]
+    rows += [row(10, NS, symbol='USDTUSD')]
+    full = read_features([write_parquet(tmp_path, rows)])
+    for frame in (full, full.filter(pl.col('symbol') != 'USDTUSD')):
+        matrix, features = build_matrix(frame, 'BTC_spot')
+        present = frame.filter(pl.col('symbol') == 'USDTUSD').height > 0
+        assert any(c.startswith('ctx_usdt_') for c in features) == present
+        if present:
+            assert matrix['ctx_usdt_okx_spot_premium_bps'].null_count() == matrix.height
+            assert matrix['ctx_usdt_binance_spot_premium_bps'].to_list() == [None, 0.]
+    # Presence is about input rows, even if none coincide with eligible matrix ticks.
+    off_stride = full.with_columns(pl.when(pl.col('symbol') == 'USDTUSD')
+                                  .then(pl.col('tick_ns') + NS).otherwise(pl.col('tick_ns')).alias('tick_ns'))
+    matrix, _ = build_matrix(off_stride, 'BTC_spot')
+    assert matrix['ctx_usdt_binance_spot_premium_bps'].null_count() == matrix.height
+
+
+def test_cli_splits_paths_before_loading_and_trains_same_reports(tmp_path, synthetic_path,
+                                                               compact_folds, monkeypatch, capsys):
+    from research.evaluation import DAY_NS, date_split
+    start = int(datetime(2026, 1, 1, tzinfo=timezone.utc).timestamp()) * NS
+    raw = pl.read_parquet(synthetic_path)
+    for i in range(2):
+        part = raw.slice(i * 5400, 5400).with_columns(
+            (pl.col('tick_ns') - i * 5400 * NS + start + i * DAY_NS).alias('tick_ns'),
+            (pl.col('available_ns') - i * 5400 * NS + start + i * DAY_NS).alias('available_ns'))
+        write_parquet(tmp_path / 'features' / f'date=2026-01-{i+1:02d}', part.to_dicts())
+    for i in (3, 4):
+        write_parquet(tmp_path / 'features' / f'date=2026-01-{i:02d}',
+                      [row(start // NS + (i - 1) * 86400)])
+    paths = feature_paths(tmp_path)
+    full = read_features(paths, ['BTC_spot'])
+    expected_split = date_split(full['tick_ns'].to_numpy(), lockbox_from='2026-01-04',
+                                input_days=feature_dates(paths, full['tick_ns'].to_numpy()))
+    assert date_split([], lockbox_from='2026-01-04', input_days=feature_dates(paths)) == expected_split
+    original = read_features
+    seen = []
+
+    def check_read(paths, *args, **kwargs):
+        assert [p.parent.name for p in paths] == ['date=2026-01-01', 'date=2026-01-02']
+        assert kwargs['before_ns'] == expected_split['development_end_ns']
+        loaded = original(paths, *args, **kwargs)
+        assert loaded['tick_ns'].max() < expected_split['development_end_ns']
+        seen.append(loaded.height)
+        return loaded
+
+    monkeypatch.setattr('research.train.read_features', check_read)
+    result = main([str(tmp_path), '--target', 'BTC_spot', '--horizon-s', '900', '--rounds', '2',
+                   '--threads', '2', '--version', 'lean', '--lockbox-from', '2026-01-04'])
+    report = result['results'][0]
+    assert result['trained'] == 1 and result['input_rows'] == seen[0] < full.height
+    assert report['date_split'] == expected_split
+    baseline = train_target(full, 'BTC_spot', 900, tmp_path, 'full', rounds=2,
+                            split=expected_split, num_threads=2)
+    assert set(report) == set(baseline)
+    for key in ('features', 'metrics', 'stop_metrics', 'matrix_rows', 'labeled_rows', 'folds'):
+        assert report[key] == baseline[key]
+    assert json.loads((tmp_path / 'research_report_lean.json').read_text()) == result
+    assert set(result) == {'input_files', 'input_rows', 'results', 'trained', 'skipped'}
+    output = capsys.readouterr().out
+    for stage in ('loading', 'matrix/labels', 'fitting'):
+        assert f'Peak RSS after {stage}' in output
+
+
+def test_lockbox_cli_loads_union_of_saved_strides_and_dense_references(tmp_path, monkeypatch):
+    for market, horizon, stride in [('spot', 900, 6), ('perp', 300, 10)]:
+        directory = tmp_path / 'models' / f'BTC_{market}' / str(horizon) / 'saved'
+        directory.mkdir(parents=True)
+        (directory / 'metadata.json').write_text(json.dumps(dict(
+            target=f'BTC_{market}', horizon_s=horizon, stride_s=stride)))
+    for day in (1, 2):
+        second = int(datetime(2026, 1, day, tzinfo=timezone.utc).timestamp())
+        write_parquet(tmp_path / 'features' / f'date=2026-01-{day:02d}',
+                      [row(second + t, market=market) for t in range(21) for market in ('spot', 'perp')])
+    observed = []
+
+    def evaluate(rows, output, version, targets, horizons, *args, **kwargs):
+        assert output == tmp_path and version == 'saved'
+        assert kwargs['input_days'] == ['2026-01-01', '2026-01-02']
+        for market in ('spot', 'perp'):
+            ref = rows.filter(pl.col('market') == market)
+            assert ref.height == 42
+            for stride in (6, 10):
+                ticks = ref.filter(pl.col('tick_ns') % (stride * NS) == 0)
+                assert ticks['ret_60s'].null_count() == 0
+            dense = ref.filter(pl.col('tick_ns') % (2 * NS) != 0)
+            assert dense['ret_60s'].null_count() == dense.height
+        observed.append(rows.height)
+        return {'evaluated': True}
+
+    monkeypatch.setattr('research.train.open_lockbox', evaluate)
+    assert main([str(tmp_path), '--version', 'saved', '--open-lockbox', '--stride-s', '7']) == {'evaluated': True}
+    assert observed == [84]
+
+
+@pytest.mark.parametrize('platform,peak', [('darwin', 5 * 1024**3 // 4), ('linux', 5 * 1024**2 // 4)])
+def test_peak_rss_uses_platform_units(platform, peak, monkeypatch, capsys):
+    from types import SimpleNamespace
+    from research.train import print_peak_rss
+    monkeypatch.setattr('research.train.sys.platform', platform)
+    monkeypatch.setattr('research.train.resource.getrusage', lambda who: SimpleNamespace(ru_maxrss=peak))
+    print_peak_rss('loading')
+    assert capsys.readouterr().out == 'Peak RSS after loading: 1.250 GiB\n'

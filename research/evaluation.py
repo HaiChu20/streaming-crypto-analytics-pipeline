@@ -2,12 +2,13 @@
 from datetime import date, datetime, timezone
 import math
 import os
+from pathlib import Path
 import re
 
 import numpy as np
 import polars as pl
 
-from research.threads import resolve_threads
+from research.threads import available_cpus, resolve_threads
 
 DAY_NS = 86_400_000_000_000
 
@@ -61,7 +62,32 @@ def feature_array(matrix, features):
 def memory_estimate(rows, features, max_memory_gb=None):
     estimated = int(rows) * int(features) * np.dtype(np.float64).itemsize
     if max_memory_gb is None:
-        max_memory_gb = .7 * os.sysconf('SC_PHYS_PAGES') * os.sysconf('SC_PAGE_SIZE') / 1024**3
+        physical = os.sysconf('SC_PHYS_PAGES') * os.sysconf('SC_PAGE_SIZE')
+        limits = [physical]
+        for path in ('/sys/fs/cgroup/memory.max', '/sys/fs/cgroup/memory.limit_in_bytes',
+                     '/sys/fs/cgroup/memory/memory.limit_in_bytes'):
+            try:
+                limit = int(Path(path).read_text().strip())
+            except (OSError, ValueError):
+                continue
+            if 0 < limit < physical:  # Also ignores v1's huge "unlimited" sentinel.
+                limits.append(limit)
+        slurm_cpus = available_cpus()
+        for name in ('SLURM_CPUS_PER_TASK', 'SLURM_CPUS_ON_NODE'):
+            try:
+                cpus = int(os.environ.get(name, ''))
+            except ValueError:
+                continue
+            if cpus > 0:
+                slurm_cpus = min(slurm_cpus, cpus)
+        for name, cpus in (('SLURM_MEM_PER_NODE', 1), ('SLURM_MEM_PER_CPU', slurm_cpus)):
+            try:
+                limit = int(os.environ.get(name, '')) * cpus * 1024**2
+            except ValueError:
+                continue
+            if 0 < limit < physical:
+                limits.append(limit)
+        max_memory_gb = .7 * min(limits) / 1024**3
     if not math.isfinite(max_memory_gb) or max_memory_gb <= 0:
         raise ValueError('max_memory_gb must be positive and finite')
     print(f'X memory estimate: {rows:,} rows × {features:,} features × 8 bytes = '

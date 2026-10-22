@@ -4,8 +4,11 @@ import argparse
 from datetime import date, datetime, timezone
 import json
 import hashlib
+import math
 import os
 from pathlib import Path
+import resource
+import sys
 
 import lightgbm as lgb
 import numpy as np
@@ -22,6 +25,12 @@ from research.threads import available_cpus, resolve_threads
 
 class InsufficientHistory(ValueError):
     """Valid input that cannot yet support the requested walk-forward split."""
+
+
+def print_peak_rss(stage):
+    peak = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+    gib = peak / (1024**3 if sys.platform == 'darwin' else 1024**2)
+    print(f'Peak RSS after {stage}: {gib:.3f} GiB', flush=True)
 
 
 def walk_forward_folds(tick_ns, horizon_s: int, purge_s: int | None = None,
@@ -194,6 +203,7 @@ def train_target(rows: pl.DataFrame, target: str, horizon_s: int, output_root: s
                           & (pl.col("available_ns") < pl.col("label_end_ns"))
                           & (pl.col("label_end_ns") < split['development_end_ns'])
                           & (pl.col("label_available_ns") < split['development_end_ns'])).sort("tick_ns")
+    print_peak_rss(f'matrix/labels ({target}/{horizon_s})')
     if not features or data.is_empty():
         return dict(skipped, reason="not enough labeled rows", matrix_rows=matrix.height,
                     labeled_rows=data.height)
@@ -281,6 +291,7 @@ def train_target(rows: pl.DataFrame, target: str, horizon_s: int, output_root: s
     regressor.save_model(str(directory / "regressor.txt"))
     classifier.save_model(str(directory / "classifier.txt"))
     stop_models = fit_stop_models(x, adverse, features, rounds, num_threads=num_threads)
+    print_peak_rss(f'fitting ({target}/{horizon_s})')
     for name, model in stop_models.items():
         model.save_model(str(directory / f"{name}.txt"))
     data.select("asset", "tick_ns", "available_ns", "label_end_ns", "label_available_ns",
@@ -355,6 +366,18 @@ def upload_model(directory: str | Path, output_root: str | Path, bucket: str | N
             client.upload_file(str(path), bucket, path.relative_to(output_root).as_posix())
 
 
+def lockbox_reports(output, version, targets=None, horizons=None):
+    """Read the frozen model configurations used for loading and evaluation."""
+    paths = sorted(p / 'metadata.json' for p in (Path(output) / 'models').glob('*/*/*')
+                   if p.name == version and (p / 'metadata.json').is_file())
+    reports = [json.loads(path.read_text()) for path in paths]
+    reports = [r for r in reports if (not targets or r['target'] in targets)
+               and (not horizons or r['horizon_s'] in horizons)]
+    if not reports:
+        raise ValueError('--open-lockbox needs already-trained models of --version')
+    return reports
+
+
 def open_lockbox(rows, output, version, targets=None, horizons=None, acknowledge_reuse=False,
                  max_memory_gb=None, num_threads=None, input_days=None):
     """Evaluate saved boosters and frozen calibration only. No fitting code here."""
@@ -364,13 +387,7 @@ def open_lockbox(rows, output, version, targets=None, horizons=None, acknowledge
 
     if not version or Path(version).name != version or version in {'.', '..'}:
         raise ValueError('version must be a single directory name')
-    paths = sorted(p / 'metadata.json' for p in (Path(output) / 'models').glob('*/*/*')
-                   if p.name == version and (p / 'metadata.json').is_file())
-    reports = [json.loads(path.read_text()) for path in paths]
-    reports = [r for r in reports if (not targets or r['target'] in targets)
-               and (not horizons or r['horizon_s'] in horizons)]
-    if not reports:
-        raise ValueError('--open-lockbox needs already-trained models of --version')
+    reports = lockbox_reports(output, version, targets, horizons)
     ranges = {json.dumps(r['date_split']['lockbox'], sort_keys=True) for r in reports}
     if 'null' in ranges:
         raise ValueError('This version has no lockbox days')
@@ -410,6 +427,7 @@ def open_lockbox(rows, output, version, targets=None, horizons=None, acknowledge
                 data = matrix.join(make_labels(held, report['target'], report['horizon_s'], spec),
                                    on='tick_ns', how='left').filter(
                     pl.col('return_pct').is_not_null() & (pl.col('available_ns') < pl.col('label_end_ns')))
+                print_peak_rss(f'matrix/labels (lockbox {report["target"]}/{report["horizon_s"]})')
                 memory_estimate(data.height, len(report['features']), max_memory_gb)
                 x = feature_array(data, report['features'])
                 directory = Path(report['model_dir'])
@@ -506,14 +524,38 @@ def main(argv=None):
     paths = feature_paths(args.root)
     spec = load_spec()
     targets = args.target or [f'{asset}_{market}' for asset, markets in spec['references'].items() for market in markets]
-    rows = read_features(paths, targets=targets, spec=spec)
-    input_days = feature_dates(paths, rows['tick_ns'].to_numpy())
+    load_stride = args.stride_s
+    if args.open_lockbox:
+        frozen = lockbox_reports(output, args.version, args.target, args.horizon_s)
+        targets = sorted({report['target'] for report in frozen})
+        # A shared read must retain full payloads for every saved model's stride.
+        load_stride = math.gcd(*(report['stride_s'] for report in frozen))
+    try:
+        input_days = feature_dates(paths)
+    except ValueError:
+        input_days = None  # Single-file/legacy inputs still derive dates from full rows.
+    split = None
+    load_paths = paths
+    before_ns = None
+    if input_days is not None and not args.open_lockbox:
+        split = date_split([], args.lockbox_pct, args.lockbox_from, args.embargo_days,
+                           max(spec['horizons_s']), input_days=input_days)
+        before_ns = split['development_end_ns']
+        load_paths = [p for p in paths if feature_dates([p])[0] < split['embargo']['first_day']]
+        # Preserve the input schema for the ordinary no-development-days skip.
+        load_paths = load_paths or paths[:1]
+    rows = read_features(load_paths, targets=targets, spec=spec,
+                         stride_s=load_stride if input_days is not None or args.open_lockbox else None,
+                         before_ns=before_ns)
+    print_peak_rss('loading')
+    if input_days is None:
+        input_days = feature_dates(paths, rows['tick_ns'].to_numpy())
     if args.open_lockbox:
         return open_lockbox(rows, output, args.version, args.target, args.horizon_s,
                             args.i_understand_lockbox_reuse, args.max_memory_gb,
                             num_threads=num_threads, input_days=input_days)
-    split = date_split(rows['tick_ns'].to_numpy(), args.lockbox_pct, args.lockbox_from,
-                       args.embargo_days, max(spec['horizons_s']), input_days=input_days)
+    split = split or date_split(rows['tick_ns'].to_numpy(), args.lockbox_pct, args.lockbox_from,
+                               args.embargo_days, max(spec['horizons_s']), input_days=input_days)
     print('Date split (UTC): ' + json.dumps(split), flush=True)
     reports = []
     for target in targets:

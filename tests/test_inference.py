@@ -135,10 +135,15 @@ def test_duplicates_late_rows_inference_errors_and_future_availability(caplog):
     assert sum("differs from live" in m for m in caplog.messages) == 1
 
 
-def test_load_and_predict_tiny_native_models(tmp_path):
-    meta = metadata()
+@pytest.mark.parametrize('legacy_context', [False, True], ids=['current', 'legacy-context'])
+def test_load_and_predict_tiny_native_models(tmp_path, legacy_context):
+    features = (['ctx_usdt_okx_spot_premium_bps', 'binance_spot_spread_bps',
+                 'ctx_usdt_binance_spot_spread_bps'] if legacy_context else None)
+    meta = metadata(features)
     x = np.arange(120).reshape(-1, 1).astype(float)
     y = np.sin(x[:, 0])
+    if legacy_context:
+        x = np.column_stack([np.full(120, np.nan), x, np.full(120, np.nan)])
     reg, clf, _ = fit_models(x, y, np.sign(y).astype(int), meta["features"], 3)
     path = tmp_path / "models/BTC_spot/900/test"
     path.mkdir(parents=True)
@@ -149,7 +154,11 @@ def test_load_and_predict_tiny_native_models(tmp_path):
     svc = Service(models, Producer())
     feed(svc, row(10), row(11))
     assert svc.counts["predictions"] == 1
-    expected = float(reg.predict([[2.]], num_threads=2)[0])
+    vector = vector_for([row(10)], [], meta)
+    if legacy_context:
+        assert vector.dtype == np.float64
+        np.testing.assert_array_equal(vector, [[np.nan, 2., np.nan]])
+    expected = float(reg.predict(vector, num_threads=2)[0])
     payload = json.loads(svc.producer.messages[0][1]["value"])
     assert payload["pred_return_pct"] == expected
     assert models[0].stops == {}

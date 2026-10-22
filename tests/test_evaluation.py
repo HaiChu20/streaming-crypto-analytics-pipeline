@@ -140,12 +140,68 @@ def test_leak_flag_synthetic_numbers_threshold_and_undefined():
 
 def test_memory_guard_before_allocation_and_physical_default(monkeypatch, capsys):
     monkeypatch.setattr('research.evaluation.os.sysconf', lambda key: {'SC_PHYS_PAGES': 1024**2, 'SC_PAGE_SIZE': 4096}[key])
+    monkeypatch.setattr('research.evaluation.Path.read_text', lambda self: 'max')
+    monkeypatch.delenv('SLURM_MEM_PER_NODE', raising=False)
+    monkeypatch.delenv('SLURM_MEM_PER_CPU', raising=False)
     estimate = memory_estimate(100, 50)
     assert estimate['bytes'] == 100 * 50 * 8 and estimate['dtype'] == 'float64'
     assert estimate['max_memory_gb'] == pytest.approx(2.8)
     with pytest.raises(ValueError, match='stride-s.*fewer days'):
         memory_estimate(10**9, 100, .001)
     assert '8 bytes' in capsys.readouterr().out
+
+
+@pytest.mark.parametrize('cgroup,node,cpu,expected_gb', [
+    ('1073741824', None, None, .7),
+    ('max', '2048', None, 1.4),
+    ('9223372036854771712', None, '256', .7),
+    ('2147483648', '1024', None, .7),
+    ('0', None, None, 2.8),
+    ('invalid', '-1', 'invalid', 2.8),
+])
+def test_memory_guard_respects_cgroup_and_slurm(monkeypatch, cgroup, node, cpu, expected_gb):
+    monkeypatch.setattr('research.evaluation.os.sysconf',
+                        lambda key: {'SC_PHYS_PAGES': 1024**2, 'SC_PAGE_SIZE': 4096}[key])
+    monkeypatch.setattr('research.evaluation.Path.read_text', lambda self: cgroup)
+    monkeypatch.setattr('research.evaluation.available_cpus', lambda: 4)
+    monkeypatch.delenv('SLURM_CPUS_PER_TASK', raising=False)
+    monkeypatch.delenv('SLURM_CPUS_ON_NODE', raising=False)
+    for name, value in [('SLURM_MEM_PER_NODE', node), ('SLURM_MEM_PER_CPU', cpu)]:
+        if value is None:
+            monkeypatch.delenv(name, raising=False)
+        else:
+            monkeypatch.setenv(name, value)
+    assert memory_estimate(100, 10)['max_memory_gb'] == pytest.approx(expected_gb)
+
+
+@pytest.mark.parametrize('cpu_variable', ['SLURM_CPUS_PER_TASK', 'SLURM_CPUS_ON_NODE'])
+def test_memory_guard_uses_slurm_allocated_cpu_count(monkeypatch, cpu_variable):
+    monkeypatch.setattr('research.evaluation.os.sysconf',
+                        lambda key: {'SC_PHYS_PAGES': 1024**2, 'SC_PAGE_SIZE': 4096}[key])
+    monkeypatch.setattr('research.evaluation.Path.read_text', lambda self: 'max')
+    monkeypatch.setattr('research.evaluation.available_cpus', lambda: 64)
+    for name in ('SLURM_MEM_PER_NODE', 'SLURM_CPUS_PER_TASK', 'SLURM_CPUS_ON_NODE'):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv('SLURM_MEM_PER_CPU', '256')
+    monkeypatch.setenv(cpu_variable, '2')
+    assert memory_estimate(100, 10)['max_memory_gb'] == pytest.approx(.35)
+
+
+@pytest.mark.parametrize('path', ['/sys/fs/cgroup/memory.max', '/sys/fs/cgroup/memory.limit_in_bytes',
+                                 '/sys/fs/cgroup/memory/memory.limit_in_bytes'])
+def test_memory_guard_cgroup_paths_and_unavailable_files(monkeypatch, path):
+    monkeypatch.setattr('research.evaluation.os.sysconf',
+                        lambda key: {'SC_PHYS_PAGES': 1024**2, 'SC_PAGE_SIZE': 4096}[key])
+    monkeypatch.delenv('SLURM_MEM_PER_NODE', raising=False)
+    monkeypatch.delenv('SLURM_MEM_PER_CPU', raising=False)
+
+    def read(self):
+        if str(self) == path:
+            return str(1024**3)
+        raise OSError('unavailable')
+
+    monkeypatch.setattr('research.evaluation.Path.read_text', read)
+    assert memory_estimate(100, 10)['max_memory_gb'] == pytest.approx(.7)
 
 
 def test_float64_live_training_vector_parity_and_predictions():

@@ -8,7 +8,8 @@ import polars as pl
 import pyarrow.parquet as pq
 
 from research.calendar import Calendar, calendar_features
-from research.labels import NS, load_spec, momentum_300s, momentum_900s, reference_for, reference_rows
+from research.labels import (LABEL_INPUTS, NS, load_spec, momentum_300s, momentum_900s,
+                             reference_for, reference_rows)
 
 # Absolute prices are non-stationary. Timestamps/provenance never enter X.
 IDENTITY = {"exchange", "market", "symbol", "tick_ns", "available_ns", "engine_version",
@@ -27,9 +28,15 @@ def feature_paths(root: str | Path) -> list[Path]:
     return paths
 
 
-def read_features(paths: list[Path], targets=None, spec: dict | None = None) -> pl.DataFrame:
-    """Lazily load only target/context instruments; leave cross rows with their base asset."""
+def read_features(paths: list[Path], targets=None, spec: dict | None = None, *,
+                  stride_s: int | None = None, before_ns: int | None = None) -> pl.DataFrame:
+    """Load stride features plus dense reference label inputs, or full rows by default."""
     spec = spec or load_spec()
+    if stride_s is not None and stride_s <= 0:
+        raise ValueError("stride_s must be positive")
+    references = [reference_for(target, spec) for target in (targets or [
+        f'{asset}_{market}' for asset, markets in spec['references'].items() for market in markets
+    ])] if stride_s is not None else []
     assets = ({target.rsplit('_', 1)[0] for target in targets} |
               set(spec.get('context_assets', []))) if targets else None
     frames = []
@@ -39,6 +46,8 @@ def read_features(paths: list[Path], targets=None, spec: dict | None = None) -> 
         if mode not in {"as_live", "ideal"}:
             raise ValueError(f"Missing/unknown replay mode in {path}: {mode!r}")
         query = pl.scan_parquet(path)
+        if before_ns is not None:
+            query = query.filter(pl.col('tick_ns') < before_ns)
         if assets:
             derived = asset_expr()
             keep = derived.is_in(sorted(assets))
@@ -48,12 +57,28 @@ def read_features(paths: list[Path], targets=None, spec: dict | None = None) -> 
                 keep = instrument_asset.is_in(sorted(assets)) | (
                     (pl.col('exchange') == 'cross') & derived.is_in(sorted(assets)))
             query = query.filter(keep)
-        frame = query.with_columns(pl.lit(mode).alias("replay_mode")).collect()
         version = metadata.get(b"engine_version", b"").decode()
-        if version and frame.filter(pl.col("engine_version") != version).height:
-            raise ValueError(f"Engine version disagrees with metadata in {path}")
-        frames.append(frame)
-    rows = pl.concat(frames, how="diagonal_relaxed")
+        queries = [query]
+        if stride_s is not None:
+            stride = pl.col('tick_ns') % (stride_s * NS) == 0
+            reference = pl.any_horizontal([
+                pl.all_horizontal([pl.col(k) == v for k, v in ref.items()]) for ref in references
+            ])
+            dense_columns = list(dict.fromkeys([
+                *LABEL_INPUTS, 'engine_version',
+                *(['asset'] if 'asset' in query.collect_schema().names() else []),
+            ]))
+            # Collect separately: a shared-scan cache must not materialize all
+            # columns for the dense branch. The predicates are disjoint.
+            queries = [query.filter(stride),
+                       query.filter(~stride & reference).select(dense_columns)]
+        for part in queries:
+            frame = part.with_columns(pl.lit(mode).alias("replay_mode")).collect()
+            if version and frame.filter(pl.col("engine_version") != version).height:
+                raise ValueError(f"Engine version disagrees with metadata in {path}")
+            frames.append(frame)
+    rows = pl.concat(frames, how="diagonal_relaxed", rechunk=False)
+    del frames, frame, queries, query, part
     keys = ["exchange", "market", "symbol", "tick_ns"]
     if rows.select(keys).unique().height != rows.height:
         raise ValueError("Duplicate instrument ticks (including overlapping inputs)")
@@ -107,10 +132,14 @@ def build_matrix(rows: pl.DataFrame, target: str, stride_s: int = 10,
     if "asset" in rows.columns:
         # Older rows can omit the asset or contain an empty serde default.
         asset_column = pl.when(pl.col("asset").is_not_null() & (pl.col("asset") != "")).then(pl.col("asset")).otherwise(asset_column)
-    selected = rows.with_columns(asset_column.alias("asset")).filter(
+    normalized = rows.with_columns(asset_column.alias("asset"))
+    # In lean mode, context presence requires rows at stride ticks; off-stride-only context is omitted.
+    present_context = set(normalized['asset'].unique().to_list()) & set(context_assets)
+    selected = normalized.filter(
         pl.col("asset").is_in([asset, *context_assets])
         & (pl.col("tick_ns") % (stride_s * NS) == 0)
     ).join(matrix, on="tick_ns", how="semi")
+    del normalized
     conflicts = selected.group_by("tick_ns").agg(
         pl.col("replay_mode").n_unique().alias("modes"),
         pl.col("engine_version").n_unique().alias("versions"),
@@ -153,11 +182,10 @@ def build_matrix(rows: pl.DataFrame, target: str, stride_s: int = 10,
                        .otherwise(None).alias(prefix + "premium_bps"))
             expressions.append(premium)
         matrix = matrix.join(part.select("tick_ns", *expressions), on="tick_ns", how="left")
-    # Entirely absent context venues still have null predictors, including when
-    # the context asset is absent from every file. Match the observed venue set.
+    # Fill missing venues only for context assets observed somewhere in input.
     venues = selected.select("exchange", "market").unique().sort("exchange", "market").iter_rows()
     for exchange, market in venues:
-        for base in context_assets:
+        for base in sorted(present_context):
             prefix = f"ctx_{base.lower()}_{exchange}_{market}_"
             if prefix not in prefixes:
                 expressions = [pl.lit(None, dtype=rows.schema[c]).alias(prefix + c)
