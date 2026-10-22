@@ -56,6 +56,19 @@ def params_argument(value):
         raise argparse.ArgumentTypeError(str(exc)) from exc
 
 
+def validate_entry_delay(entry_delay_s):
+    if isinstance(entry_delay_s, bool) or not isinstance(entry_delay_s, (int, np.integer)) or entry_delay_s < 0:
+        raise ValueError('entry_delay_s must be a non-negative integer')
+    return int(entry_delay_s)
+
+
+def delayed_labels(rows, target, horizon_s, spec=None, entry_delay_s=0):
+    """Join a label starting at t+D to features at t; keep its true endpoints."""
+    delay = validate_entry_delay(entry_delay_s)
+    labels = make_labels(rows, target, horizon_s, spec)
+    return labels.with_columns((pl.col('tick_ns') - delay * NS).alias('tick_ns')) if delay else labels
+
+
 class InsufficientHistory(ValueError):
     """Valid input that cannot yet support the requested walk-forward split."""
 
@@ -179,7 +192,8 @@ def regime_assignments(ticks, rv, edges):
         groups[valid] = np.searchsorted(edges, rv[valid], side='right')
     days = ticks // DAY_NS
     return {'volatility_tercile': groups, 'utc_hour_4h': (ticks % DAY_NS) // (3600 * 4 * NS),
-            'week_part': ((days + 3) % 7 >= 5).astype(int)}
+            'week_part': ((days + 3) % 7 >= 5).astype(int),
+            'day_phase': (ticks % DAY_NS >= 3600 * NS).astype(np.int8)}
 
 
 def forecast_metrics(actual, predictions, probabilities):
@@ -197,7 +211,7 @@ def direction_regimes(actuals, predictions, probabilities, regimes):
     result = {}
     for axis, labels in {'volatility_tercile': ['low', 'medium', 'high'],
                          'utc_hour_4h': ['00–04', '04–08', '08–12', '12–16', '16–20', '20–24'],
-                         'week_part': ['weekday', 'weekend']}.items():
+                         'week_part': ['weekday', 'weekend'], 'day_phase': ['first_hour', 'rest']}.items():
         groups = regimes[axis]
         result[axis] = {label: forecast_metrics(actuals[groups == i],
                            {name: values[groups == i] for name, values in predictions.items()},
@@ -264,7 +278,8 @@ def train_target(rows: pl.DataFrame, target: str, horizon_s: int, output_root: s
                  embargo_days=1, fold_days=7, min_train_days=14, fold_embargo_s=None,
                  max_folds=12, shuffle_test=False, max_memory_gb=None, num_threads=None,
                  params=None, risk_params=None, early_stopping=False, inner_valid_days=7,
-                 early_stopping_rounds=50, exclude_groups=(), exclude_features=()) -> dict:
+                 early_stopping_rounds=50, exclude_groups=(), exclude_features=(), entry_delay_s=0) -> dict:
+    entry_delay_s = validate_entry_delay(entry_delay_s)
     num_threads = resolve_threads(num_threads)
     params, risk_params = parse_params(params), parse_params(risk_params)
     if inner_valid_days < 1 or early_stopping_rounds < 1:
@@ -285,6 +300,7 @@ def train_target(rows: pl.DataFrame, target: str, horizon_s: int, output_root: s
     skipped = {"target": target, "horizon_s": horizon_s, "version": version,
                "status": "skipped", "reference": reference_for(target, spec), "date_split": split,
                'model_params': effective_model_params(params, risk_params, num_threads),
+               'entry_delay_s': entry_delay_s,
                "labeled_rows": 0, "matrix_rows": 0}
     if not reference_present(rows, target, spec):
         return dict(skipped, reason="not enough labeled rows: no development reference rows" if split["development"] is None
@@ -293,7 +309,7 @@ def train_target(rows: pl.DataFrame, target: str, horizon_s: int, output_root: s
     matrix, features = build_matrix(rows, target, stride_s, spec, calendar=calendar)
     features, exclusions = select_features(features, exclude_groups, exclude_features)
     skipped.update(features=features, exclusions=exclusions, **feature_schema(features))
-    labeled = matrix.join(make_labels(rows, target, horizon_s, spec), on="tick_ns", how="left")
+    labeled = matrix.join(delayed_labels(rows, target, horizon_s, spec, entry_delay_s), on="tick_ns", how="left")
     # A delayed emission after the target endpoint cannot be a forecast.
     data = labeled.filter(pl.col("return_pct").is_not_null()
                           & (pl.col("available_ns") < pl.col("label_end_ns"))
@@ -398,6 +414,8 @@ def train_target(rows: pl.DataFrame, target: str, horizon_s: int, output_root: s
         fold_frame = data[test].select('tick_ns', 'available_ns', 'label_end_ns', 'label_available_ns',
                                        'return_pct', 'direction', 'adverse_long_bps', 'adverse_short_bps')
         oof_frames.append(fold_frame.with_columns(pl.lit(i, dtype=pl.Int32).alias('fold'),
+                           pl.lit(entry_delay_s, dtype=pl.Int64).alias('entry_delay_s'),
+                           (pl.col('tick_ns') + entry_delay_s * NS).alias('label_start_ns'),
                            *[pl.Series(name, values, nan_to_null=True) for name, values in saved.items()]))
     oof = pl.concat(oof_frames, rechunk=False)
     del oof_frames, stop_oof
@@ -439,6 +457,7 @@ def train_target(rows: pl.DataFrame, target: str, horizon_s: int, output_root: s
     oof.write_parquet(directory / "oof.parquet")
     report = {
         "target": target, "horizon_s": horizon_s, "version": version, "status": "trained",
+        'entry_delay_s': entry_delay_s,
         "date_split": split, "memory": memory, "num_threads": num_threads,
         "feature_dtype": "float64; shared research.evaluation.feature_array in training and inference; labels float64",
         "regimes": regime_summary, "shuffle_test": shuffle_summary, "bootstrap": bootstrap,
@@ -579,7 +598,8 @@ def open_lockbox(rows, output, version, targets=None, horizons=None, acknowledge
                 if calendar:
                     verify_calendar(calendar, report)
                 matrix, _ = build_matrix(held, report['target'], report['stride_s'], spec, calendar=calendar)
-                data = matrix.join(make_labels(held, report['target'], report['horizon_s'], spec),
+                data = matrix.join(delayed_labels(held, report['target'], report['horizon_s'], spec,
+                                                  report.get('entry_delay_s', 0)),
                                    on='tick_ns', how='left').filter(
                     pl.col('return_pct').is_not_null() & (pl.col('available_ns') < pl.col('label_end_ns')))
                 print_peak_rss(f'matrix/labels (lockbox {report["target"]}/{report["horizon_s"]})')
@@ -624,6 +644,7 @@ def open_lockbox(rows, output, version, targets=None, horizons=None, acknowledge
                                   **{key: stop_metrics(actual, values, q, groups) for key, values in
                                      [('model', p), ('unconditional', constant), ('volatility_scaled', scaled)]}}
                 report['lockbox_results'] = {'range': split['lockbox'], 'metrics': measured, 'stop_metrics': risk,
+                    'entry_delay_s': report.get('entry_delay_s', 0),
                     'num_threads': num_threads,
                     'flat_labels': int((data['direction'] == 0).sum()),
                     'regimes': direction_regimes(y, predictions, class_probs,
@@ -676,6 +697,7 @@ def write_experiment(output, args, argv, targets, horizons, reports, split, rows
             'reason': report.get('reason') if report else error, 'metrics': measured.get('metrics'),
             'stop_metrics': measured.get('stop_metrics'), 'split': report.get('date_split'),
             'stride_s': report.get('stride_s', args.stride_s), 'rounds': report.get('rounds', args.rounds),
+            'entry_delay_s': report.get('entry_delay_s', args.entry_delay_s),
             'params': report.get('model_params'),
             'exclusions': report.get('exclusions'), 'chosen_rounds': report.get('chosen_rounds'),
             'feature_count': len(features) if features is not None else None,
@@ -687,6 +709,7 @@ def write_experiment(output, args, argv, targets, horizons, reports, split, rows
     entry = {'version': args.version, 'utc_time': datetime.now(timezone.utc).isoformat(), 'git': git,
              'argv': list(argv), 'mode': 'list_feature_groups' if args.list_feature_groups else ('open_lockbox' if args.open_lockbox else 'train'),
              'targets': targets, 'horizons_s': horizons, 'stride_s': args.stride_s, 'rounds': args.rounds,
+             'entry_delay_s': args.entry_delay_s,
              'params': effective_model_params(args.params, args.risk_params, num_threads),
              'exclude_groups': args.exclude_group, 'exclude_features': args.exclude_features,
              'split': split, 'engine_versions': sorted(rows['engine_version'].unique().drop_nulls().to_list())
@@ -710,6 +733,8 @@ def main(argv=None):
     parser.add_argument('--threads', type=int, default=available_cpus(),
                         help='LightGBM CPU threads; defaults to the CPUs available to this process')
     parser.add_argument('--stride-s', type=int, default=10)
+    parser.add_argument('--entry-delay-s', type=int, default=0,
+                        help='Simulated entry delay; features stay at t and labels span t+D to t+D+h')
     parser.add_argument('--purge-s', type=int)
     parser.add_argument('--rounds', type=int, default=100)
     parser.add_argument('--params', type=params_argument, default={}, help='Inline JSON object or .json file; return/direction parameters')
@@ -736,6 +761,8 @@ def main(argv=None):
     parser.add_argument('--i-understand-lockbox-reuse', action='store_true')
     parser.add_argument('--upload', action='store_true')
     args = parser.parse_args(argv)
+    if args.entry_delay_s < 0:
+        parser.error('--entry-delay-s must be a non-negative integer')
     if args.open_lockbox and not args.version:
         parser.error('--open-lockbox requires the already-trained --version')
     args.version = args.version or datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S%fZ')
@@ -824,7 +851,8 @@ def main(argv=None):
                                       num_threads=num_threads, params=args.params, risk_params=args.risk_params,
                                       early_stopping=args.early_stopping, inner_valid_days=args.inner_valid_days,
                                       early_stopping_rounds=args.early_stopping_rounds,
-                                      exclude_groups=args.exclude_group, exclude_features=args.exclude_features)
+                                      exclude_groups=args.exclude_group, exclude_features=args.exclude_features,
+                                      entry_delay_s=args.entry_delay_s)
                 reports.append(report)
                 if report['status'] == 'skipped':
                     print(f"Skipped {target}/{horizon}: {report['reason']}", flush=True)

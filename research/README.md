@@ -114,3 +114,56 @@ prediction tables have nullable columns so older messages without stop fields
 remain ingestible. Existing deployments need the corresponding additive column
 migration before consuming the expanded messages; the init SQL defines fresh
 installations.
+
+
+## Evaluation and timing controls
+
+`--params` overrides return/classifier defaults; `--risk-params` overrides stop
+parameters. Both accept an inline JSON object or a `.json` file:
+
+```sh
+python -m research.train WORK --params '{"num_leaves":7,"lambda_l2":10}' \
+  --risk-params risk.json --early-stopping --inner-valid-days 7 --early-stopping-rounds 50
+```
+
+Early stopping selects rounds using the last whole UTC training days, with
+purged inner training rows, then refits the complete outer training fold.
+`--rounds` is the maximum; insufficient inner history falls back to it. Final
+models follow the same procedure. Outer test labels never choose rounds.
+`regressor_shrunk` adds an inner-validation-fitted scale in [0,1] when early
+stopping is enabled; the original regressor stays available.
+
+The always-on `ridge` control uses training-only median filling, missing
+indicators, standardisation and chunked normal equations. Alpha is factor ×
+training rows / 1000: factor 100 normally, or inner selection from 1/10/100/1000.
+Its frozen model is `ridge.npz`.
+
+Repeat `--exclude-group NAME` or `--exclude-features REGEX` to remove predictors.
+`--list-feature-groups` counts a one-day sample without fitting. Groups:
+`calendar`, `liquidations`, `l3`, `flow`, `returns`, `volatility`, `book`,
+`positioning`, `cross`, `quality`, `venue_kraken`, `venue_binance`, `context`.
+Groups overlap; read ablations separately, not additively. Momentum is in returns;
+DVOL is in volatility. Unmatched/all-removing exclusions fail. Metadata saves
+excluded names and the retained count and ordered feature SHA256.
+
+`--entry-delay-s D` accepts a non-negative integer (default 0). Features and
+momentum/reversal stay at t; returns and excursions span t+D to t+D+h.
+Delayed endpoints drive purging and the development cutoff. Lockbox evaluation
+uses the saved delay. `day_phase` uses feature time: 0 for 00:00–01:00 UTC, 1 for
+rest, in both pooled and lockbox summaries.
+
+`oof.parquet` saves each outer-test tick, feature availability, label
+start/end/availability, delay, fold, return/direction; regressor, optional shrunk
+regressor, ridge, classifier expected return, `p_down/p_flat/p_up`,
+`p_up_minus_down`, zero, momentum, reversal, prior probabilities/expected return;
+regime assignments, four stops, adverse labels, stop baselines and optional
+shuffle predictions. Adjacent `metadata.json` records parameters and choices.
+
+JSON/HTML report log loss, Brier and paired bootstrap differences: whole UTC
+days in moving blocks of 1/3/7, 1000 fixed-seed draws, mean and 2.5/50/97.5
+percentiles. Positive accuracy differences and negative loss differences favour
+the model. `OUTPUT/experiments.jsonl` records arguments, git state, parameters,
+split, feature schema, statuses and metrics, including skipped/runtime-failed runs.
+`--lockbox-ledger PATH` defaults to `ROOT/lockbox_ledger.jsonl` even with another
+output root. Overlapping dates require `--i-understand-lockbox-reuse`; acknowledged
+entries record reuse.

@@ -84,7 +84,7 @@ def timestamp(value):
 
 
 def target_section(r):
-    result = f"<article><h2>{escape(r['target'])} · {r['horizon_s']} seconds</h2>"
+    result = f"<article><h2>{escape(r['target'])} · {r['horizon_s']} seconds · entry delay {r.get('entry_delay_s', 0)} s</h2>"
     result += '<h3>Data window, lockbox and embargo</h3>'
     window = r.get('data_window', {})
     result += table(['Start UTC', 'End UTC', 'Last label endpoint UTC'],
@@ -135,7 +135,7 @@ def target_section(r):
         result += table(['Comparison', 'Block days', 'Paired rows', 'Mean difference', '2.5%', '50%', '97.5%'], [
             [name, length, values['paired_rows'], values['mean_difference'], values['p2_5'], values['p50'], values['p97_5']]
             for length, scores in bootstrap['blocks'].items() for name, values in scores.items()])
-    result += '<h3>Regime breakdown</h3><p>Volatility groups use training-fold terciles; clock buckets are UTC; weekends are Saturday and Sunday.</p>'
+    result += '<h3>Regime breakdown</h3><p>Volatility groups use training-fold terciles; clock buckets are UTC; weekends are Saturday and Sunday. Day phase separates 00:00–01:00 UTC from the rest of each day, using the feature tick.</p>'
     for axis, groups in r.get('regimes', {}).items():
         result += f'<h4>{escape(axis)}</h4>' + table(['Group', 'Model', 'Rows', 'Hit rate', 'IC', 'Log loss', 'Brier'], [
             [group, name, m['n'], m['directional_accuracy'], m['spearman_ic'], m.get('log_loss'), m.get('brier_score')]
