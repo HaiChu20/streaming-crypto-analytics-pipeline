@@ -7,6 +7,7 @@ from pathlib import Path
 import lightgbm as lgb
 import numpy as np
 import polars as pl
+import pyarrow.parquet as pq
 import pytest
 
 from research.evaluation import (DAY_NS, date_split, day_block_permutation, feature_array,
@@ -651,3 +652,54 @@ def test_inventory_stat_only_gaps_case_open_sources_and_targets(tmp_path, monkey
     with pytest.raises(SystemExit):
         inventory_main([str(archive), '--json', str(archive / 'forbidden.json')])
     assert not (archive / 'forbidden.json').exists()
+
+
+def test_train_from_changes_only_training_rows_and_preserves_oof_windows(tmp_path, sparse_evaluation):
+    rows, spec, _ = sparse_evaluation
+    baseline = train_target(rows, 'BTC_spot', 300, tmp_path, 'all-history', spec=spec, rounds=1, num_threads=2,
+                            early_stopping=True, inner_valid_days=2)
+    recent = train_target(rows, 'BTC_spot', 300, tmp_path, 'recent', spec=spec, rounds=1, num_threads=2,
+                          train_from='2026-01-08', early_stopping=True, inner_valid_days=2)
+    assert baseline['status'] == recent['status'] == 'trained'
+    for original, trimmed in zip(baseline['folds'], recent['folds'], strict=True):
+        for key in ('test_rows', 'test_start_ns', 'test_end_ns'):
+            assert original[key] == trimmed[key]
+        assert trimmed['train_rows'] < original['train_rows']
+        assert trimmed['train_start_ns'] >= stamp('2026-01-08')
+    columns = ['tick_ns', 'fold', 'label_end_ns', 'return_pct', 'direction']
+    original_oof = pl.read_parquet(Path(baseline['model_dir']) / 'oof.parquet').select(columns)
+    trimmed_oof = pl.read_parquet(Path(recent['model_dir']) / 'oof.parquet').select(columns)
+    assert original_oof.equals(trimmed_oof)
+    before = pl.read_parquet(Path(baseline['model_dir']) / 'training_rows.parquet')
+    after = pl.read_parquet(Path(recent['model_dir']) / 'training_rows.parquet')
+    assert after.equals(before.filter(pl.col('tick_ns') >= stamp('2026-01-08')))
+    assert recent['final_train_rows'] == after.height < before.height
+
+
+def test_lockbox_cli_uses_saved_kraken_spec_even_with_missing_label_spec(tmp_path, sparse_evaluation, monkeypatch):
+    from research.train import main
+    rows, _, _ = sparse_evaluation
+    rows = rows.with_columns(pl.lit('kraken').alias('exchange'), pl.lit('BTC/USD').alias('symbol'),
+                             pl.lit('ideal+exchange_clock_35ms').alias('replay_mode'))
+    spec = dict(load_spec(Path(__file__).resolve().parents[1] / 'research/targets_kraken.yaml'), calendar=None)
+    report = train_target(rows, 'BTC_spot', 300, tmp_path, 'kraken-saved', spec=spec, rounds=1, num_threads=2)
+    assert report['label_spec'] == spec
+    assert report['replay_modes'] == ['ideal+exchange_clock_35ms']
+    path = tmp_path / 'features.parquet'
+    pq.write_table(rows.to_arrow().replace_schema_metadata({b'mode': b'ideal+exchange_clock_35ms', b'engine_version': b'fixture'}), path)
+    def default_forbidden(*args, **kwargs):
+        pytest.fail('Lockbox must never load a current label spec')
+    monkeypatch.setattr('research.train.load_spec', default_forbidden)
+    result = main([str(path), '--version', 'kraken-saved', '--open-lockbox', '--threads', '2',
+                   '--label-spec', str(tmp_path / 'missing.yaml')])
+    opened = result['results'][0]
+    assert opened['label_spec'] == spec
+    assert opened['lockbox_results']['metrics']['zero']['n'] > 0
+
+
+def test_train_from_without_training_rows_is_hard_error_naming_fold(tmp_path, sparse_evaluation):
+    rows, spec, _ = sparse_evaluation
+    with pytest.raises(ValueError, match=r'--train-from leaves selected fold 1 .*zero training rows'):
+        train_target(rows, 'BTC_spot', 300, tmp_path, 'no-train', spec=spec, rounds=1,
+                     num_threads=2, train_from='2026-02-01')
+    assert not (tmp_path / 'models').exists()

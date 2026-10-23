@@ -18,7 +18,7 @@ import polars as pl
 
 from research.calendar import Calendar, verify_calendar
 from research.dataset import (FEATURE_GROUPS, build_matrix, feature_dates, feature_paths,
-                              read_features, select_features)
+                              read_features, select_features, validate_replay_modes)
 from research.fitting import fit_booster, inner_split, parse_params, shrinkage_coefficient
 from research.labels import NS, load_spec, make_labels, reference_for, reference_present
 from research.risk import (PARAMS as STOP_PARAMS, STOP_NAMES, evaluate_stops, fit_stop_models,
@@ -79,14 +79,24 @@ def print_peak_rss(stage):
     print(f'Peak RSS after {stage}: {gib:.3f} GiB', flush=True)
 
 
+def train_from_ns(value):
+    if value is None:
+        return None
+    day = date.fromisoformat(value)
+    if day.isoformat() != value:
+        raise ValueError('--train-from must be YYYY-MM-DD')
+    return (day - date(1970, 1, 1)).days * DAY_NS
+
+
 def walk_forward_folds(tick_ns, horizon_s: int, purge_s: int | None = None,
                        label_available_ns=None, feature_available_ns=None, *,
-                       fold_days=7, min_train_days=14, fold_embargo_s=None, max_folds=12):
+                       fold_days=7, min_train_days=14, fold_embargo_s=None, max_folds=12, train_from=None):
     """Expanding UTC calendar blocks, with horizon purge plus a time embargo.
 
     Both label endpoint/emission and feature emission precede the embargo start.
     Only the latest nonempty max_folds blocks allocate index arrays.
     """
+    lower = train_from_ns(train_from)
     ticks = np.asarray(tick_ns, dtype=np.int64)
     purge_s = horizon_s if purge_s is None else purge_s
     embargo = horizon_s if fold_embargo_s is None else fold_embargo_s
@@ -109,10 +119,14 @@ def walk_forward_folds(tick_ns, horizon_s: int, purge_s: int | None = None,
         if right > left:
             blocks.append((start, left, right))
     folds = []
-    for start, left, right in blocks[-max_folds:]:
+    for fold, (start, left, right) in enumerate(blocks[-max_folds:], 1):
         train = np.flatnonzero((ticks + (purge_s + embargo) * NS < start)
                               & (known + embargo * NS < start))
         if len(train):
+            if lower is not None:
+                train = train[ticks[train] >= lower]
+                if not len(train):
+                    raise ValueError(f'--train-from leaves selected fold {fold} (test start_ns={start}) with zero training rows')
             folds.append((train, np.arange(left, right)))
     if not folds:
         raise InsufficientHistory('Insufficient history for requested folds and purge; collect more data')
@@ -278,8 +292,11 @@ def train_target(rows: pl.DataFrame, target: str, horizon_s: int, output_root: s
                  embargo_days=1, fold_days=7, min_train_days=14, fold_embargo_s=None,
                  max_folds=12, shuffle_test=False, max_memory_gb=None, num_threads=None,
                  params=None, risk_params=None, early_stopping=False, inner_valid_days=7,
-                 early_stopping_rounds=50, exclude_groups=(), exclude_features=(), entry_delay_s=0) -> dict:
+                 early_stopping_rounds=50, exclude_groups=(), exclude_features=(), entry_delay_s=0, train_from=None) -> dict:
     entry_delay_s = validate_entry_delay(entry_delay_s)
+    lower = train_from_ns(train_from)
+    if rows['replay_mode'].n_unique() > 1:
+        raise ValueError('Cannot mix replay modes within one training run')
     num_threads = resolve_threads(num_threads)
     params, risk_params = parse_params(params), parse_params(risk_params)
     if inner_valid_days < 1 or early_stopping_rounds < 1:
@@ -298,6 +315,7 @@ def train_target(rows: pl.DataFrame, target: str, horizon_s: int, output_root: s
     # Neither label endpoints nor path labels can borrow embargo/lockbox rows.
     rows = rows.filter(pl.col('tick_ns') < split['development_end_ns'])
     skipped = {"target": target, "horizon_s": horizon_s, "version": version,
+               "train_from": train_from, "label_spec": spec, "label_spec_version": spec["version"],
                "status": "skipped", "reference": reference_for(target, spec), "date_split": split,
                'model_params': effective_model_params(params, risk_params, num_threads),
                'entry_delay_s': entry_delay_s,
@@ -324,7 +342,7 @@ def train_target(rows: pl.DataFrame, target: str, horizon_s: int, output_root: s
         folds = walk_forward_folds(ticks, horizon_s, purge_s,
                                    data["label_available_ns"].to_numpy(), data["available_ns"].to_numpy(),
                                    fold_days=fold_days, min_train_days=min_train_days,
-                                   fold_embargo_s=fold_embargo_s, max_folds=max_folds)
+                                   fold_embargo_s=fold_embargo_s, max_folds=max_folds, train_from=train_from)
     except InsufficientHistory as exc:
         return dict(skipped, reason=f"not enough labeled rows: {exc}",
                     matrix_rows=matrix.height, labeled_rows=data.height)
@@ -434,17 +452,23 @@ def train_target(rows: pl.DataFrame, target: str, horizon_s: int, output_root: s
         shuffle_summary = {name: leak_check_metrics(dict(value, effective_days=effective_days))
                            for name, value in forecast_metrics(actuals, shuffled_predictions,
                                                               {'classifier': shuffled_probs}).items()}
-    all_rows = np.arange(len(x))
+    final_start = 0 if lower is None else int(np.searchsorted(ticks, lower))
+    all_rows = np.arange(final_start, len(x))
+    final_x, final_y, final_directions = x[final_start:], y[final_start:], directions[final_start:]
+    final_adverse = {side: a[final_start:] for side, a in adverse.items()}
+    final_rv = rv[final_start:]
     final_inner = choose_inner(all_rows)
-    ridge, ridge_info = fit_ridge(x, y, all_rows, final_inner)
+    ridge, ridge_info = fit_ridge(x, y, all_rows,
+        tuple(all_rows[v] for v in final_inner) if final_inner is not None else None)
     regressor, classifier, class_means, final_selection, final_shrinkage = fit_models(
-        x, y, directions, features, rounds, num_threads=num_threads,
+        final_x, final_y, final_directions, features, rounds, num_threads=num_threads,
         inner=final_inner, return_selection=True, **fitting)
     directory = Path(output_root) / "models" / target / str(horizon_s) / version
     directory.mkdir(parents=True, exist_ok=False)
     regressor.save_model(str(directory / "regressor.txt"))
     classifier.save_model(str(directory / "classifier.txt"))
-    stop_models, stop_selection = fit_stop_models(x, adverse, features, rounds, num_threads=num_threads,
+    stop_models, stop_selection = fit_stop_models(final_x, final_adverse,
+        features, rounds, num_threads=num_threads,
         params=risk_params, inner=final_inner, early_stopping=early_stopping,
         early_stopping_rounds=early_stopping_rounds, return_selection=True)
     final_selection.update(stop_selection)
@@ -452,12 +476,12 @@ def train_target(rows: pl.DataFrame, target: str, horizon_s: int, output_root: s
     print_peak_rss(f'fitting ({target}/{horizon_s})')
     for name, model in stop_models.items():
         model.save_model(str(directory / f"{name}.txt"))
-    data.select("asset", "tick_ns", "available_ns", "label_end_ns", "label_available_ns",
+    data.slice(final_start).select("asset", "tick_ns", "available_ns", "label_end_ns", "label_available_ns",
                 "engine_version", "replay_mode").write_parquet(directory / "training_rows.parquet")
     oof.write_parquet(directory / "oof.parquet")
     report = {
         "target": target, "horizon_s": horizon_s, "version": version, "status": "trained",
-        'entry_delay_s': entry_delay_s,
+        'entry_delay_s': entry_delay_s, "train_from": train_from, "final_train_rows": len(all_rows),
         "date_split": split, "memory": memory, "num_threads": num_threads,
         "feature_dtype": "float64; shared research.evaluation.feature_array in training and inference; labels float64",
         "regimes": regime_summary, "shuffle_test": shuffle_summary, "bootstrap": bootstrap,
@@ -471,14 +495,14 @@ def train_target(rows: pl.DataFrame, target: str, horizon_s: int, output_root: s
         'regressor_shrinkage': final_shrinkage,
         "fold_config": {"fold_days": fold_days, "min_train_days": min_train_days, "max_folds": max_folds,
                         "fold_embargo_s": horizon_s if fold_embargo_s is None else fold_embargo_s},
-        "importance": {name: model_importance(model, x, features, num_threads=num_threads) for name, model in
+        "importance": {name: model_importance(model, final_x, features, num_threads=num_threads) for name, model in
                        {"regressor": regressor, "classifier": classifier, **stop_models}.items()},
-        "risk_calibration": risk_calibration(adverse, rv),
-        "volatility_edges": volatility_edges(rv),
+        "risk_calibration": risk_calibration(final_adverse, final_rv),
+        "volatility_edges": volatility_edges(final_rv),
         "label_spec_version": spec["version"], "label_spec": spec,
         "features": features, "engine_version": sorted(data["engine_version"].unique().to_list()),
         "replay_modes": sorted(data["replay_mode"].unique().to_list()),
-        "data_window": {"start_ns": int(ticks[0]), "end_ns": int(ticks[-1]),
+        "data_window": {"start_ns": int(ticks[all_rows[0]]), "end_ns": int(ticks[all_rows[-1]]),
                         "last_label_end_ns": int(data["label_end_ns"].max())},
         "matrix_rows": matrix.height, "labeled_rows": data.height,
         "late_prediction_rows_excluded": labeled.filter(pl.col("return_pct").is_not_null()
@@ -499,7 +523,7 @@ def train_target(rows: pl.DataFrame, target: str, horizon_s: int, output_root: s
                       "from volatility baseline/regimes; zero rv predicts zero if k is available. "
                       "Overall metrics pool held-out rows and their fold-local regime assignments.",
         "classifier_class_order": [-1, 0, 1], "classifier_class_mean_returns": class_means.tolist(),
-        "classifier_class_prior": class_prior(directions).tolist(),
+        "classifier_class_prior": class_prior(final_directions).tolist(),
         "metric_notes": "Returns/MAE/RMSE in percentage points. Classifier implied return = "
                         "probabilities @ training-only class mean returns; direction = argmax. "
                         "Directional accuracy excludes actual flats. Undefined IC is null. "
@@ -698,6 +722,7 @@ def write_experiment(output, args, argv, targets, horizons, reports, split, rows
             'stop_metrics': measured.get('stop_metrics'), 'split': report.get('date_split'),
             'stride_s': report.get('stride_s', args.stride_s), 'rounds': report.get('rounds', args.rounds),
             'entry_delay_s': report.get('entry_delay_s', args.entry_delay_s),
+            'train_from': report.get('train_from', args.train_from),
             'params': report.get('model_params'),
             'exclusions': report.get('exclusions'), 'chosen_rounds': report.get('chosen_rounds'),
             'feature_count': len(features) if features is not None else None,
@@ -709,7 +734,7 @@ def write_experiment(output, args, argv, targets, horizons, reports, split, rows
     entry = {'version': args.version, 'utc_time': datetime.now(timezone.utc).isoformat(), 'git': git,
              'argv': list(argv), 'mode': 'list_feature_groups' if args.list_feature_groups else ('open_lockbox' if args.open_lockbox else 'train'),
              'targets': targets, 'horizons_s': horizons, 'stride_s': args.stride_s, 'rounds': args.rounds,
-             'entry_delay_s': args.entry_delay_s,
+             'entry_delay_s': args.entry_delay_s, 'train_from': args.train_from,
              'params': effective_model_params(args.params, args.risk_params, num_threads),
              'exclude_groups': args.exclude_group, 'exclude_features': args.exclude_features,
              'split': split, 'engine_versions': sorted(rows['engine_version'].unique().drop_nulls().to_list())
@@ -728,6 +753,8 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('root', type=Path, help='Contains features/date=D/features.parquet')
     parser.add_argument('--output-root', type=Path)
+    parser.add_argument('--label-spec', type=Path, default=Path(__file__).with_name('targets.yaml'))
+    parser.add_argument('--train-from', help='Earliest UTC training day; test folds are unchanged')
     parser.add_argument('--target', action='append', choices=['BTC_spot', 'BTC_perp', 'ETH_spot', 'ETH_perp'])
     parser.add_argument('--horizon-s', action='append', type=int, choices=[300, 900, 1800])
     parser.add_argument('--threads', type=int, default=available_cpus(),
@@ -761,6 +788,10 @@ def main(argv=None):
     parser.add_argument('--i-understand-lockbox-reuse', action='store_true')
     parser.add_argument('--upload', action='store_true')
     args = parser.parse_args(argv)
+    try:
+        train_from_ns(args.train_from)
+    except ValueError:
+        parser.error('--train-from must be YYYY-MM-DD')
     if args.entry_delay_s < 0:
         parser.error('--entry-delay-s must be a non-negative integer')
     if args.open_lockbox and not args.version:
@@ -775,13 +806,17 @@ def main(argv=None):
     try:
         num_threads = resolve_threads(args.threads)
         paths = feature_paths(args.root)
-        spec = load_spec()
-        targets = args.target or [f'{asset}_{market}' for asset, markets in spec['references'].items() for market in markets]
-        horizons = args.horizon_s or spec['horizons_s']
+        validate_replay_modes(paths)
+        spec = load_spec(args.label_spec) if not args.open_lockbox else None
+        targets = args.target or ([f'{asset}_{market}' for asset, markets in spec['references'].items() for market in markets] if spec else [])
+        horizons = args.horizon_s or (spec['horizons_s'] if spec else [])
         load_stride = args.stride_s
         if args.open_lockbox:
             frozen = lockbox_reports(output, args.version, args.target, args.horizon_s)
             reports = frozen
+            spec = frozen[0]['label_spec']
+            if any(report['label_spec'] != spec for report in frozen):
+                raise ValueError('Saved models have different label specs; open them in separate runs')
             targets = sorted({report['target'] for report in frozen})
             horizons = sorted({report['horizon_s'] for report in frozen})
             # A shared read must retain full payloads for every saved model's stride.
@@ -852,7 +887,7 @@ def main(argv=None):
                                       early_stopping=args.early_stopping, inner_valid_days=args.inner_valid_days,
                                       early_stopping_rounds=args.early_stopping_rounds,
                                       exclude_groups=args.exclude_group, exclude_features=args.exclude_features,
-                                      entry_delay_s=args.entry_delay_s)
+                                      entry_delay_s=args.entry_delay_s, train_from=args.train_from)
                 reports.append(report)
                 if report['status'] == 'skipped':
                     print(f"Skipped {target}/{horizon}: {report['reason']}", flush=True)

@@ -296,3 +296,84 @@ def test_default_jobs_uses_process_cpu_affinity_helper(launcher):
     assert result.returncode == 0, result.stdout + result.stderr
     assert (work.parent / 'repo/jobs-helper-called').read_text() == 'yes'
     assert len(list(work.glob('features/date=*/features.parquet'))) == 2
+
+
+def test_v2_skip_metadata_resume_filters_and_training_input(tmp_path):
+    import shutil
+    archive = tmp_path / 'archive'
+    shutil.copytree(REPO / 'tests/fixtures/archive_v2/KrakenTest', archive / 'KrakenTest')
+    # These broken, unselected streams must not discover days or fail replay.
+    for venue, market in [('Binance', 'Spot'), ('KrakenRaw', 'Futurev6')]:
+        ignored = archive / venue / market / 'BTC-USD'
+        ignored.mkdir(parents=True)
+        (ignored / '20251112_book.jsonl').write_text('broken JSON\n')
+    work = tmp_path / 'work'
+    flags = ('--exchange', 'kraken', '--market', 'spot', '--exchange-clock-ms', '35',
+             '--skip-marker-only-days', '--label-spec', str(REPO / 'research/targets_kraken.yaml'),
+             '--train-from', '2025-11-01')
+    result = run(archive, work, '--version', 'v2', *flags)
+    assert result.returncode == 0, result.stdout + result.stderr
+    features = work / 'features/date=2025-11-08/features.parquet'
+    skip_path = work / 'features/date=2025-11-11/skipped.json'
+    skipped = json.loads(skip_path.read_text())
+    assert skipped['reason'] == 'marker_only_inputs'
+    assert skipped['date'] == '2025-11-11'
+    assert skipped['engine_version'] == pq.read_metadata(features).metadata[b'engine_version'].decode()
+    assert skipped['replay_mode'] == 'ideal+exchange_clock_35ms'
+    assert len(skipped['files']) == 1 and skipped['files'][0].endswith('20251111_level3.jsonl.gz')
+    assert not (skip_path.parent / 'features.parquet').exists()
+    assert not (work / 'features/date=2025-11-12').exists()
+    summary = json.loads(next(work.glob('logs/run-summary-*.json')).read_text())
+    assert summary['skipped_days'] == [skipped]
+    trained = json.loads((work / 'research_report_v2.json').read_text())
+    assert trained['input_files'] == [str(features)]
+    assert len(trained['results']) == 6
+    before = features.stat().st_mtime_ns, skip_path.stat().st_mtime_ns
+    resumed = run(archive, work, '--version', 'v2-resumed', *flags)
+    assert resumed.returncode == 0, resumed.stdout + resumed.stderr
+    assert 'Replay 2025-' not in resumed.stdout
+    assert 'Skipped marker-only days: 2025-11-11' in resumed.stdout
+    assert before == (features.stat().st_mtime_ns, skip_path.stat().st_mtime_ns)
+    wrong_clock = list(flags)
+    wrong_clock[wrong_clock.index('35')] = '36'
+    refused = run(archive, work, '--version', 'wrong-clock', *wrong_clock)
+    assert refused.returncode != 0 and 'replay_mode' in refused.stderr
+    assert before == (features.stat().st_mtime_ns, skip_path.stat().st_mtime_ns)
+
+
+def test_duplicate_directories_fail_before_replay_even_for_cached_day(launcher):
+    work, launch = launcher
+    original = work.parent / 'archive/BinanceRaw/Spotv6/BTCUSDT/20260915_snapshot.jsonl'
+    duplicate = work.parent / 'archive/Binance/Spot/BTCUSDT/20260915_snapshot.jsonl'
+    duplicate.parent.mkdir(parents=True)
+    duplicate.write_text('duplicate stream\n')
+    write_feature(work, '2026-09-15', b'9.8.7-features-test')
+    result = launch()
+    assert result.returncode != 0 and 'duplicate archive stream' in result.stderr
+    assert str(original) in result.stderr and str(duplicate) in result.stderr
+    assert not list(work.glob('.replay-*'))
+    assert not (work / 'trained').exists()
+
+
+def test_label_spec_train_from_and_venue_flags_pass_through(launcher):
+    work, launch = launcher
+    result = launch('--exchange', 'binance', '--market', 'spot', '--label-spec', 'custom.yaml',
+                    '--train-from', '2026-09-01')
+    assert result.returncode == 0, result.stdout + result.stderr
+    passed = json.loads((work / 'train-args.json').read_text())
+    assert passed[-4:] == ['--label-spec', 'custom.yaml', '--train-from', '2026-09-01']
+
+
+def test_all_marker_only_days_finish_successfully_without_training(tmp_path):
+    archive = tmp_path / 'archive/Kraken/Spotv2/ETH-USD'
+    archive.mkdir(parents=True)
+    (archive / '20251111_level3.jsonl').write_text(json.dumps({
+        'marker': 'ws_event', 'event': 'connected', 'timestamp': '2025-11-11T00:00:00+00:00'
+    }) + '\n')
+    work = tmp_path / 'work'
+    result = run(tmp_path / 'archive', work, '--exchange', 'kraken', '--market', 'spot',
+                 '--exchange-clock-ms', '35', '--skip-marker-only-days')
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert 'No completed feature days; training skipped' in result.stdout
+    assert (work / 'features/date=2025-11-11/skipped.json').exists()
+    assert not list(work.glob('research_report_*.json'))

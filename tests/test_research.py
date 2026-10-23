@@ -167,11 +167,11 @@ def test_lazy_target_loading_keeps_context_cross_and_input_date_split(tmp_path):
     assert_frame_equal(btc_matrix, both_matrix)
 
 
-def test_provenance_records_mode_per_row_across_files(tmp_path):
+def test_reject_mixed_modes_even_on_disjoint_days(tmp_path):
     paths = [write_parquet(tmp_path, [row(0)], "ideal", "a.parquet"),
              write_parquet(tmp_path, [row(10)], "as_live", "b.parquet")]
-    matrix, _ = build_matrix(read_features(paths), "BTC_spot")
-    assert matrix["replay_mode"].to_list() == ["ideal", "as_live"]
+    with pytest.raises(ValueError, match="Cannot mix replay modes within one training run"):
+        read_features(paths)
 
 
 def test_reject_mixing_modes_within_a_feature_tick(tmp_path):
@@ -572,7 +572,7 @@ def test_lockbox_cli_loads_union_of_saved_strides_and_dense_references(tmp_path,
         directory = tmp_path / 'models' / f'BTC_{market}' / str(horizon) / 'saved'
         directory.mkdir(parents=True)
         (directory / 'metadata.json').write_text(json.dumps(dict(
-            target=f'BTC_{market}', horizon_s=horizon, stride_s=stride)))
+            target=f'BTC_{market}', horizon_s=horizon, stride_s=stride, label_spec=load_spec())))
     for day in (1, 2):
         second = int(datetime(2026, 1, day, tzinfo=timezone.utc).timestamp())
         write_parquet(tmp_path / 'features' / f'date=2026-01-{day:02d}',
@@ -632,3 +632,77 @@ def test_experiment_ledger_records_failed_invocation_when_git_is_unavailable(tmp
         assert entry['status'] == 'failed' and entry['argv'] == argv
         assert entry['results'][0]['status'] == 'failed'
         assert entry['results'][0]['reason'] == 'ValueError: invalid fixture'
+
+
+def test_kraken_label_spec_native_symbols_calendar_and_cli(tmp_path):
+    spec_path = Path(__file__).resolve().parents[1] / 'research/targets_kraken.yaml'
+    spec = load_spec(spec_path)
+    assert spec['version'] == 'v1-kraken-spot'
+    assert spec['calendar'] == load_spec()['calendar']
+    assert spec['horizons_s'] == load_spec()['horizons_s']
+    assert spec['context_assets'] == []
+    assert spec['references'] == {
+        asset: {'spot': {'exchange': 'kraken', 'market': 'spot', 'symbol': f'{asset}/USD'}}
+        for asset in ('BTC', 'ETH')}
+    path = write_parquet(tmp_path, [row(t, exchange='kraken', symbol='BTC/USD') for t in (0, 300)])
+    rows = read_features([path], targets=['BTC_spot'], spec=spec, stride_s=10)
+    assert make_labels(rows, 'BTC_spot', 300, spec)['return_pct'][0] == 0
+    result = main([str(path), '--label-spec', str(spec_path), '--version', 'kraken', '--threads', '2',
+                   '--train-from', '1970-01-01'])
+    assert len(result['results']) == 6
+    experiment = json.loads((tmp_path / 'experiments.jsonl').read_text())
+    assert experiment['train_from'] == '1970-01-01'
+    assert all(item['train_from'] == '1970-01-01' for item in experiment['results'])
+    for report in result['results']:
+        assert report['label_spec'] == spec
+        assert report['reference']['exchange'] == 'kraken'
+        assert report['target'].endswith('_spot')
+
+
+@pytest.mark.parametrize('mode', ['ideal+exchange_clock_0ms', 'ideal+exchange_clock_35ms'])
+def test_exchange_clock_provenance_is_accepted_and_preserved(tmp_path, mode):
+    path = write_parquet(tmp_path, [row(0), row(10)], mode)
+    rows = read_features([path])
+    matrix, _ = build_matrix(rows, 'BTC_spot')
+    assert matrix['replay_mode'].to_list() == [mode, mode]
+
+
+def test_exchange_clock_modes_cannot_mix_across_days_or_hidden_lockbox_paths(tmp_path):
+    from research.dataset import validate_replay_modes
+    paths = [write_parquet(tmp_path, [row(0)], 'ideal+exchange_clock_35ms', 'a.parquet'),
+             write_parquet(tmp_path, [row(86400)], 'ideal+exchange_clock_36ms', 'b.parquet')]
+    with pytest.raises(ValueError, match='Cannot mix replay modes'):
+        validate_replay_modes(paths)
+    with pytest.raises(ValueError, match='Cannot mix replay modes'):
+        read_features(paths, before_ns=86400 * NS)
+
+
+def test_skipped_json_is_excluded_from_feature_paths_and_dates(tmp_path):
+    skip = tmp_path / 'features/date=2025-11-11/skipped.json'
+    skip.parent.mkdir(parents=True)
+    skip.write_text(json.dumps({'reason': 'marker_only_inputs', 'files': ['level3.jsonl.gz']}))
+    feature = write_parquet(tmp_path / 'features/date=2025-11-08', [row(0)])
+    assert feature_paths(tmp_path) == [feature]
+    assert feature_dates(feature_paths(tmp_path)) == ['2025-11-08']
+
+
+def test_train_from_leaves_latest_twelve_fold_blocks_and_test_rows_unchanged():
+    from research.evaluation import DAY_NS
+    start = int(datetime(2025, 1, 1, tzinfo=timezone.utc).timestamp()) * NS
+    ticks = start + np.arange(180 * 24, dtype=np.int64) * 3600 * NS
+    original = walk_forward_folds(ticks, 300)
+    trimmed = walk_forward_folds(ticks, 300, train_from='2025-02-01')
+    assert len(original) == len(trimmed) == 12
+    # Placement stays on the original start+14 day grid; select its last 12 blocks.
+    assert ticks[original[0][1][0]] == start + 98 * DAY_NS
+    cutoff = int(datetime(2025, 2, 1, tzinfo=timezone.utc).timestamp()) * NS
+    for (train, test), (recent_train, recent_test) in zip(original, trimmed):
+        np.testing.assert_array_equal(test, recent_test)
+        np.testing.assert_array_equal(recent_train, train[ticks[train] >= cutoff])
+        assert len(recent_train) < len(train)
+
+
+@pytest.mark.parametrize('value', ['20250101', '2025-02-30', '2025-1-01'])
+def test_invalid_train_from_cli_errors_before_loading(value):
+    with pytest.raises(SystemExit, match='2'):
+        main(['unused', '--train-from', value])

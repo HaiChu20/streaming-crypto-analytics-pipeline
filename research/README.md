@@ -167,3 +167,43 @@ split, feature schema, statuses and metrics, including skipped/runtime-failed ru
 `--lockbox-ledger PATH` defaults to `ROOT/lockbox_ledger.jsonl` even with another
 output root. Overlapping dates require `--i-understand-lockbox-reuse`; acknowledged
 entries record reuse.
+
+### Kraken-only v2 archive training
+
+The offline launcher passes `--exchange NAME`, `--market NAME`,
+`--exchange-clock-ms N`, and `--skip-marker-only-days` to replay. For the older
+native Kraken spot WS v2 archive (no receive timestamps), use:
+
+```sh
+scripts/train_offline.sh ARCHIVE WORK --jobs 1 \
+  --exchange kraken --market spot --exchange-clock-ms 35 --skip-marker-only-days \
+  --label-spec research/targets_kraken.yaml --train-from 2025-11-01
+```
+
+Discovery and duplicate checks use the selected venue/market; no other venues
+are required. An engine skip (status 3) becomes
+`WORK/features/date=D/skipped.json`, recording the reason, input paths, engine
+version and replay mode. It counts as complete on resubmission with the same
+options, appears in `WORK/logs/run-summary-*.json` and stdout, and never enters
+training: input discovery globs only `features/date=*/features.parquet`. If every
+day is skipped, the launcher finishes successfully without training. Use a new
+work directory when changing replay clocks, or rebuild all stale days explicitly;
+a skipped result cannot replace an existing feature day (use a new work directory).
+Duplicate canonical streams across archive directories fail even for cached days.
+
+`research.train --label-spec PATH` defaults to `research/targets.yaml`.
+`targets_kraken.yaml` keeps the same calendar/horizons, has no context assets or
+perpetual references, and labels BTC/ETH spot from Kraken's native `BTC/USD` and
+`ETH/USD` symbols. Reports and model metadata save the complete spec;
+`--open-lockbox` uses that saved spec even if the current/default spec changes.
+A training run requires one replay mode across all input files, including dates
+reserved for the lockbox. Exchange-clock replay records, for example,
+`ideal+exchange_clock_35ms`; it cannot mix with receive-time `ideal` or another delay.
+
+`--train-from YYYY-MM-DD` sets the earliest UTC training tick for every fold and
+the final refit. It is recorded in reports, model metadata and `experiments.jsonl`.
+Both runs load the same inputs: fold placement remains anchored at the first
+labeled UTC day plus `min_train_days`, with the latest `max_folds` nonempty
+calendar blocks retained (default 12 weekly blocks). Test windows and test rows
+stay unchanged. A cutoff leaving any selected fold with no training rows is an
+error identifying that fold; it never silently drops or moves test folds.

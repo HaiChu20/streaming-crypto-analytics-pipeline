@@ -1,7 +1,7 @@
 use engine_replay::{
     Result, SECOND, error,
     features::Engine,
-    input::{Merge, day_bounds, discover_filtered},
+    input::{Merge, day_bounds, discover_filtered, marker_only_files},
     output::Writer,
 };
 use std::{collections::BTreeMap, path::PathBuf};
@@ -18,6 +18,8 @@ fn run() -> Result<()> {
     let mut allow_open = false;
     let mut exchange = None;
     let mut market = None;
+    let mut exchange_clock_ms = None;
+    let mut skip_marker_only_days = false;
     let mut mode = "ideal".to_string();
     let mut from_state = None;
     let mut json_out = None;
@@ -51,6 +53,19 @@ fn run() -> Result<()> {
             "--market" => {
                 market = Some(args.next().ok_or_else(|| error("--market requires name"))?)
             }
+            "--exchange-clock-ms" => {
+                exchange_clock_ms = Some(
+                    args.next()
+                        .ok_or_else(|| {
+                            error("--exchange-clock-ms requires non-negative integer milliseconds")
+                        })?
+                        .parse::<u64>()
+                        .map_err(|_| {
+                            error("--exchange-clock-ms requires non-negative integer milliseconds")
+                        })?,
+                );
+            }
+            "--skip-marker-only-days" => skip_marker_only_days = true,
             "--allow-open" => allow_open = true,
             "--mode" => {
                 mode = args
@@ -71,13 +86,24 @@ fn run() -> Result<()> {
             }
             "--help" => {
                 println!(
-                    "engine-replay --root data --date YYYY-MM-DD [--out data/features] [--allow-open] [--exchange NAME] [--market NAME]\nengine-replay --engine-version"
+                    "engine-replay --root data --date YYYY-MM-DD [--out data/features] [--allow-open] [--exchange NAME] [--market NAME] [--exchange-clock-ms N] [--skip-marker-only-days]\nengine-replay --engine-version"
                 );
                 return Ok(());
             }
             _ => return Err(error(format!("unknown argument {arg}"))),
         }
     }
+    if exchange_clock_ms.is_some()
+        && (mode != "ideal"
+            || exchange.as_deref() != Some("kraken")
+            || market.as_deref() != Some("spot"))
+    {
+        return Err(error(
+            "--exchange-clock-ms requires --mode ideal --exchange kraken --market spot",
+        ));
+    }
+    let replay_mode =
+        exchange_clock_ms.map_or_else(|| mode.clone(), |ms| format!("ideal+exchange_clock_{ms}ms"));
     let date = date.ok_or_else(|| error("--date is required"))?;
     let (start, end) = day_bounds(&date)?;
     let out = out
@@ -88,6 +114,37 @@ fn run() -> Result<()> {
         if exchange.is_some() || market.is_some() {
             return Err(error("--exchange/--market filters require ideal mode"));
         }
+    } else if mode != "ideal" || from_state.is_some() || json_out.is_some() {
+        return Err(error(
+            "use --mode ideal or as_live; --from-state/--json-out require as_live",
+        ));
+    }
+    if skip_marker_only_days {
+        let paths = discover_filtered(
+            &root,
+            &date,
+            allow_open,
+            exchange.as_deref(),
+            market.as_deref(),
+        )?;
+        let files = marker_only_files(&paths, exchange_clock_ms)?;
+        if !files.is_empty() {
+            if out.exists() {
+                return Err(error(
+                    "refusing to skip a day with existing features; use a new output directory",
+                ));
+            }
+            println!(
+                "{}",
+                serde_json::json!({
+                    "status":"skipped", "reason":"marker_only_inputs", "files":files,
+                    "date":date, "engine_version":engine_core::ENGINE_VERSION, "replay_mode":replay_mode,
+                })
+            );
+            std::process::exit(3);
+        }
+    }
+    if mode == "as_live" {
         use std::io::Write;
         let wall = std::time::Instant::now();
         let mut replay =
@@ -119,19 +176,17 @@ fn run() -> Result<()> {
         );
         return Ok(());
     }
-    if mode != "ideal" || from_state.is_some() || json_out.is_some() {
-        return Err(error(
-            "use --mode ideal or as_live; --from-state/--json-out require as_live",
-        ));
-    }
-    let mut merge = Merge::new(discover_filtered(
-        &root,
-        &date,
-        allow_open,
-        exchange.as_deref(),
-        market.as_deref(),
-    )?)?;
-    let mut writer = Writer::new(&out)?;
+    let mut merge = Merge::with_exchange_clock(
+        discover_filtered(
+            &root,
+            &date,
+            allow_open,
+            exchange.as_deref(),
+            market.as_deref(),
+        )?,
+        exchange_clock_ms,
+    )?;
+    let mut writer = Writer::new_mode(&out, &replay_mode)?;
     let mut engine = Engine::default();
     let mut coverage = BTreeMap::<String, (u64, u64)>::new();
     let mut row_counts = BTreeMap::<String, u64>::new();
@@ -186,7 +241,7 @@ fn run() -> Result<()> {
     println!(
         "{}",
         serde_json::to_string_pretty(
-            &serde_json::json!({"output":out,"records":engine.records,"rows":rows,"wall_s":seconds,"records_per_s":engine.records as f64/seconds,"first_recv_ns":first_ns,"last_recv_ns":last_ns,"book_breaks":engine.book_breaks,"book_break_reasons":engine.book_break_reasons,"data_anomalies":engine.data_anomalies,"clock_steps":merge.clock_steps(),"foreign_before_day":foreign,"coverage":coverage,"max_abs_cross_bps":max_cross,"inputs":merge.snapshots,"books":engine.book_reports(),"row_counts":row_counts})
+            &serde_json::json!({"mode":replay_mode,"engine_version":engine_core::ENGINE_VERSION,"output":out,"records":engine.records,"rows":rows,"wall_s":seconds,"records_per_s":engine.records as f64/seconds,"first_recv_ns":first_ns,"last_recv_ns":last_ns,"book_breaks":engine.book_breaks,"book_break_reasons":engine.book_break_reasons,"data_anomalies":engine.data_anomalies,"clock_steps":merge.clock_steps(),"foreign_before_day":foreign,"coverage":coverage,"max_abs_cross_bps":max_cross,"inputs":merge.snapshots,"books":engine.book_reports(),"row_counts":row_counts})
         )?
     );
     Ok(())

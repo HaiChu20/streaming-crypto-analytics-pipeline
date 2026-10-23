@@ -82,7 +82,7 @@ impl StreamPath {
     }
     /// Stateless convenience for explicit coordinates; Source maintains synthetic epochs.
     pub fn parse(&self, line: &str) -> Result<Option<Record>> {
-        self.parse_at(line, 0, &mut 0, &mut None)
+        self.parse_at(line, 0, &mut 0, &mut None, None, &mut None)
     }
     fn parse_at(
         &self,
@@ -90,6 +90,8 @@ impl StreamPath {
         index: i64,
         epochs: &mut u64,
         epoch: &mut Option<String>,
+        exchange_clock_ms: Option<u64>,
+        previous_clock: &mut Option<i128>,
     ) -> Result<Option<Record>> {
         #[derive(Deserialize)]
         struct Meta<'a> {
@@ -105,6 +107,38 @@ impl StreamPath {
             data: Option<&'a serde_json::value::RawValue>,
         }
         let meta: Meta<'_> = serde_json::from_str(line)?;
+        let exchange_recv = if let Some(ms) = exchange_clock_ms {
+            if self.exchange != "kraken" || self.market != "spot" {
+                return Err(error("exchange clock requires Kraken spot input"));
+            }
+            let computed = if meta.marker.is_some() {
+                iso_ns(
+                    meta.timestamp
+                        .ok_or_else(|| error("marker missing ISO timestamp"))?,
+                )?
+            } else {
+                #[derive(Deserialize)]
+                struct Time<'a> {
+                    timestamp: Option<&'a str>,
+                }
+                let data: Vec<Time<'_>> = serde_json::from_str(
+                    meta.data
+                        .ok_or_else(|| error("Kraken data line missing data"))?
+                        .get(),
+                )?;
+                match data.first().and_then(|d| d.timestamp) {
+                    Some(timestamp) => iso_ns(timestamp)? + i128::from(ms) * 1_000_000,
+                    None => previous_clock.ok_or_else(|| {
+                        error("Kraken data line has neither exchange timestamp nor previous clock")
+                    })?,
+                }
+            };
+            let recv = previous_clock.map_or(computed, |previous| previous.max(computed));
+            *previous_clock = Some(recv);
+            Some(recv)
+        } else {
+            None
+        };
         // A failed REST snapshot leaves the depth stream and book unchanged.
         if matches!(meta.marker, Some("rollover" | "gap" | "snapshot_error"))
             || meta.event == Some("gap")
@@ -201,9 +235,10 @@ impl StreamPath {
                 .then(|| serde_json::json!({"archive_snapshot":true}));
             (kind, None, None, detail, native.to_owned())
         };
-        let recv_ns = meta
-            .recv_time_ns
-            .or_else(|| meta.timestamp.and_then(|t| iso_ns(t).ok()))
+        let recv_ns = exchange_recv
+            .or(meta
+                .recv_time_ns
+                .or_else(|| meta.timestamp.and_then(|t| iso_ns(t).ok())))
             .ok_or_else(|| error("v3 line missing receive time or valid marker timestamp"))?;
         Ok(Some(Record {
             exchange: self.exchange.clone(),
@@ -299,12 +334,17 @@ pub(crate) struct Source {
     open: bool,
     line: u64,
     previous_offset: Option<i64>,
+    exchange_clock_ms: Option<u64>,
+    previous_clock: Option<i128>,
     epochs: u64,
     epoch: Option<String>,
     pub bytes: u64,
 }
 impl Source {
     pub fn new(path: &Path) -> Result<Self> {
+        Self::with_exchange_clock(path, None)
+    }
+    fn with_exchange_clock(path: &Path, exchange_clock_ms: Option<u64>) -> Result<Self> {
         let stream = StreamPath::new(path)?;
         let file = File::open(path)?;
         let bytes = file.metadata()?.len();
@@ -321,6 +361,8 @@ impl Source {
             open: path.to_string_lossy().ends_with(".open"),
             line: 0,
             previous_offset: None,
+            exchange_clock_ms,
+            previous_clock: None,
             epochs: 0,
             epoch: None,
             bytes,
@@ -344,6 +386,8 @@ impl Source {
                     (self.line - 1) as i64,
                     &mut self.epochs,
                     &mut self.epoch,
+                    self.exchange_clock_ms,
+                    &mut self.previous_clock,
                 )
                 .map_err(|e| error(format!("{}:{}: {e}", self.path.display(), self.line)))?;
             let Some(record) = record else {
@@ -432,14 +476,20 @@ pub struct Merge {
     pub snapshots: Vec<Snapshot>,
 }
 impl Merge {
-    pub fn new(mut paths: Vec<PathBuf>) -> Result<Self> {
+    pub fn new(paths: Vec<PathBuf>) -> Result<Self> {
+        Self::with_exchange_clock(paths, None)
+    }
+    pub fn with_exchange_clock(
+        mut paths: Vec<PathBuf>,
+        exchange_clock_ms: Option<u64>,
+    ) -> Result<Self> {
         paths.sort();
         let mut snapshots = Vec::new();
         let mut sources = Vec::new();
         let mut heap = BinaryHeap::new();
         let mut partitions = BTreeMap::<String, i32>::new();
         for path in paths {
-            let mut file = Source::new(&path)?;
+            let mut file = Source::with_exchange_clock(&path, exchange_clock_ms)?;
             let topic = format!(
                 "raw.{}.{}.{}.v1",
                 file.stream.exchange, file.stream.market, file.stream.feed
@@ -489,6 +539,29 @@ impl Merge {
     pub fn clock_steps(&self) -> u64 {
         self.sources.iter().map(|s| s.clock_steps).sum()
     }
+}
+
+/// Stop at the first data record; marker-only files are read through EOF.
+/// Run before creating a Writer so a skipped day cannot publish features.
+pub fn marker_only_files(
+    paths: &[PathBuf],
+    exchange_clock_ms: Option<u64>,
+) -> Result<Vec<PathBuf>> {
+    let mut empty = Vec::new();
+    for path in paths {
+        let mut source = Source::with_exchange_clock(path, exchange_clock_ms)?;
+        let mut has_data = false;
+        while let Some(record) = source.next()? {
+            if record.kind != Kind::Control {
+                has_data = true;
+                break;
+            }
+        }
+        if !has_data {
+            empty.push(path.clone());
+        }
+    }
+    Ok(empty)
 }
 
 pub use engine_core::features::asset;
@@ -632,6 +705,23 @@ pub fn discover_filtered(
         }
     }
     let paths = chosen.into_values().map(|(_, p)| p).collect::<Vec<_>>();
+    let mut streams = BTreeMap::new();
+    for path in &paths {
+        let stream = StreamPath::new(path)?;
+        let key = (
+            stream.exchange,
+            stream.market,
+            stream.symbol,
+            stream.channel,
+        );
+        if let Some(previous) = streams.insert(key, path) {
+            return Err(error(format!(
+                "duplicate archive stream for {date}: {} and {}",
+                previous.display(),
+                path.display(),
+            )));
+        }
+    }
     if paths.is_empty() {
         return Err(error(
             "no v3 input streams found (use --allow-open for .jsonl.open)",

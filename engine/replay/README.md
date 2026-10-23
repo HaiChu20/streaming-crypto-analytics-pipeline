@@ -395,3 +395,32 @@ RV units, Parquet and checkpoint/from-state parity with a pending candle.
 Both measured regressions are below 5%, with zero data anomalies. These short
 fixture ingestion runs vary with local load; the increases are not evidence of
 an algorithmic speedup. They exclude ticks and Parquet, as described above.
+
+## Older Kraken spot archives (v2)
+
+`Kraken*/Spotv2/<BTC-USD|ETH-USD>/YYYYMMDD_<book|level3|trades>.jsonl.gz`
+contains native WS v2 lines and recorder markers, without `recv_time_ns`, `conn`
+or `offset`. These files require the explicit ideal-mode option:
+
+```sh
+engine/target/release/engine-replay --root ARCHIVE --date 2025-11-08 \
+  --exchange kraken --market spot --exchange-clock-ms 35 --skip-marker-only-days \
+  --out WORK/features
+```
+
+`--exchange-clock-ms N` uses `data[0].timestamp + N ms` for every data line,
+including v3 lines with an existing receive time. N is a non-negative integer.
+Markers use their ISO timestamp without the delay. L2 snapshots without a
+timestamp carry the previous clock in that file; missing both is an error.
+Every file's clock is clamped to be non-decreasing, including ignored rollover
+markers. Parquet `mode` and the day report record `ideal+exchange_clock_35ms`;
+`ENGINE_VERSION` stays unchanged. Without the option, receive-time replay remains
+the default and v2 data without a receive time still fails.
+
+With `--skip-marker-only-days`, any empty or marker-only input skips the whole
+day before creating features. Exit status **3** means skipped (ordinary failures
+return 1); stdout is JSON with `status`, `reason: "marker_only_inputs"`, `files`,
+`date`, `engine_version`, and `replay_mode`. Without the flag, behavior is unchanged.
+Duplicate canonical exchange/market/symbol/channel/day streams across archive
+directories are errors naming both paths; representation priority within one
+directory remains `.jsonl`, `.jsonl.gz`, then `.jsonl.open`.

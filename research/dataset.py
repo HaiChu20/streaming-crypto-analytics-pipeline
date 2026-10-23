@@ -67,9 +67,23 @@ def feature_paths(root: str | Path) -> list[Path]:
     return paths
 
 
+def validate_replay_modes(paths: list[Path]) -> str:
+    modes = set()
+    for path in paths:
+        metadata = pq.read_metadata(path).metadata or {}
+        mode = metadata.get(b"mode", metadata.get(b"replay_mode", b"")).decode()
+        if mode not in {"as_live", "ideal"} and not re.fullmatch(r"ideal\+exchange_clock_[0-9]+ms", mode):
+            raise ValueError(f"Missing/unknown replay mode in {path}: {mode!r}")
+        modes.add(mode)
+    if len(modes) != 1:
+        raise ValueError(f"Cannot mix replay modes within one training run: {sorted(modes)}")
+    return modes.pop()
+
+
 def read_features(paths: list[Path], targets=None, spec: dict | None = None, *,
                   stride_s: int | None = None, before_ns: int | None = None) -> pl.DataFrame:
     """Load stride features plus dense reference label inputs, or full rows by default."""
+    mode = validate_replay_modes(paths)
     spec = spec or load_spec()
     if stride_s is not None and stride_s <= 0:
         raise ValueError("stride_s must be positive")
@@ -81,9 +95,6 @@ def read_features(paths: list[Path], targets=None, spec: dict | None = None, *,
     frames = []
     for path in paths:
         metadata = pq.read_metadata(path).metadata or {}
-        mode = metadata.get(b"mode", metadata.get(b"replay_mode", b"")).decode()
-        if mode not in {"as_live", "ideal"}:
-            raise ValueError(f"Missing/unknown replay mode in {path}: {mode!r}")
         query = pl.scan_parquet(path)
         if before_ns is not None:
             query = query.filter(pl.col('tick_ns') < before_ns)
