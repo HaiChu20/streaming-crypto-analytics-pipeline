@@ -207,3 +207,18 @@ labeled UTC day plus `min_train_days`, with the latest `max_folds` nonempty
 calendar blocks retained (default 12 weekly blocks). Test windows and test rows
 stay unchanged. A cutoff leaving any selected fold with no training rows is an
 error identifying that fold; it never silently drops or moves test folds.
+
+### Comparing two runs
+
+Run `python -m research.compare A B --blocks 1 3 7 --draws 1000 --seed 17
+--json-out comparison.json`, where A and B are model directories or their
+`oof.parquet` paths. The table reports B minus A with 2.5/50/97.5 percentiles
+from paired moving UTC-day blocks, plus each run's scores and valid row/day
+counts. Higher directional accuracy and lower log loss, multiclass Brier, MSE
+and stop pinball loss are better. Row keys, order, folds, entry delays and
+labels must match; adjacent metadata, when present for both, must agree on
+target, horizon, label spec version and date split. There is no row intersection.
+Optional shrunk predictions and stop models are compared when present in both.
+Finite masks follow each run's report; each draw divides summed scores by that
+run's valid-row count, so missing stop labels and unequal day sizes retain their
+proper weights. A metric with no valid rows is reported as `n/a` (JSON `null`).
