@@ -168,6 +168,35 @@ split, feature schema, statuses and metrics, including skipped/runtime-failed ru
 output root. Overlapping dates require `--i-understand-lockbox-reuse`; acknowledged
 entries record reuse.
 
+### Freezing and opening the lockbox
+
+Before any opening, freeze all saved candidates and decision rules into a new
+plan (existing plans are never overwritten). Use one shared ledger for every
+work root and pass the same plan and ledger to each opening:
+
+```sh
+python -m research.freeze lockbox-plan.json \
+  --entry WORK_A:full-v2-BTC_spot --entry WORK_A:full-v2-ETH_spot \
+  --entry WORK_A:full-v2-BTC_perp --entry WORK_A:full-v2-ETH_perp \
+  --entry WORK_B:k-long --only k-long:BTC_spot/300 \
+  --rule "Compare classifier direction against reversal and log loss against the prior; no tuning." \
+  --lockbox-ledger shared-lockbox.jsonl
+for version in full-v2-BTC_spot full-v2-ETH_spot full-v2-BTC_perp full-v2-ETH_perp; do
+  python -m research.train WORK_A --open-lockbox --version "$version" \
+    --lockbox-plan lockbox-plan.json --lockbox-ledger shared-lockbox.jsonl
+done
+python -m research.train WORK_B --open-lockbox --version k-long --target BTC_spot --horizon-s 300 \
+  --lockbox-plan lockbox-plan.json --lockbox-ledger shared-lockbox.jsonl
+```
+
+Repeat `--only VERSION:TARGET/H` to restrict a version to exact pairs; other
+versions include all saved models. Hashes bind model files, metadata and roots.
+Distinct candidates under the same plan may each open once; repeated attempts,
+including failed openings, require the reuse acknowledgement. Each opening
+saves `lockbox.parquet` with fold 0 and 1/3/7-day bootstrap intervals in JSON/HTML.
+`research.compare` accepts two `lockbox.parquet` files only when their rows and
+labels match (same work root, target, horizon and delay).
+
 ### Kraken-only v2 archive training
 
 The offline launcher passes `--exchange NAME`, `--market NAME`,

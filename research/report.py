@@ -168,6 +168,12 @@ def target_section(r):
         result += '<h3>Opened lockbox</h3><p>' + escape(r['lockbox_results']['notes']) + '</p>'
         result += direction_charts(r['lockbox_results']['metrics'], 'Lockbox direction')
         result += stop_section(r['lockbox_results']['stop_metrics'])
+        if r['lockbox_results'].get('bootstrap'):
+            result += '<h4>Lockbox paired day-block bootstrap</h4>' + table(
+                ['Comparison', 'Block days', 'Paired rows', 'Mean difference', '2.5%', '50%', '97.5%'], [
+                [name, length, values['paired_rows'], values['mean_difference'], values['p2_5'], values['p50'], values['p97_5']]
+                for length, scores in r['lockbox_results']['bootstrap']['blocks'].items()
+                for name, values in scores.items()])
     return result + '</article>'
 
 

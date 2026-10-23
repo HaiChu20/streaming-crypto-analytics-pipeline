@@ -575,7 +575,8 @@ def lockbox_reports(output, version, targets=None, horizons=None):
 
 
 def open_lockbox(rows, output, version, targets=None, horizons=None, acknowledge_reuse=False,
-                 max_memory_gb=None, num_threads=None, input_days=None, lockbox_ledger=None):
+                 max_memory_gb=None, num_threads=None, input_days=None, lockbox_ledger=None,
+                 lockbox_plan=None):
     """Evaluate saved boosters and frozen calibration only. No fitting code here."""
     num_threads = resolve_threads(num_threads)
     import fcntl
@@ -584,6 +585,12 @@ def open_lockbox(rows, output, version, targets=None, horizons=None, acknowledge
     if not version or Path(version).name != version or version in {'.', '..'}:
         raise ValueError('version must be a single directory name')
     reports = lockbox_reports(output, version, targets, horizons)
+    plan_sha256 = None
+    if lockbox_plan is not None:
+        from research.freeze import validate_plan
+        plan_sha256 = validate_plan(lockbox_plan, output, version, reports)
+    requested = {f"{version}:{r['target']}/{r['horizon_s']}" for r in reports
+                 if 'target' in r and 'horizon_s' in r}
     ranges = {json.dumps(r['date_split']['lockbox'], sort_keys=True) for r in reports}
     if 'null' in ranges:
         raise ValueError('This version has no lockbox days')
@@ -594,15 +601,21 @@ def open_lockbox(rows, output, version, targets=None, horizons=None, acknowledge
         ledger.seek(0)
         previous = [json.loads(line) for line in ledger if line.strip()]
         reused = {span: any(date_intervals_overlap(json.loads(span), item['lockbox_range'])
+                            and not (plan_sha256 is not None and item.get('plan_sha256') == plan_sha256
+                                     and isinstance(item.get('attempted'), list)
+                                     and not requested.intersection(item['attempted']))
                             for item in previous) for span in ranges}
         if any(reused.values()):
             print('WARNING: LOCKBOX REUSE — these results are no longer untouched!', flush=True)
             if not acknowledge_reuse:
                 raise ValueError('Pass --i-understand-lockbox-reuse to reopen this lockbox range')
         outcomes = {}
+        attempted = {span: [] for span in ranges}
         try:
             for report in reports:
                 split, spec = report['date_split'], report['label_spec']
+                attempted[json.dumps(split['lockbox'], sort_keys=True)].append(
+                    f"{version}:{report['target']}/{report['horizon_s']}")
                 stop_day = date.fromisoformat(split['lockbox']['last_day'])
                 end_ns = ((stop_day - date(1970, 1, 1)).days + 1) * DAY_NS
                 held = rows.filter((pl.col('tick_ns') >= split['lockbox_start_ns'])
@@ -656,6 +669,15 @@ def open_lockbox(rows, output, version, targets=None, horizons=None, acknowledge
                 stop_models = {name: lgb.Booster(model_file=str(directory / config['file']))
                                for name, config in report['stop_models'].items()}
                 stops = predict_stops(stop_models, x, num_threads=num_threads) if len(x) else {n: np.array([]) for n in stop_models}
+                regimes = regime_assignments(data['tick_ns'].to_numpy(), rv, report['volatility_edges'])
+                saved = {'regressor': predictions['regressor'], 'classifier_expected': predictions['classifier'],
+                         'zero': predictions['zero'], 'momentum': momentum, 'reversal': -momentum,
+                         'prior_expected': predictions.get('prior', np.full(len(x), np.nan)),
+                         'p_up_minus_down': probs[:, 2] - probs[:, 0], **regimes}
+                saved.update({name: predictions[name] for name in ('ridge', 'regressor_shrunk') if name in predictions})
+                for prefix, probabilities in [('', probs), ('prior_', class_probs.get('prior', np.full((len(x), 3), np.nan)))]:
+                    saved.update({prefix + 'p_' + name: probabilities[:, j]
+                                  for j, name in enumerate(('down', 'flat', 'up'))})
                 risk = {}
                 for name, p in stops.items():
                     side, q = name.split('_')[1], int(name[-2:]) / 100
@@ -664,15 +686,29 @@ def open_lockbox(rows, output, version, targets=None, horizons=None, acknowledge
                     constant = np.full(len(x), calibration['constant'])
                     scaled = np.where(np.isfinite(rv) & (rv >= 0), rv * calibration['k'], np.nan) if calibration['k'] is not None else np.full(len(x), np.nan)
                     groups = regime_assignments(data['tick_ns'].to_numpy(), rv, calibration['edges'])['volatility_tercile']
+                    saved.update({name: p, name + '_unconditional': constant,
+                                  name + '_volatility_scaled': scaled, name + '_volatility_tercile': groups})
                     risk[name] = {'quantile': q, 'target_hit_rate': 1-q,
                                   **{key: stop_metrics(actual, values, q, groups) for key, values in
                                      [('model', p), ('unconditional', constant), ('volatility_scaled', scaled)]}}
+                # Keep unavailable legacy stop models explicit for the shared bootstrap.
+                for name in STOP_NAMES:
+                    saved.setdefault(name, np.full(len(x), np.nan))
+                    saved.setdefault(name + '_unconditional', np.full(len(x), np.nan))
+                lockbox = data.select('tick_ns', 'available_ns', 'label_end_ns', 'label_available_ns',
+                                      'return_pct', 'direction', 'adverse_long_bps', 'adverse_short_bps').with_columns(
+                    pl.lit(0, dtype=pl.Int32).alias('fold'),
+                    pl.lit(report.get('entry_delay_s', 0), dtype=pl.Int64).alias('entry_delay_s'),
+                    (pl.col('tick_ns') + report.get('entry_delay_s', 0) * NS).alias('label_start_ns'),
+                    *[pl.Series(name, values, nan_to_null=True) for name, values in saved.items()])
+                bootstrap = bootstrap_comparisons(lockbox)
+                lockbox.write_parquet(directory / 'lockbox.parquet')
                 report['lockbox_results'] = {'range': split['lockbox'], 'metrics': measured, 'stop_metrics': risk,
+                    'bootstrap': bootstrap, 'predictions_file': 'lockbox.parquet', 'prediction_rows': lockbox.height,
                     'entry_delay_s': report.get('entry_delay_s', 0),
                     'num_threads': num_threads,
                     'flat_labels': int((data['direction'] == 0).sum()),
-                    'regimes': direction_regimes(y, predictions, class_probs,
-                        regime_assignments(data['tick_ns'].to_numpy(), rv, report['volatility_edges'])),
+                    'regimes': direction_regimes(y, predictions, class_probs, regimes),
                     'notes': 'Saved models only; no refit or tuning; baseline calibration frozen on development.'}
                 outcomes[f"{report['target']}/{h}"] = report['lockbox_results']
                 (directory / 'metadata.json').write_text(json.dumps(report, indent=2, allow_nan=False) + '\n')
@@ -682,6 +718,8 @@ def open_lockbox(rows, output, version, targets=None, horizons=None, acknowledge
             for span in sorted(ranges):
                 entry = {'version': version, 'utc_time': datetime.now(timezone.utc).isoformat(),
                          'lockbox_range': json.loads(span),
+                         'plan_sha256': plan_sha256,
+                         'attempted': attempted[span],
                          'reused': reused[span],
                          'metrics_digest': hashlib.sha256(json.dumps(outcomes, sort_keys=True, allow_nan=False).encode()).hexdigest(),
                          'completed_targets': sorted(outcomes)}
@@ -783,6 +821,7 @@ def main(argv=None):
     parser.add_argument('--shuffle-test', action='store_true')
     parser.add_argument('--max-memory-gb', type=float)
     parser.add_argument('--open-lockbox', action='store_true')
+    parser.add_argument('--lockbox-plan', type=Path, help='Frozen model plan created by research.freeze')
     parser.add_argument('--lockbox-ledger', type=Path,
                         help='Reuse ledger; defaults to ROOT/lockbox_ledger.jsonl even with --output-root')
     parser.add_argument('--i-understand-lockbox-reuse', action='store_true')
@@ -796,6 +835,8 @@ def main(argv=None):
         parser.error('--entry-delay-s must be a non-negative integer')
     if args.open_lockbox and not args.version:
         parser.error('--open-lockbox requires the already-trained --version')
+    if args.lockbox_plan is not None and not args.open_lockbox:
+        parser.error('--lockbox-plan is only valid with --open-lockbox')
     args.version = args.version or datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S%fZ')
     if not args.version or Path(args.version).name != args.version or args.version in {'.', '..'}:
         parser.error('--version must be a single directory name')
@@ -814,6 +855,9 @@ def main(argv=None):
         if args.open_lockbox:
             frozen = lockbox_reports(output, args.version, args.target, args.horizon_s)
             reports = frozen
+            if args.lockbox_plan is not None:
+                from research.freeze import validate_plan
+                validate_plan(args.lockbox_plan, output, args.version, frozen)
             spec = frozen[0]['label_spec']
             if any(report['label_spec'] != spec for report in frozen):
                 raise ValueError('Saved models have different label specs; open them in separate runs')
@@ -868,7 +912,8 @@ def main(argv=None):
             result = open_lockbox(rows, output, args.version, args.target, args.horizon_s,
                                   args.i_understand_lockbox_reuse, args.max_memory_gb,
                                   num_threads=num_threads, input_days=input_days,
-                                  lockbox_ledger=args.lockbox_ledger or root / 'lockbox_ledger.jsonl')
+                                  lockbox_ledger=args.lockbox_ledger or root / 'lockbox_ledger.jsonl',
+                                  lockbox_plan=args.lockbox_plan)
             opened = {(r['target'], r['horizon_s']) for r in frozen}
             reports = [r for r in result.get('results', frozen) if (r['target'], r['horizon_s']) in opened]
             return result

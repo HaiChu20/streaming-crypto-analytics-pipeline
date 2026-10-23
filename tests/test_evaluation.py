@@ -320,6 +320,7 @@ def test_lockbox_frozen_models_ledger_and_cross_version_reuse_guard(tmp_path, sp
     ledger = tmp_path / 'lockbox_ledger.jsonl'
     entries = [json.loads(line) for line in ledger.read_text().splitlines()]
     assert len(entries) == 1 and len(entries[0]['metrics_digest']) == 64 and entries[0]['version'] == 'v1'
+    assert entries[0]['plan_sha256'] is None and entries[0]['attempted'] == ['v1:BTC_spot/300']
     assert entries[0]['lockbox_range'] == r['date_split']['lockbox']
     assert 'Opened lockbox' in (tmp_path / 'report_v1.html').read_text()
     calls.clear()
@@ -703,3 +704,248 @@ def test_train_from_without_training_rows_is_hard_error_naming_fold(tmp_path, sp
         train_target(rows, 'BTC_spot', 300, tmp_path, 'no-train', spec=spec, rounds=1,
                      num_threads=2, train_from='2026-02-01')
     assert not (tmp_path / 'models').exists()
+
+
+@pytest.fixture
+def frozen_model_dirs(tmp_path):
+    """Artifact-only fixtures for plan validation; opening tests use real boosters."""
+    roots = [tmp_path / 'a', tmp_path / 'b']
+    reports = []
+    for root, version in zip(roots, ('v1', 'v2'), strict=True):
+        directory = root / 'models/BTC_spot/300' / version
+        directory.mkdir(parents=True)
+        report = {'target': 'BTC_spot', 'horizon_s': 300, 'version': version,
+                  'model_dir': str(directory), 'features': ['frozen_feature'],
+                  'date_split': {'lockbox': {'first_day': '2026-02-02', 'last_day': '2026-02-09', 'days': 8}}}
+        (directory / 'metadata.json').write_text(json.dumps(report))
+        for name in ('regressor.txt', 'classifier.txt', 'ridge.npz', 'notes.json',
+                     'oof.parquet', 'training_rows.parquet', 'report.html'):
+            (directory / name).write_text(name)
+        reports.append(report)
+    return roots, reports
+
+
+def test_freeze_cli_creation_hashes_and_overwrite(tmp_path, frozen_model_dirs):
+    from research.freeze import main, model_snapshot
+    roots, reports = frozen_model_dirs
+    path = tmp_path / 'plan.json'
+    argv = [str(path), '--entry', f'{roots[0]}:v1', '--entry', f'{roots[1]}:v2',
+            '--only', 'v1:BTC_spot/300', '--rule', 'Compare direction first', '--rule', 'No tuning']
+    plan = main(argv)
+    assert json.loads(path.read_text()) == plan
+    assert plan['rules'] == ['Compare direction first', 'No tuning']
+    assert datetime.fromisoformat(plan['created_utc']).utcoffset().total_seconds() == 0
+    assert set(plan['git']) == {'sha', 'dirty'}
+    assert plan['lockbox_range'] == reports[0]['date_split']['lockbox']
+    assert plan['models'] == [model_snapshot(r, v, m) for r, v, m in zip(roots, ('v1', 'v2'), reports, strict=True)]
+    for root, model in zip(roots, plan['models'], strict=True):
+        assert model['root'] == str(root.resolve())
+        assert set(model['files']) == {'regressor.txt', 'classifier.txt', 'ridge.npz', 'notes.json'}
+        directory = Path(root) / 'models/BTC_spot/300' / model['version']
+        for name, digest in model['files'].items():
+            assert digest == hashlib.sha256((directory / name).read_bytes()).hexdigest()
+        metadata = json.loads((directory / 'metadata.json').read_text())
+        assert model['metadata_sha256'] == hashlib.sha256(json.dumps(metadata, sort_keys=True,
+            separators=(',', ':')).encode()).hexdigest()
+    before = path.read_bytes()
+    with pytest.raises(SystemExit):
+        main(argv)
+    assert path.read_bytes() == before
+
+
+@pytest.mark.parametrize('reason', ['missing', 'range', 'opened', 'overlap', 'null-range', 'unknown-only'])
+def test_freeze_refusals_leave_no_plan(tmp_path, frozen_model_dirs, reason):
+    from research.freeze import freeze_plan
+    roots, reports = frozen_model_dirs
+    ledger = tmp_path / 'shared.jsonl'
+    entries = [f'{roots[0]}:v1', f'{roots[1]}:v2']
+    only = []
+    if reason == 'missing':
+        entries[1] = f'{roots[1]}:missing'
+    elif reason == 'range':
+        reports[1]['date_split']['lockbox']['days'] = 7
+    elif reason == 'opened':
+        reports[1]['lockbox_results'] = {}
+    elif reason == 'null-range':
+        reports[1]['date_split']['lockbox'] = None
+    elif reason == 'overlap':
+        ledger.write_text(json.dumps({'lockbox_range': {'first_day': '2026-02-09', 'last_day': '2026-03-01'}}) + '\n')
+    elif reason == 'unknown-only':
+        only = ['v2:ETH_spot/900']
+    (Path(reports[1]['model_dir']) / 'metadata.json').write_text(json.dumps(reports[1]))
+    with pytest.raises(ValueError):
+        freeze_plan(tmp_path / 'plan.json', entries, ['Frozen rule'], only=only, lockbox_ledger=ledger)
+    assert not (tmp_path / 'plan.json').exists()
+
+
+def test_freeze_only_selects_exact_pairs_and_checks_default_ledgers(tmp_path, frozen_model_dirs):
+    from research.freeze import freeze_plan
+    roots, reports = frozen_model_dirs
+    for target, horizon in [('BTC_spot', 900), ('ETH_spot', 300), ('ETH_spot', 900)]:
+        directory = roots[0] / 'models' / target / str(horizon) / 'v1'
+        directory.mkdir(parents=True)
+        report = dict(reports[0], target=target, horizon_s=horizon, model_dir=str(directory))
+        (directory / 'metadata.json').write_text(json.dumps(report))
+    plan = freeze_plan(tmp_path / 'plan.json', [f'{roots[0]}:v1'], ['No tuning'],
+                       only=['v1:BTC_spot/300', 'v1:ETH_spot/900'])
+    assert [(m['target'], m['horizon_s']) for m in plan['models']] == [('BTC_spot', 300), ('ETH_spot', 900)]
+    (roots[0] / 'lockbox_ledger.jsonl').write_text(json.dumps({'lockbox_range': plan['lockbox_range']}) + '\n')
+    with pytest.raises(ValueError, match='overlaps'):
+        freeze_plan(tmp_path / 'new.json', [f'{roots[0]}:v1'], ['No tuning'])
+    assert not (tmp_path / 'new.json').exists()
+
+
+@pytest.mark.parametrize('tamper', ['model', 'metadata', 'extra-file', 'unlisted-version', 'unlisted-root', 'range'])
+def test_lockbox_plan_preflight_refuses_before_rows_or_ledger(tmp_path, frozen_model_dirs, tamper, monkeypatch):
+    from research.freeze import freeze_plan
+    roots, reports = frozen_model_dirs
+    plan_path, ledger = tmp_path / 'plan.json', tmp_path / 'ledger.jsonl'
+    freeze_plan(plan_path, [f'{roots[0]}:v1'], ['No tuning'], lockbox_ledger=ledger)
+    root, version = roots[0], 'v1'
+    directory = Path(reports[0]['model_dir'])
+    if tamper == 'model':
+        (directory / 'regressor.txt').write_text('tampered')
+    elif tamper == 'metadata':
+        reports[0]['features'] = ['changed']
+    elif tamper == 'extra-file':
+        (directory / 'extra.txt').write_text('unexpected')
+    elif tamper in {'unlisted-version', 'unlisted-root'}:
+        root, version = roots[1], 'v2'
+        if tamper == 'unlisted-root':
+            directory = roots[1] / 'models/BTC_spot/300/v1'
+            directory.mkdir()
+            report = dict(reports[0], model_dir=str(directory))
+            (directory / 'metadata.json').write_text(json.dumps(report))
+            version = 'v1'
+    elif tamper == 'range':
+        plan = json.loads(plan_path.read_text())
+        plan['lockbox_range']['days'] = 7
+        plan_path.write_text(json.dumps(plan))
+    (Path(reports[0]['model_dir']) / 'metadata.json').write_text(json.dumps(reports[0]))
+    monkeypatch.setattr('research.train.make_labels', lambda *a, **k: pytest.fail('Must not read labels'))
+    with pytest.raises(ValueError, match='plan'):
+        open_lockbox(None, root, version, lockbox_plan=plan_path, lockbox_ledger=ledger, num_threads=2)
+    assert not ledger.exists()
+    # The CLI must reject before even loading feature rows.
+    from research.train import main
+    monkeypatch.setattr('research.train.feature_paths', lambda *a: [])
+    monkeypatch.setattr('research.train.validate_replay_modes', lambda *a: None)
+    monkeypatch.setattr('research.train.read_features', lambda *a, **k: pytest.fail('Must not read rows'))
+    with pytest.raises(ValueError, match='plan'):
+        main([str(root), '--version', version, '--open-lockbox', '--lockbox-plan', str(plan_path),
+              '--lockbox-ledger', str(ledger), '--threads', '2'])
+    assert not ledger.exists()
+
+
+def test_two_root_plan_opening_predictions_bootstrap_and_compare(tmp_path, sparse_evaluation, monkeypatch):
+    from research.compare import main as compare_main
+    from research.freeze import freeze_plan
+    from research.train import bootstrap_comparisons, main
+    rows, spec, calls = sparse_evaluation
+    roots = [tmp_path / 'a', tmp_path / 'b']
+    reports = [train_target(rows, 'BTC_spot', 300, root, version, spec=spec, rounds=1, num_threads=2,
+                           early_stopping=True, inner_valid_days=2, exclude_features=exclusions)
+               for root, version, exclusions in [(roots[0], 'v1', ()), (roots[1], 'v2', ('oracle',))]]
+    assert reports[0]['features'] != reports[1]['features']
+    plan_path, ledger = tmp_path / 'plan.json', tmp_path / 'shared.jsonl'
+    freeze_plan(plan_path, [f'{roots[0]}:v1', f'{roots[1]}:v2'], ['Compare without tuning'], lockbox_ledger=ledger)
+    calls.clear()
+    monkeypatch.setattr('research.train.fit_models', lambda *a, **k: pytest.fail('No refitting'))
+    monkeypatch.setattr('research.train.fit_stop_models', lambda *a, **k: pytest.fail('No refitting'))
+    first = open_lockbox(rows, roots[0], 'v1', lockbox_plan=plan_path, lockbox_ledger=ledger, num_threads=2)
+    path = roots[1] / 'features.parquet'
+    pq.write_table(rows.to_arrow().replace_schema_metadata({b'mode': b'ideal', b'engine_version': b'fixture'}), path)
+    second = main([str(path), '--version', 'v2', '--open-lockbox', '--lockbox-plan', str(plan_path),
+                   '--lockbox-ledger', str(ledger), '--threads', '2'])
+    assert len(calls) == 2
+    entries = [json.loads(line) for line in ledger.read_text().splitlines()]
+    assert [e['reused'] for e in entries] == [False, False]
+    assert [e['attempted'] for e in entries] == [['v1:BTC_spot/300'], ['v2:BTC_spot/300']]
+    assert all(e['plan_sha256'] == hashlib.sha256(plan_path.read_bytes()).hexdigest() for e in entries)
+    paths = []
+    for opened in (first, second):
+        report = opened['results'][0]
+        directory = Path(report['model_dir'])
+        prediction_path = directory / 'lockbox.parquet'
+        frame = pl.read_parquet(prediction_path)
+        paths.append(prediction_path)
+        assert frame.height == report['lockbox_results']['metrics']['regressor']['n'] > 0
+        assert frame['fold'].unique().to_list() == [0]
+        assert set(pl.read_parquet(directory / 'oof.parquet').columns) <= set(frame.columns)
+        assert report['lockbox_results']['bootstrap'] == bootstrap_comparisons(frame)
+        assert set(report['lockbox_results']['bootstrap']['blocks']) == {'1', '3', '7'}
+        assert 'classifier_vs_prior_log_loss' in report['lockbox_results']['bootstrap']['blocks']['1']
+        np.testing.assert_array_equal(frame['reversal'].to_numpy(), -frame['momentum'].to_numpy())
+        html = (directory.parent / f'report_{report["version"]}.html').read_text()
+        assert 'Lockbox paired day-block bootstrap' in html
+    compare_path = tmp_path / 'comparison.json'
+    compare_main([str(p) for p in paths] + ['--json-out', str(compare_path), '--draws', '20'])
+    assert json.loads(compare_path.read_text())['n_rows'] == pl.read_parquet(paths[0]).height
+    calls.clear()
+    before = ledger.read_bytes()
+    with pytest.raises(ValueError, match='i-understand-lockbox-reuse'):
+        open_lockbox(rows, roots[0], 'v1', lockbox_plan=plan_path, lockbox_ledger=ledger, num_threads=2)
+    assert not calls and ledger.read_bytes() == before
+    open_lockbox(rows, roots[0], 'v1', lockbox_plan=plan_path, lockbox_ledger=ledger,
+                 acknowledge_reuse=True, num_threads=2)
+    assert json.loads(ledger.read_text().splitlines()[-1])['reused'] is True
+
+
+def test_lockbox_plan_flag_requires_open_lockbox(tmp_path):
+    from research.train import main
+    with pytest.raises(SystemExit):
+        main([str(tmp_path), '--lockbox-plan', str(tmp_path / 'plan.json')])
+    assert not (tmp_path / 'experiments.jsonl').exists()
+
+
+@pytest.mark.parametrize('previous', ['other-plan', 'no-plan', 'same-attempt', 'missing-attempts'])
+def test_lockbox_plan_preserves_reuse_guard_for_other_overlaps(tmp_path, frozen_model_dirs, previous):
+    from research.freeze import freeze_plan
+    roots, reports = frozen_model_dirs
+    plan_path, ledger = tmp_path / 'plan.json', tmp_path / 'ledger.jsonl'
+    freeze_plan(plan_path, [f'{roots[0]}:v1'], ['No tuning'], lockbox_ledger=ledger)
+    entry = {'lockbox_range': reports[0]['date_split']['lockbox'],
+             'plan_sha256': hashlib.sha256(plan_path.read_bytes()).hexdigest(),
+             'attempted': ['v2:BTC_spot/300']}
+    if previous == 'other-plan':
+        entry['plan_sha256'] = 'different'
+    elif previous == 'no-plan':
+        entry['plan_sha256'] = None
+    elif previous == 'same-attempt':
+        entry['attempted'] = ['v1:BTC_spot/300']
+    else:
+        entry.pop('attempted')
+    ledger.write_text(json.dumps(entry) + '\n')
+    before = ledger.read_bytes()
+    with pytest.raises(ValueError, match='i-understand-lockbox-reuse'):
+        open_lockbox(None, roots[0], 'v1', lockbox_plan=plan_path, lockbox_ledger=ledger, num_threads=2)
+    assert ledger.read_bytes() == before
+
+
+def test_plan_failed_opening_records_only_attempted_models(tmp_path, sparse_evaluation, monkeypatch):
+    from research.freeze import freeze_plan
+    rows, spec, calls = sparse_evaluation
+    for horizon in (300, 900):
+        train_target(rows, 'BTC_spot', horizon, tmp_path, 'v1', spec=spec, rounds=1, num_threads=2)
+    plan_path, ledger = tmp_path / 'plan.json', tmp_path / 'ledger.jsonl'
+    freeze_plan(plan_path, [f'{tmp_path}:v1'], ['No tuning'], lockbox_ledger=ledger)
+    calls.clear()
+    def fail_after_labels(*args, **kwargs):
+        raise RuntimeError('fixture failure after labels')
+    with monkeypatch.context() as patch:
+        patch.setattr('research.train.feature_array', fail_after_labels)
+        with pytest.raises(RuntimeError, match='after labels'):
+            open_lockbox(rows, tmp_path, 'v1', lockbox_plan=plan_path, lockbox_ledger=ledger, num_threads=2)
+    assert len(calls) == 1
+    entry = json.loads(ledger.read_text())
+    assert entry['attempted'] == ['v1:BTC_spot/300'] and entry['completed_targets'] == []
+    assert entry['reused'] is False
+    result = open_lockbox(rows, tmp_path, 'v1', horizons=[900], lockbox_plan=plan_path,
+                         lockbox_ledger=ledger, num_threads=2)
+    assert result['results'][0]['lockbox_results']['metrics']['regressor']['n'] > 0
+    assert json.loads(ledger.read_text().splitlines()[-1])['reused'] is False
+    calls.clear()
+    with pytest.raises(ValueError, match='i-understand-lockbox-reuse'):
+        open_lockbox(rows, tmp_path, 'v1', horizons=[300], lockbox_plan=plan_path,
+                     lockbox_ledger=ledger, num_threads=2)
+    assert not calls and len(ledger.read_text().splitlines()) == 2

@@ -156,8 +156,8 @@ def _print_table(result):
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('a', help='Run A model directory or oof.parquet')
-    parser.add_argument('b', help='Run B model directory or oof.parquet')
+    parser.add_argument('a', help='Run A model directory, oof.parquet or lockbox.parquet')
+    parser.add_argument('b', help='Run B model directory, oof.parquet or lockbox.parquet')
     parser.add_argument('--blocks', nargs='+', type=int, default=[1, 3, 7])
     parser.add_argument('--draws', type=int, default=1000)
     parser.add_argument('--seed', type=int, default=17)
