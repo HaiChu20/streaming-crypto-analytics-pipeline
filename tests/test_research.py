@@ -659,7 +659,9 @@ def test_kraken_label_spec_native_symbols_calendar_and_cli(tmp_path):
         assert report['target'].endswith('_spot')
 
 
-@pytest.mark.parametrize('mode', ['ideal+exchange_clock_0ms', 'ideal+exchange_clock_35ms'])
+@pytest.mark.parametrize('mode', ['ideal', 'as_live', 'ideal+exchange_clock_0ms',
+                                  'ideal+exchange_clock_35ms', 'ideal+dvol',
+                                  'ideal+exchange_clock_0ms+dvol', 'ideal+exchange_clock_35ms+dvol'])
 def test_exchange_clock_provenance_is_accepted_and_preserved(tmp_path, mode):
     path = write_parquet(tmp_path, [row(0), row(10)], mode)
     rows = read_features([path])
@@ -667,10 +669,15 @@ def test_exchange_clock_provenance_is_accepted_and_preserved(tmp_path, mode):
     assert matrix['replay_mode'].to_list() == [mode, mode]
 
 
-def test_exchange_clock_modes_cannot_mix_across_days_or_hidden_lockbox_paths(tmp_path):
+@pytest.mark.parametrize('modes', [
+    ('ideal+exchange_clock_35ms', 'ideal+exchange_clock_36ms'),
+    ('ideal', 'ideal+dvol'),
+    ('ideal+exchange_clock_35ms', 'ideal+exchange_clock_35ms+dvol'),
+])
+def test_exchange_clock_modes_cannot_mix_across_days_or_hidden_lockbox_paths(tmp_path, modes):
     from research.dataset import validate_replay_modes
-    paths = [write_parquet(tmp_path, [row(0)], 'ideal+exchange_clock_35ms', 'a.parquet'),
-             write_parquet(tmp_path, [row(86400)], 'ideal+exchange_clock_36ms', 'b.parquet')]
+    paths = [write_parquet(tmp_path, [row(0)], modes[0], 'a.parquet'),
+             write_parquet(tmp_path, [row(86400)], modes[1], 'b.parquet')]
     with pytest.raises(ValueError, match='Cannot mix replay modes'):
         validate_replay_modes(paths)
     with pytest.raises(ValueError, match='Cannot mix replay modes'):
@@ -706,3 +713,15 @@ def test_train_from_leaves_latest_twelve_fold_blocks_and_test_rows_unchanged():
 def test_invalid_train_from_cli_errors_before_loading(value):
     with pytest.raises(SystemExit, match='2'):
         main(['unused', '--train-from', value])
+
+
+@pytest.mark.parametrize('mode', ['', 'as_live+dvol', 'ideal+exchange_clock_-1ms',
+                                  'ideal+exchange_clock_1.5ms+dvol', 'ideal+exchange_clock_ms',
+                                  'ideal+exchange_clock_35', 'ideal+dvol+exchange_clock_35ms',
+                                  'ideal+dvol+dvol', 'ideal+exchange_clock_35ms+dvol+extra',
+                                  'ideal+dvol\n'])
+def test_reject_unknown_dvol_replay_modes(tmp_path, mode):
+    from research.dataset import validate_replay_modes
+    path = write_parquet(tmp_path, [row(0)], mode)
+    with pytest.raises(ValueError, match='Missing/unknown replay mode'):
+        validate_replay_modes([path])

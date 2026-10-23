@@ -424,3 +424,11 @@ return 1); stdout is JSON with `status`, `reason: "marker_only_inputs"`, `files`
 Duplicate canonical exchange/market/symbol/channel/day streams across archive
 directories are errors naming both paths; representation priority within one
 directory remains `.jsonl`, `.jsonl.gz`, then `.jsonl.open`.
+
+Add `--include-dvol` to a filtered ideal replay (and to `scripts/train_offline.sh`)
+to also read that day's `Deribit*/Index*/<BTC|ETH>/YYYYMMDD_dvol.jsonl[.gz]`.
+Missing DVOL files leave its features null. DVOL retains `recv_time_ns` while
+Kraken spot uses the optional exchange clock; both merge by their effective time.
+The mode gains `+dvol` (for example `ideal+exchange_clock_35ms+dvol` or
+`ideal+dvol`). The flag requires an exchange or market filter. Launcher day
+discovery still uses only the selected venue/market; DVOL never adds days.

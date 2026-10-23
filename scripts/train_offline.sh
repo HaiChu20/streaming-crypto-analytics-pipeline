@@ -3,7 +3,7 @@
 set -euo pipefail
 
 usage() {
-    echo "Usage: $0 <archive_root> <work_dir> [--jobs N] [--from YYYY-MM-DD] [--to YYYY-MM-DD] [--version V] [--allow-missing-days] [--rebuild-stale] [--replay-only] [--exchange NAME] [--market NAME] [--exchange-clock-ms N] [--skip-marker-only-days] [research.train flags: --label-spec PATH, --train-from YYYY-MM-DD, --threads, --lockbox-pct/--lockbox-from/--embargo-days, --fold-days/--min-train-days/--fold-embargo-s/--max-folds, --shuffle-test, --max-memory-gb, --open-lockbox/--i-understand-lockbox-reuse]" >&2
+    echo "Usage: $0 <archive_root> <work_dir> [--jobs N] [--from YYYY-MM-DD] [--to YYYY-MM-DD] [--version V] [--allow-missing-days] [--rebuild-stale] [--replay-only] [--exchange NAME] [--market NAME] [--exchange-clock-ms N] [--include-dvol] [--skip-marker-only-days] [research.train flags: --label-spec PATH, --train-from YYYY-MM-DD, --threads, --lockbox-pct/--lockbox-from/--embargo-days, --fold-days/--min-train-days/--fold-embargo-s/--max-folds, --shuffle-test, --max-memory-gb, --open-lockbox/--i-understand-lockbox-reuse]" >&2
 }
 fail() { echo "train_offline: $*" >&2; exit 1; }
 [[ $# -ge 2 ]] || { usage; exit 2; }
@@ -27,6 +27,7 @@ exchange_filter=""
 market_filter=""
 exchange_clock_ms=""
 skip_marker_only=0
+include_dvol=0
 replay_args=(--mode ideal)
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -48,6 +49,8 @@ while [[ $# -gt 0 ]]; do
             esac
             replay_args+=("$1" "$2")
             shift 2 ;;
+        --include-dvol)
+            include_dvol=1; replay_args+=("$1"); shift ;;
         --skip-marker-only-days)
             skip_marker_only=1; replay_args+=("$1"); shift ;;
         --threads|--label-spec|--train-from|--lockbox-pct|--lockbox-from|--embargo-days|--fold-days|--min-train-days|--fold-embargo-s|--max-folds|--max-memory-gb|--stride-s|--target|--horizon-s|--rounds|--purge-s)
@@ -75,6 +78,7 @@ done
 if [[ -n $exchange_clock_ms ]]; then
     [[ $exchange_clock_ms =~ ^[0-9]+$ && $exchange_filter == kraken && $market_filter == spot ]] || fail "--exchange-clock-ms requires non-negative integer milliseconds, --exchange kraken --market spot"
 fi
+[[ $include_dvol -eq 0 || -n $exchange_filter || -n $market_filter ]] || fail "--include-dvol requires an --exchange/--market filter"
 [[ $version =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || fail "--version must be a single directory name"
 repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 [[ -d $archive_root ]] || fail "archive directory does not exist: $archive_root"
@@ -108,7 +112,7 @@ run_id="$(date -u +%Y%m%dT%H%M%SZ)-$$"
 days_file="$logs/days-$run_id.txt"
 # Inspect only the accepted three-level exchange/market/pair tree. .open files
 # are intentionally excluded; missing channels/venues do not invent missing days.
-"${python_cmd[@]}" - "$archive_root" "$from_day" "$to_day" "$exchange_filter" "$market_filter" > "$days_file" <<'PY'
+"${python_cmd[@]}" - "$archive_root" "$from_day" "$to_day" "$exchange_filter" "$market_filter" "$include_dvol" > "$days_file" <<'PY'
 from datetime import date
 from pathlib import Path
 import re
@@ -128,6 +132,7 @@ def bound(value):
 
 start, end = map(bound, sys.argv[2:4])
 exchange_filter, market_filter = sys.argv[4:6]
+include_dvol = sys.argv[6] == '1'
 if start and end and start > end:
     raise SystemExit('--from must be <= --to')
 root = root / 'raw' if (root / 'raw').is_dir() else root
@@ -138,14 +143,17 @@ for exchange in root.iterdir():
         continue
     name = exchange.name.lower()
     canonical_exchange = next(e for e in ('binance', 'kraken', 'okx', 'deribit') if name.startswith(e))
-    if exchange_filter and canonical_exchange != exchange_filter:
+    if exchange_filter and canonical_exchange != exchange_filter and not (include_dvol and canonical_exchange == 'deribit'):
         continue
     for market in exchange.iterdir():
         if not market.is_dir() or not market.name.lower().startswith(('spot', 'fut', 'perp', 'swap', 'index')):
             continue
         canonical_market = ('spot' if market.name.lower().startswith('spot') else
                             'index' if market.name.lower().startswith('index') else 'perp')
-        if market_filter and canonical_market != market_filter:
+        selected = ((not exchange_filter or canonical_exchange == exchange_filter)
+                    and (not market_filter or canonical_market == market_filter))
+        auxiliary = include_dvol and canonical_exchange == 'deribit' and canonical_market == 'index'
+        if not selected and not auxiliary:
             continue
         spot = canonical_market == 'spot'
         if name.startswith('deribit'):
@@ -169,10 +177,15 @@ for exchange in root.iterdir():
                 if (start is None or day >= start) and (end is None or day <= end):
                     symbol = pair.name.replace('-', '/') if canonical_exchange == 'kraken' and spot else pair.name
                     key = canonical_exchange, canonical_market, symbol, match[2], day
-                    previous = streams.setdefault(key, path)
-                    if previous.parent != path.parent:
-                        raise SystemExit(f'duplicate archive stream for {day}: {previous} and {path}')
-                    days.add(day.isoformat())
+                    streams.setdefault(key, []).append(path)
+                    if selected:
+                        days.add(day.isoformat())
+for (*_, day), paths in streams.items():
+    if day.isoformat() in days:
+        original = paths[0]
+        for path in paths[1:]:
+            if original.parent != path.parent:
+                raise SystemExit(f'duplicate archive stream for {day}: {original} and {path}')
 for day in sorted(days):
     print(day)
 PY
@@ -212,6 +225,7 @@ if [[ -n $exchange_clock_ms ]]; then
     clock_value=$("${python_cmd[@]}" -c 'import sys; print(int(sys.argv[1]))' "$exchange_clock_ms")
     replay_mode="ideal+exchange_clock_${clock_value}ms"
 fi
+if [[ $include_dvol -eq 1 ]]; then replay_mode="${replay_mode}+dvol"; fi
 # Training includes every completed day in work_dir, even outside --from/--to.
 # Validate all of them before any replay or replacement, then plan selected days.
 replay_plan="$logs/replay-plan-$run_id.txt"

@@ -1,7 +1,7 @@
 use engine_replay::{
     Result, SECOND, error,
     features::Engine,
-    input::{Merge, day_bounds, discover_filtered, marker_only_files},
+    input::{Merge, StreamPath, day_bounds, discover_filtered_with_dvol, marker_only_files},
     output::Writer,
 };
 use std::{collections::BTreeMap, path::PathBuf};
@@ -20,6 +20,7 @@ fn run() -> Result<()> {
     let mut market = None;
     let mut exchange_clock_ms = None;
     let mut skip_marker_only_days = false;
+    let mut include_dvol = false;
     let mut mode = "ideal".to_string();
     let mut from_state = None;
     let mut json_out = None;
@@ -65,6 +66,7 @@ fn run() -> Result<()> {
                         })?,
                 );
             }
+            "--include-dvol" => include_dvol = true,
             "--skip-marker-only-days" => skip_marker_only_days = true,
             "--allow-open" => allow_open = true,
             "--mode" => {
@@ -86,7 +88,7 @@ fn run() -> Result<()> {
             }
             "--help" => {
                 println!(
-                    "engine-replay --root data --date YYYY-MM-DD [--out data/features] [--allow-open] [--exchange NAME] [--market NAME] [--exchange-clock-ms N] [--skip-marker-only-days]\nengine-replay --engine-version"
+                    "engine-replay --root data --date YYYY-MM-DD [--out data/features] [--allow-open] [--exchange NAME] [--market NAME] [--exchange-clock-ms N] [--include-dvol] [--skip-marker-only-days]\nengine-replay --engine-version"
                 );
                 return Ok(());
             }
@@ -102,8 +104,16 @@ fn run() -> Result<()> {
             "--exchange-clock-ms requires --mode ideal --exchange kraken --market spot",
         ));
     }
-    let replay_mode =
+    if include_dvol && exchange.is_none() && market.is_none() {
+        return Err(error(
+            "--include-dvol requires an --exchange/--market filter",
+        ));
+    }
+    let mut replay_mode =
         exchange_clock_ms.map_or_else(|| mode.clone(), |ms| format!("ideal+exchange_clock_{ms}ms"));
+    if include_dvol {
+        replay_mode.push_str("+dvol");
+    }
     let date = date.ok_or_else(|| error("--date is required"))?;
     let (start, end) = day_bounds(&date)?;
     let out = out
@@ -120,13 +130,27 @@ fn run() -> Result<()> {
         ));
     }
     if skip_marker_only_days {
-        let paths = discover_filtered(
+        let mut paths = discover_filtered_with_dvol(
             &root,
             &date,
             allow_open,
             exchange.as_deref(),
             market.as_deref(),
+            include_dvol,
         )?;
+        if include_dvol {
+            // Optional auxiliary streams must not decide whether the selected day is skipped.
+            let mut selected = Vec::new();
+            for path in paths {
+                let stream = StreamPath::new(&path)?;
+                if exchange.as_deref().is_none_or(|e| e == stream.exchange)
+                    && market.as_deref().is_none_or(|m| m == stream.market)
+                {
+                    selected.push(path);
+                }
+            }
+            paths = selected;
+        }
         let files = marker_only_files(&paths, exchange_clock_ms)?;
         if !files.is_empty() {
             if out.exists() {
@@ -177,12 +201,13 @@ fn run() -> Result<()> {
         return Ok(());
     }
     let mut merge = Merge::with_exchange_clock(
-        discover_filtered(
+        discover_filtered_with_dvol(
             &root,
             &date,
             allow_open,
             exchange.as_deref(),
             market.as_deref(),
+            include_dvol,
         )?,
         exchange_clock_ms,
     )?;

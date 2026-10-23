@@ -298,7 +298,8 @@ def test_default_jobs_uses_process_cpu_affinity_helper(launcher):
     assert len(list(work.glob('features/date=*/features.parquet'))) == 2
 
 
-def test_v2_skip_metadata_resume_filters_and_training_input(tmp_path):
+@pytest.mark.parametrize('include_dvol', [False, True])
+def test_v2_skip_metadata_resume_filters_and_training_input(tmp_path, include_dvol):
     import shutil
     archive = tmp_path / 'archive'
     shutil.copytree(REPO / 'tests/fixtures/archive_v2/KrakenTest', archive / 'KrakenTest')
@@ -307,10 +308,16 @@ def test_v2_skip_metadata_resume_filters_and_training_input(tmp_path):
         ignored = archive / venue / market / 'BTC-USD'
         ignored.mkdir(parents=True)
         (ignored / '20251112_book.jsonl').write_text('broken JSON\n')
+    if include_dvol:
+        shutil.copytree(REPO / 'tests/fixtures/archive_v2/Deribit', archive / 'Deribit')
+        # Auxiliary DVOL must never discover a day absent from Kraken spot.
+        (archive / 'Deribit/Index/BTC/20251112_dvol.jsonl').write_text('broken JSON\n')
     work = tmp_path / 'work'
     flags = ('--exchange', 'kraken', '--market', 'spot', '--exchange-clock-ms', '35',
              '--skip-marker-only-days', '--label-spec', str(REPO / 'research/targets_kraken.yaml'),
              '--train-from', '2025-11-01')
+    if include_dvol:
+        flags += ('--include-dvol',)
     result = run(archive, work, '--version', 'v2', *flags)
     assert result.returncode == 0, result.stdout + result.stderr
     features = work / 'features/date=2025-11-08/features.parquet'
@@ -319,7 +326,9 @@ def test_v2_skip_metadata_resume_filters_and_training_input(tmp_path):
     assert skipped['reason'] == 'marker_only_inputs'
     assert skipped['date'] == '2025-11-11'
     assert skipped['engine_version'] == pq.read_metadata(features).metadata[b'engine_version'].decode()
-    assert skipped['replay_mode'] == 'ideal+exchange_clock_35ms'
+    mode = 'ideal+exchange_clock_35ms' + ('+dvol' if include_dvol else '')
+    assert skipped['replay_mode'] == mode
+    assert pq.read_metadata(features).metadata[b'mode'].decode() == mode
     assert len(skipped['files']) == 1 and skipped['files'][0].endswith('20251111_level3.jsonl.gz')
     assert not (skip_path.parent / 'features.parquet').exists()
     assert not (work / 'features/date=2025-11-12').exists()
@@ -337,6 +346,10 @@ def test_v2_skip_metadata_resume_filters_and_training_input(tmp_path):
     wrong_clock = list(flags)
     wrong_clock[wrong_clock.index('35')] = '36'
     refused = run(archive, work, '--version', 'wrong-clock', *wrong_clock)
+    assert refused.returncode != 0 and 'replay_mode' in refused.stderr
+    assert before == (features.stat().st_mtime_ns, skip_path.stat().st_mtime_ns)
+    changed_dvol = tuple(f for f in flags if f != '--include-dvol') if include_dvol else (*flags, '--include-dvol')
+    refused = run(archive, work, '--version', 'wrong-dvol', *changed_dvol)
     assert refused.returncode != 0 and 'replay_mode' in refused.stderr
     assert before == (features.stat().st_mtime_ns, skip_path.stat().st_mtime_ns)
 
@@ -377,3 +390,28 @@ def test_all_marker_only_days_finish_successfully_without_training(tmp_path):
     assert 'No completed feature days; training skipped' in result.stdout
     assert (work / 'features/date=2025-11-11/skipped.json').exists()
     assert not list(work.glob('research_report_*.json'))
+
+
+@pytest.mark.parametrize('filter_args', [(), ('--exchange-clock-ms', '35')])
+def test_launcher_include_dvol_requires_filter(launcher, filter_args):
+    _, launch = launcher
+    result = launch('--include-dvol', *filter_args)
+    assert result.returncode != 0
+    assert 'requires' in result.stderr
+
+
+@pytest.mark.parametrize('cached', [False, True])
+def test_auxiliary_dvol_duplicates_fail_before_replay(launcher, cached):
+    work, launch = launcher
+    paths = []
+    for directory in ('Deribit/Index/BTC', 'DeribitRaw/IndexV2/BTC'):
+        path = work.parent / 'archive' / directory / '20260915_dvol.jsonl'
+        path.parent.mkdir(parents=True)
+        path.write_text('duplicate DVOL\n')
+        paths.append(path)
+    if cached:
+        write_feature(work, '2026-09-15', b'9.8.7-features-test')
+    result = launch('--exchange', 'binance', '--market', 'spot', '--include-dvol')
+    assert result.returncode != 0 and 'duplicate archive stream' in result.stderr
+    assert all(str(path) in result.stderr for path in paths)
+    assert not list(work.glob('.replay-*'))

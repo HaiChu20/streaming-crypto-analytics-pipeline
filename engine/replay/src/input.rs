@@ -368,6 +368,14 @@ impl Source {
             bytes,
         })
     }
+    // Mixed replays retain receive time for auxiliary feeds such as Deribit DVOL.
+    fn with_kraken_exchange_clock(path: &Path, exchange_clock_ms: Option<u64>) -> Result<Self> {
+        let mut source = Self::new(path)?;
+        if source.stream.exchange == "kraken" && source.stream.market == "spot" {
+            source.exchange_clock_ms = exchange_clock_ms;
+        }
+        Ok(source)
+    }
     pub fn next(&mut self) -> Result<Option<Record>> {
         let mut text = String::new();
         loop {
@@ -489,7 +497,7 @@ impl Merge {
         let mut heap = BinaryHeap::new();
         let mut partitions = BTreeMap::<String, i32>::new();
         for path in paths {
-            let mut file = Source::with_exchange_clock(&path, exchange_clock_ms)?;
+            let mut file = Source::with_kraken_exchange_clock(&path, exchange_clock_ms)?;
             let topic = format!(
                 "raw.{}.{}.{}.v1",
                 file.stream.exchange, file.stream.market, file.stream.feed
@@ -549,7 +557,7 @@ pub fn marker_only_files(
 ) -> Result<Vec<PathBuf>> {
     let mut empty = Vec::new();
     for path in paths {
-        let mut source = Source::with_exchange_clock(path, exchange_clock_ms)?;
+        let mut source = Source::with_kraken_exchange_clock(path, exchange_clock_ms)?;
         let mut has_data = false;
         while let Some(record) = source.next()? {
             if record.kind != Kind::Control {
@@ -649,6 +657,22 @@ pub fn discover_filtered(
     exchange: Option<&str>,
     market: Option<&str>,
 ) -> Result<Vec<PathBuf>> {
+    discover_filtered_with_dvol(root, date, allow_open, exchange, market, false)
+}
+
+pub fn discover_filtered_with_dvol(
+    root: &Path,
+    date: &str,
+    allow_open: bool,
+    exchange: Option<&str>,
+    market: Option<&str>,
+    include_dvol: bool,
+) -> Result<Vec<PathBuf>> {
+    if include_dvol && exchange.is_none() && market.is_none() {
+        return Err(error(
+            "--include-dvol requires an --exchange/--market filter",
+        ));
+    }
     day_bounds(date)?;
     let base = if root.join("raw").is_dir() {
         root.join("raw")
@@ -694,8 +718,13 @@ pub fn discover_filtered(
                 continue;
             }
         };
-        if exchange.is_some_and(|e| e != stream.exchange)
-            || market.is_some_and(|m| m != stream.market)
+        let dvol = include_dvol
+            && stream.exchange == "deribit"
+            && stream.market == "index"
+            && stream.feed == "dvol";
+        if !dvol
+            && (exchange.is_some_and(|e| e != stream.exchange)
+                || market.is_some_and(|m| m != stream.market))
         {
             continue;
         }
@@ -768,4 +797,19 @@ pub fn day_bounds(date: &str) -> Result<(i64, i64)> {
         - 1;
     let start = days * 86400 * SECOND;
     Ok((start, start + 86400 * SECOND))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn forcing_exchange_clock_directly_on_non_kraken_input_is_an_error() {
+        let stream = StreamPath::new(Path::new("Deribit/Index/BTC/20251108_dvol.jsonl")).unwrap();
+        let error = stream
+            .parse_at("{}", 0, &mut 0, &mut None, Some(35), &mut None)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("exchange clock requires Kraken spot input"));
+    }
 }

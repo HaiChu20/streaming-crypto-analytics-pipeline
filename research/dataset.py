@@ -72,7 +72,7 @@ def validate_replay_modes(paths: list[Path]) -> str:
     for path in paths:
         metadata = pq.read_metadata(path).metadata or {}
         mode = metadata.get(b"mode", metadata.get(b"replay_mode", b"")).decode()
-        if mode not in {"as_live", "ideal"} and not re.fullmatch(r"ideal\+exchange_clock_[0-9]+ms", mode):
+        if mode != "as_live" and not re.fullmatch(r"ideal(?:\+exchange_clock_[0-9]+ms)?(?:\+dvol)?", mode):
             raise ValueError(f"Missing/unknown replay mode in {path}: {mode!r}")
         modes.add(mode)
     if len(modes) != 1:

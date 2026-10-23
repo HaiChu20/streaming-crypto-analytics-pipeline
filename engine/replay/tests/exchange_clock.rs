@@ -59,7 +59,14 @@ fn cli(
 
 #[test]
 fn native_v2_excerpts_have_monotonic_clocks_and_l2_snapshot_carry() {
-    let paths = discover(&fixtures(), "2025-11-08", false).unwrap();
+    let paths = discover_filtered(
+        &fixtures(),
+        "2025-11-08",
+        false,
+        Some("kraken"),
+        Some("spot"),
+    )
+    .unwrap();
     assert_eq!(paths.len(), 3);
     assert!(
         Merge::new(paths.clone())
