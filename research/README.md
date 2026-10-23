@@ -251,3 +251,26 @@ Optional shrunk predictions and stop models are compared when present in both.
 Finite masks follow each run's report; each draw divides summed scores by that
 run's valid-row count, so missing stop labels and unequal day sizes retain their
 proper weights. A metric with no valid rows is reported as `n/a` (JSON `null`).
+
+## Short horizons and selective evaluation
+
+Use `--label-spec research/targets_short.yaml` (Binance) or
+`--label-spec research/targets_kraken_short.yaml` (Kraken spot) with
+`--horizon-s 60` or `--horizon-s 120`. These versioned specs also retain
+300/900/1800 seconds; the original specs stay unchanged. Short horizons use exact
+trailing same-horizon momentum and its negative for reversal, with the existing
+feature schema, endpoint/availability purge, and complete-path stop labels.
+The 300/900/1800-second baseline calculations are unchanged.
+
+With `--early-stopping`, selective evaluation uses `|p_up - p_down|` confidence
+and `sign(p_up - p_down)` direction (ties make no prediction). Each fold uses
+only its chronological inner-validation classifier predictions to set confidence
+quantiles for nominal 50/20/10/5% coverage. Final-model thresholds are frozen in
+metadata for lockbox evaluation. OOF and lockbox Parquet include `confidence`
+and boolean `selected_q50/q20/q10/q5` columns. JSON and HTML report realised
+coverage, rows/days, paired model/reversal accuracy on selected nonflat rows
+with finite reversal forecasts, and 1/3/7-day paired bootstrap intervals; days
+without selections remain in the sampled day grid. Quantile boundary ties can
+increase coverage. Without early stopping or usable inner validation the status
+is `unavailable`, thresholds are null, and selection flags are false; pooled
+OOF status is `partial` if only some folds have thresholds.

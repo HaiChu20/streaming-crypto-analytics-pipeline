@@ -20,13 +20,14 @@ from research.calendar import Calendar, verify_calendar
 from research.dataset import (FEATURE_GROUPS, build_matrix, feature_dates, feature_paths,
                               read_features, select_features, validate_replay_modes)
 from research.fitting import fit_booster, inner_split, parse_params, shrinkage_coefficient
-from research.labels import NS, load_spec, make_labels, reference_for, reference_present
+from research.labels import NS, load_spec, make_labels, momentum_return, reference_for, reference_present
 from research.risk import (PARAMS as STOP_PARAMS, STOP_NAMES, evaluate_stops, fit_stop_models,
                            pinball_losses, predict_stops, stop_metrics)
 from research.evaluation import (DAY_NS, date_split, feature_array, memory_estimate,
                                  class_prior, date_intervals_overlap, day_block_permutation,
                                  leak_check_metrics, model_importance, paired_day_block_bootstrap,
-                                 probability_losses, probability_scores)
+                                 probability_losses, probability_scores, confidence_thresholds,
+                                 selective_columns, selective_metrics)
 from research.threads import available_cpus, resolve_threads
 from research.linear import fit_ridge, ridge_predict
 
@@ -175,7 +176,7 @@ def fit_models(x, y, directions, features, rounds: int, num_threads=None, *, par
     params = dict(PARAMS, **(params or {}), num_threads=num_threads)
     regressor, reg_selection, validation = fit_booster(x, y, features, dict(params, objective='regression'),
         rounds, inner=inner, early_stopping=early_stopping, patience=early_stopping_rounds, metric='l2')
-    classifier, cls_selection, _ = fit_booster(x, directions + 1, features,
+    classifier, cls_selection, cls_validation = fit_booster(x, directions + 1, features,
         dict(params, objective='multiclass', num_class=3), rounds, inner=inner,
         early_stopping=early_stopping, patience=early_stopping_rounds, metric='multi_logloss')
     # Classifier has no native % return. Its implied return is probability times
@@ -184,6 +185,8 @@ def fit_models(x, y, directions, features, rounds: int, num_threads=None, *, par
                             for d in (-1, 0, 1)])
     result = (regressor, classifier, class_means)
     if return_selection:
+        cls_selection['confidence_thresholds'] = (
+            confidence_thresholds(cls_validation[1]) if cls_validation is not None else None)
         shrinkage = None
         if early_stopping:
             shrinkage = {'coefficient': shrinkage_coefficient(y[validation[0]], validation[1])
@@ -319,6 +322,8 @@ def train_target(rows: pl.DataFrame, target: str, horizon_s: int, output_root: s
                "status": "skipped", "reference": reference_for(target, spec), "date_split": split,
                'model_params': effective_model_params(params, risk_params, num_threads),
                'entry_delay_s': entry_delay_s,
+               'selective': {'status': 'unavailable', 'reason': 'no held-out predictions'},
+               'confidence_thresholds': None,
                "labeled_rows": 0, "matrix_rows": 0}
     if not reference_present(rows, target, spec):
         return dict(skipped, reason="not enough labeled rows: no development reference rows" if split["development"] is None
@@ -327,6 +332,8 @@ def train_target(rows: pl.DataFrame, target: str, horizon_s: int, output_root: s
     matrix, features = build_matrix(rows, target, stride_s, spec, calendar=calendar)
     features, exclusions = select_features(features, exclude_groups, exclude_features)
     skipped.update(features=features, exclusions=exclusions, **feature_schema(features))
+    if horizon_s < 300:
+        matrix = matrix.join(momentum_return(rows, target, horizon_s, spec), on='tick_ns', how='left')
     labeled = matrix.join(delayed_labels(rows, target, horizon_s, spec, entry_delay_s), on="tick_ns", how="left")
     # A delayed emission after the target endpoint cannot be a forecast.
     data = labeled.filter(pl.col("return_pct").is_not_null()
@@ -350,7 +357,7 @@ def train_target(rows: pl.DataFrame, target: str, horizon_s: int, output_root: s
     x = feature_array(data, features)
     y = data["return_pct"].to_numpy()
     directions = data["direction"].to_numpy().astype(np.int32)
-    momentum = (data["momentum_return_300s"].to_numpy() if horizon_s == 300 else
+    momentum = (data[f"momentum_return_{horizon_s}s"].to_numpy() if horizon_s <= 300 else
                 data["momentum_return_900s"].to_numpy() * (horizon_s / 900))
     adverse = {side: data[f"adverse_{side}_bps"].to_numpy() for side in ("long", "short")}
     ref = reference_for(target, spec)
@@ -396,6 +403,8 @@ def train_target(rows: pl.DataFrame, target: str, horizon_s: int, output_root: s
                  'reversal': predictions['reversal'], 'prior_expected': predictions['prior'],
                  'p_up_minus_down': probabilities[:, 2] - probabilities[:, 0],
                  **regimes, **stop_oof[i - 1]}
+        thresholds = selected['classifier']['confidence_thresholds']
+        saved.update(selective_columns(probabilities, thresholds))
         saved.update({name: predictions[name] for name in ('ridge', 'regressor_shrunk') if name in predictions})
         for prefix, probs in [('', probabilities), ('prior_', prior)]:
             saved.update({prefix + 'p_' + name: probs[:, j] for j, name in enumerate(('down', 'flat', 'up'))})
@@ -411,7 +420,8 @@ def train_target(rows: pl.DataFrame, target: str, horizon_s: int, output_root: s
                         "metrics": fold_metrics, "stop_metrics": stop_folds[i - 1],
                         'volatility_tercile_edges': edges,
                         'chosen_rounds': dict(selected, **{name: stop_folds[i - 1][name]['selection'] for name in STOP_NAMES}),
-                        'ridge': ridge_info, 'regressor_shrinkage': shrinkage})
+                        'ridge': ridge_info, 'regressor_shrinkage': shrinkage,
+                        'confidence_thresholds': thresholds})
         if shuffle_test:
             shuffle_probs = np.full((len(test), 3), np.nan)
             shuffle_predictions = {name: np.full(len(test), np.nan) for name in ('regressor', 'classifier')}
@@ -443,6 +453,9 @@ def train_target(rows: pl.DataFrame, target: str, horizon_s: int, output_root: s
     regime_summary = direction_regimes(actuals, predictions, probabilities,
                                        {axis: oof[axis].to_numpy() for axis in regimes})
     bootstrap = bootstrap_comparisons(oof)
+    calibrated = [fold['confidence_thresholds'] is not None for fold in results]
+    selective = selective_metrics(oof, 'available' if all(calibrated) else
+                                  'partial' if any(calibrated) else 'unavailable')
     shuffle_summary = None
     if shuffle_test:
         shuffled_predictions = {name: oof[column].to_numpy() for name, column in
@@ -485,6 +498,8 @@ def train_target(rows: pl.DataFrame, target: str, horizon_s: int, output_root: s
         "date_split": split, "memory": memory, "num_threads": num_threads,
         "feature_dtype": "float64; shared research.evaluation.feature_array in training and inference; labels float64",
         "regimes": regime_summary, "shuffle_test": shuffle_summary, "bootstrap": bootstrap,
+        "selective": selective,
+        "confidence_thresholds": final_selection["classifier"]["confidence_thresholds"],
         "oof_file": "oof.parquet", "oof_rows": oof.height,
         "flat_labels": int((directions == 0).sum()), "oof_flat_labels": int((oof["direction"] == 0).sum()),
         "model_params": effective_model_params(params, risk_params, num_threads),
@@ -527,7 +542,7 @@ def train_target(rows: pl.DataFrame, target: str, horizon_s: int, output_root: s
         "metric_notes": "Returns/MAE/RMSE in percentage points. Classifier implied return = "
                         "probabilities @ training-only class mean returns; direction = argmax. "
                         "Directional accuracy excludes actual flats. Undefined IC is null. "
-                        "Momentum = trailing 300 s return for h=300, otherwise 900 s return * horizon/900; "
+                        "Momentum = exact trailing h s return for h<=300, otherwise 900 s return * horizon/900; "
                         "Reversal = exact negative momentum. Prior = add-one training-fold class frequencies; "
                         "prior implied return uses the training-fold class mean returns. Ties use class order [-1,0,1]. "
                         "Log loss clips at 1e-15; Brier sums squared errors over three classes. "
@@ -635,6 +650,10 @@ def open_lockbox(rows, output, version, targets=None, horizons=None, acknowledge
                 if calendar:
                     verify_calendar(calendar, report)
                 matrix, _ = build_matrix(held, report['target'], report['stride_s'], spec, calendar=calendar)
+                h = report['horizon_s']
+                if h < 300:
+                    matrix = matrix.join(momentum_return(held, report['target'], h, spec),
+                                         on='tick_ns', how='left')
                 data = matrix.join(delayed_labels(held, report['target'], report['horizon_s'], spec,
                                                   report.get('entry_delay_s', 0)),
                                    on='tick_ns', how='left').filter(
@@ -647,8 +666,7 @@ def open_lockbox(rows, output, version, targets=None, horizons=None, acknowledge
                 clf = lgb.Booster(model_file=str(directory / 'classifier.txt'))
                 y = data['return_pct'].to_numpy()
                 probs = clf.predict(x, num_threads=num_threads) if len(x) else np.empty((0, 3))
-                h = report['horizon_s']
-                momentum = (data['momentum_return_300s'].to_numpy() if h == 300 else
+                momentum = (data[f'momentum_return_{h}s'].to_numpy() if h <= 300 else
                             data['momentum_return_900s'].to_numpy() * h / 900)
                 predictions = {'regressor': reg.predict(x, num_threads=num_threads) if len(x) else np.array([]),
                                'classifier': probs @ report['classifier_class_mean_returns'],
@@ -674,6 +692,8 @@ def open_lockbox(rows, output, version, targets=None, horizons=None, acknowledge
                          'zero': predictions['zero'], 'momentum': momentum, 'reversal': -momentum,
                          'prior_expected': predictions.get('prior', np.full(len(x), np.nan)),
                          'p_up_minus_down': probs[:, 2] - probs[:, 0], **regimes}
+                thresholds = report.get('confidence_thresholds')
+                saved.update(selective_columns(probs, thresholds))
                 saved.update({name: predictions[name] for name in ('ridge', 'regressor_shrunk') if name in predictions})
                 for prefix, probabilities in [('', probs), ('prior_', class_probs.get('prior', np.full((len(x), 3), np.nan)))]:
                     saved.update({prefix + 'p_' + name: probabilities[:, j]
@@ -704,7 +724,9 @@ def open_lockbox(rows, output, version, targets=None, horizons=None, acknowledge
                 bootstrap = bootstrap_comparisons(lockbox)
                 lockbox.write_parquet(directory / 'lockbox.parquet')
                 report['lockbox_results'] = {'range': split['lockbox'], 'metrics': measured, 'stop_metrics': risk,
-                    'bootstrap': bootstrap, 'predictions_file': 'lockbox.parquet', 'prediction_rows': lockbox.height,
+                    'bootstrap': bootstrap,
+                    'selective': selective_metrics(lockbox, 'available' if thresholds is not None else 'unavailable'),
+                    'predictions_file': 'lockbox.parquet', 'prediction_rows': lockbox.height,
                     'entry_delay_s': report.get('entry_delay_s', 0),
                     'num_threads': num_threads,
                     'flat_labels': int((data['direction'] == 0).sum()),
@@ -794,7 +816,7 @@ def main(argv=None):
     parser.add_argument('--label-spec', type=Path, default=Path(__file__).with_name('targets.yaml'))
     parser.add_argument('--train-from', help='Earliest UTC training day; test folds are unchanged')
     parser.add_argument('--target', action='append', choices=['BTC_spot', 'BTC_perp', 'ETH_spot', 'ETH_perp'])
-    parser.add_argument('--horizon-s', action='append', type=int, choices=[300, 900, 1800])
+    parser.add_argument('--horizon-s', action='append', type=int, choices=[60, 120, 300, 900, 1800])
     parser.add_argument('--threads', type=int, default=available_cpus(),
                         help='LightGBM CPU threads; defaults to the CPUs available to this process')
     parser.add_argument('--stride-s', type=int, default=10)

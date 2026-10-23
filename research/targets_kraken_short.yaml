@@ -1,0 +1,9 @@
+version: "v1-kraken-spot-short"
+calendar: config/events.csv
+horizons_s: [60, 120, 300, 900, 1800]
+context_assets: []
+references:
+  BTC:
+    spot: {exchange: kraken, market: spot, symbol: BTC/USD}
+  ETH:
+    spot: {exchange: kraken, market: spot, symbol: ETH/USD}

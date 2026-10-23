@@ -1,0 +1,12 @@
+version: "v1-short"
+calendar: config/events.csv
+horizons_s: [60, 120, 300, 900, 1800]
+# Stablecoin context for the BTC_spot baseline; missing rows remain null.
+context_assets: [USDT]
+references:
+  BTC:
+    spot: {exchange: binance, market: spot, symbol: BTCUSDT}
+    perp: {exchange: binance, market: perp, symbol: BTCUSDT}
+  ETH:
+    spot: {exchange: binance, market: spot, symbol: ETHUSDT}
+    perp: {exchange: binance, market: perp, symbol: ETHUSDT}

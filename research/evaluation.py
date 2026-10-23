@@ -11,6 +11,53 @@ import polars as pl
 from research.threads import available_cpus, resolve_threads
 
 DAY_NS = 86_400_000_000_000
+CONFIDENCE_LEVELS = (50, 20, 10, 5)
+
+
+def confidence_thresholds(probabilities):
+    """Coverage quantiles of inner-validation confidence, before the full refit."""
+    probabilities = np.asarray(probabilities)
+    confidence = np.abs(probabilities[:, 2] - probabilities[:, 0])
+    confidence = confidence[np.isfinite(confidence)]
+    return {str(q): float(np.quantile(confidence, 1 - q / 100))
+            for q in CONFIDENCE_LEVELS} if len(confidence) else None
+
+
+def selective_columns(probabilities, thresholds):
+    difference = probabilities[:, 2] - probabilities[:, 0]
+    confidence = np.abs(difference)
+    return {'confidence': confidence, **{
+        f'selected_q{q}': (np.isfinite(confidence) & (difference != 0)
+                           & (confidence >= thresholds[str(q)])) if thresholds is not None
+                          else np.zeros(len(confidence), dtype=bool)
+        for q in CONFIDENCE_LEVELS}}
+
+
+def selective_metrics(frame, status):
+    """Paired accuracy on selected nonflat rows; retain days with no selections."""
+    if status == 'unavailable':
+        return {'status': status, 'reason': 'requires early stopping with inner-validation predictions'}
+    ticks = frame['tick_ns'].to_numpy()
+    y = frame['return_pct'].to_numpy()
+    difference = frame['p_up_minus_down'].to_numpy()
+    reversal = frame['reversal'].to_numpy()
+    levels = {}
+    for q in CONFIDENCE_LEVELS:
+        selected = frame[f'selected_q{q}'].to_numpy()
+        paired = (selected & np.isfinite(y) & (y != 0) & np.isfinite(difference)
+                  & np.isfinite(reversal))
+        model_correct = np.sign(difference) == np.sign(y)
+        reversal_correct = np.sign(reversal) == np.sign(y)
+        # NaNs give empty days zero counts without dropping them from the day grid.
+        scores = np.where(paired, model_correct.astype(float) - reversal_correct, np.nan)
+        levels[str(q)] = {
+            'coverage': float(selected.mean()) if len(selected) else None,
+            'rows': int(selected.sum()), 'days': int(len(np.unique(ticks[selected] // DAY_NS))),
+            'accuracy_rows': int(paired.sum()),
+            'model_accuracy': float(model_correct[paired].mean()) if paired.any() else None,
+            'reversal_accuracy': float(reversal_correct[paired].mean()) if paired.any() else None,
+            'bootstrap': paired_day_block_bootstrap(ticks, {'model_vs_reversal_accuracy': scores})}
+    return {'status': status, 'levels': levels}
 
 
 def class_prior(directions):

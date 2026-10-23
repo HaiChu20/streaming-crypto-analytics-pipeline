@@ -83,6 +83,26 @@ def timestamp(value):
     return datetime.fromtimestamp(value / 1e9, timezone.utc).isoformat() if value is not None else '—'
 
 
+def selective_section(selective):
+    if not selective:
+        return ''
+    result = '<h3>Selective direction evaluation</h3><p>' + escape(selective['status']) + '</p>'
+    if selective['status'] == 'unavailable':
+        return result + '<p>' + escape(selective['reason']) + '</p>'
+    result += '<p>Confidence = |p_up − p_down|; direction = sign(p_up − p_down), with ties excluded. '
+    result += 'Thresholds use inner validation only; boundary ties can increase coverage. '
+    result += 'Accuracies share selected nonflat rows with finite reversal forecasts.</p>'
+    return result + table(
+        ['Nominal coverage %', 'Actual coverage', 'Rows', 'Days', 'Accuracy rows', 'Model accuracy',
+         'Reversal accuracy', 'Block days', 'Model − reversal', '2.5%', '97.5%'], [
+        [q, level['coverage'], level['rows'], level['days'], level['accuracy_rows'],
+         level['model_accuracy'], level['reversal_accuracy'], length,
+         score['mean_difference'], score['p2_5'], score['p97_5']]
+        for q, level in selective['levels'].items()
+        for length, scores in level['bootstrap']['blocks'].items()
+        for score in scores.values()])
+
+
 def target_section(r):
     result = f"<article><h2>{escape(r['target'])} · {r['horizon_s']} seconds · entry delay {r.get('entry_delay_s', 0)} s</h2>"
     result += '<h3>Data window, lockbox and embargo</h3>'
@@ -126,6 +146,7 @@ def target_section(r):
                        for f in folds for i, (name, m) in enumerate(f['metrics'].items())],
                        'Compare the model with zero, momentum, reversal and the training prior in every held-out period.')
     result += direction_charts(r.get('metrics', {}), 'Pooled out-of-fold direction')
+    result += selective_section(r.get('selective'))
     if r.get('bootstrap'):
         bootstrap = r['bootstrap']
         result += '<h3>Paired day-block bootstrap</h3><p>' + escape(
@@ -167,6 +188,7 @@ def target_section(r):
     if 'lockbox_results' in r:
         result += '<h3>Opened lockbox</h3><p>' + escape(r['lockbox_results']['notes']) + '</p>'
         result += direction_charts(r['lockbox_results']['metrics'], 'Lockbox direction')
+        result += selective_section(r['lockbox_results'].get('selective'))
         result += stop_section(r['lockbox_results']['stop_metrics'])
         if r['lockbox_results'].get('bootstrap'):
             result += '<h4>Lockbox paired day-block bootstrap</h4>' + table(
