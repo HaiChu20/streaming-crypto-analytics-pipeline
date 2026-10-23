@@ -21,6 +21,8 @@ fn run() -> Result<()> {
     let mut exchange_clock_ms = None;
     let mut skip_marker_only_days = false;
     let mut include_dvol = false;
+    let mut mid_grid_ms = None;
+    let mut mids_out = None;
     let mut mode = "ideal".to_string();
     let mut from_state = None;
     let mut json_out = None;
@@ -66,6 +68,25 @@ fn run() -> Result<()> {
                         })?,
                 );
             }
+            "--mid-grid-ms" => {
+                let ms = args
+                    .next()
+                    .ok_or_else(|| error("--mid-grid-ms requires a positive integer"))?
+                    .parse::<u64>()
+                    .map_err(|_| error("--mid-grid-ms requires a positive integer"))?;
+                if ms == 0 || ms > i64::MAX as u64 / 1_000_000 {
+                    return Err(error(
+                        "--mid-grid-ms requires positive milliseconds fitting Int64 ns",
+                    ));
+                }
+                mid_grid_ms = Some(ms);
+            }
+            "--mids-out" => {
+                mids_out = Some(PathBuf::from(
+                    args.next()
+                        .ok_or_else(|| error("--mids-out requires a path"))?,
+                ));
+            }
             "--include-dvol" => include_dvol = true,
             "--skip-marker-only-days" => skip_marker_only_days = true,
             "--allow-open" => allow_open = true,
@@ -88,12 +109,20 @@ fn run() -> Result<()> {
             }
             "--help" => {
                 println!(
-                    "engine-replay --root data --date YYYY-MM-DD [--out data/features] [--allow-open] [--exchange NAME] [--market NAME] [--exchange-clock-ms N] [--include-dvol] [--skip-marker-only-days]\nengine-replay --engine-version"
+                    "engine-replay --root data --date YYYY-MM-DD [--out data/features] [--allow-open] [--exchange NAME] [--market NAME] [--exchange-clock-ms N] [--include-dvol] [--skip-marker-only-days] [--mid-grid-ms N --mids-out PATH]\nengine-replay --engine-version"
                 );
                 return Ok(());
             }
             _ => return Err(error(format!("unknown argument {arg}"))),
         }
+    }
+    if mid_grid_ms.is_some() != mids_out.is_some() {
+        return Err(error(
+            "--mid-grid-ms and --mids-out must be supplied together",
+        ));
+    }
+    if mid_grid_ms.is_some() && mode != "ideal" {
+        return Err(error("--mid-grid-ms requires --mode ideal"));
     }
     if exchange_clock_ms.is_some()
         && (mode != "ideal"
@@ -120,6 +149,9 @@ fn run() -> Result<()> {
         .unwrap_or_else(|| root.join("features"))
         .join(format!("date={date}"))
         .join("features.parquet");
+    if mids_out.as_ref() == Some(&out) {
+        return Err(error("--mids-out must differ from features output"));
+    }
     if mode == "as_live" {
         if exchange.is_some() || market.is_some() {
             return Err(error("--exchange/--market filters require ideal mode"));
@@ -200,17 +232,21 @@ fn run() -> Result<()> {
         );
         return Ok(());
     }
-    let mut merge = Merge::with_exchange_clock(
-        discover_filtered_with_dvol(
-            &root,
-            &date,
-            allow_open,
-            exchange.as_deref(),
-            market.as_deref(),
-            include_dvol,
-        )?,
-        exchange_clock_ms,
+    let paths = discover_filtered_with_dvol(
+        &root,
+        &date,
+        allow_open,
+        exchange.as_deref(),
+        market.as_deref(),
+        include_dvol,
     )?;
+    let mut mids = mids_out
+        .as_ref()
+        .map(|path| {
+            engine_replay::mids::MidWriter::new(path, &paths, mid_grid_ms.unwrap(), &replay_mode)
+        })
+        .transpose()?;
+    let mut merge = Merge::with_exchange_clock(paths, exchange_clock_ms)?;
     let mut writer = Writer::new_mode(&out, &replay_mode)?;
     let mut engine = Engine::default();
     let mut coverage = BTreeMap::<String, (u64, u64)>::new();
@@ -220,7 +256,19 @@ fn run() -> Result<()> {
     let mut last_ns = None;
     let mut foreign = 0u64;
     let wall = std::time::Instant::now();
-    for tick in (start..end).step_by(SECOND as usize) {
+    let grid_step = mid_grid_ms.map(|ms| (ms * 1_000_000) as i64);
+    // Grid times are epoch multiples, even when N does not divide a UTC day.
+    let mut next_grid = grid_step.map(|step| {
+        start
+            .checked_add((step - start.rem_euclid(step)) % step)
+            .unwrap_or(end)
+    });
+    let mut feature_tick = start;
+    loop {
+        let tick = feature_tick.min(next_grid.unwrap_or(end));
+        if tick >= end {
+            break;
+        }
         while merge.peek_ns().is_some_and(|ns| ns <= i128::from(tick)) {
             let r = merge.pop()?.unwrap();
             if r.recv_ns < i128::from(start) {
@@ -229,36 +277,47 @@ fn run() -> Result<()> {
             }
             first_ns = Some(first_ns.map_or(r.recv_ns, |n: i128| n.min(r.recv_ns)));
             last_ns = Some(last_ns.map_or(r.recv_ns, |n: i128| n.max(r.recv_ns)));
-            engine.consume_at_tick(&r, tick)?;
+            // Preserve the original one-second flow bucket, including late heads.
+            engine.consume_at_tick(&r, feature_tick)?;
         }
-        for row in engine.tick(tick)? {
-            *row_counts
-                .entry(format!("{}/{}/{}", row.exchange, row.market, row.symbol))
-                .or_default() += 1;
-            if row.exchange != "cross" {
-                let count = coverage
+        if tick == feature_tick {
+            for row in engine.tick(tick)? {
+                *row_counts
                     .entry(format!("{}/{}/{}", row.exchange, row.market, row.symbol))
-                    .or_default();
-                count.0 += 1;
-                count.1 += u64::from(row.book_valid);
-            } else {
-                for (name, value) in [
-                    ("basis_bps_binance", row.basis_bps_binance),
-                    ("basis_bps_okx", row.basis_bps_okx),
-                    ("basis_bps_kraken", row.basis_bps_kraken),
-                    ("spot_dev_bps_okx", row.spot_dev_bps_okx),
-                    ("spot_dev_bps_kraken", row.spot_dev_bps_kraken),
-                ] {
-                    if let Some(value) = value {
-                        let v = max_cross
-                            .entry(format!("{}/{}", row.symbol, name))
-                            .or_default();
-                        *v = v.max(value.abs());
+                    .or_default() += 1;
+                if row.exchange != "cross" {
+                    let count = coverage
+                        .entry(format!("{}/{}/{}", row.exchange, row.market, row.symbol))
+                        .or_default();
+                    count.0 += 1;
+                    count.1 += u64::from(row.book_valid);
+                } else {
+                    for (name, value) in [
+                        ("basis_bps_binance", row.basis_bps_binance),
+                        ("basis_bps_okx", row.basis_bps_okx),
+                        ("basis_bps_kraken", row.basis_bps_kraken),
+                        ("spot_dev_bps_okx", row.spot_dev_bps_okx),
+                        ("spot_dev_bps_kraken", row.spot_dev_bps_kraken),
+                    ] {
+                        if let Some(value) = value {
+                            let v = max_cross
+                                .entry(format!("{}/{}", row.symbol, name))
+                                .or_default();
+                            *v = v.max(value.abs());
+                        }
                     }
                 }
+                writer.push(row)?;
             }
-            writer.push(row)?;
+            feature_tick += SECOND;
         }
+        if next_grid == Some(tick) {
+            mids.as_mut().unwrap().push(tick, &engine)?;
+            next_grid = grid_step.map(|step| tick.checked_add(step).unwrap_or(end));
+        }
+    }
+    if let Some(mids) = mids {
+        mids.finish()?;
     }
     let rows = writer.finish()?;
     let seconds = wall.elapsed().as_secs_f64();

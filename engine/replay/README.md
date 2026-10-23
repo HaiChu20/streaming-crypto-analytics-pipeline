@@ -432,3 +432,52 @@ Kraken spot uses the optional exchange clock; both merge by their effective time
 The mode gains `+dvol` (for example `ideal+exchange_clock_35ms+dvol` or
 `ideal+dvol`). The flag requires an exchange or market filter. Launcher day
 discovery still uses only the selected venue/market; DVOL never adds days.
+
+## Fine mid grid for lead/lag (R4)
+
+```sh
+engine/target/release/engine-replay --root ARCHIVE --date 2026-10-17 \
+  --out WORK/features --mid-grid-ms 100 --mids-out WORK/mids/date=2026-10-17/mids.parquet
+scripts/train_offline.sh ARCHIVE WORK --replay-only --mid-grid-ms 100
+```
+
+`--mid-grid-ms N` requires a positive integer and `--mids-out PATH` (an exact file
+path, which must not already exist). Both options require ideal mode. Grid times
+are epoch multiples of N milliseconds within the whole UTC day `[start,end)`;
+N need not divide a second or day. At each grid time g all visible merge heads
+with effective `recv_ns <= g`, including ties, are consumed before sampling.
+The clock is the existing merge clock: receive time by default, or the effective
+Kraken exchange clock with `--exchange-clock-ms`. Head-only ordering and clock
+step-back handling remain unchanged. One-second feature ticks are interleaved
+with grid times; events keep their original one-second flow buckets. At shared
+ticks, features run before the read-only sample. The sampler never advances
+feature histories. Feature bytes remain identical with the options off, and
+are also identical when sampling is enabled.
+
+The wide Parquet has required Int64 `tick_ns` and nullable Int64
+`<exchange>_<market>_<symbol-sanitized>_mid_e9` columns, sorted by native instrument
+key. Sanitizing preserves ASCII letters, digits and `_`, replacing each other
+character with `_` (e.g. `kraken_spot_BTC_USD_mid_e9`,
+`kraken_perp_PF_XBTUSD_mid_e9`). Name collisions are errors. Schema keys come from
+selected L2/L3 input paths before replay, so absent/unseen books have columns.
+L2 is the midpoint source, exactly as in features; L3-only instruments stay null.
+There are no synthetic cross or DVOL instrument columns. Filtering and optional
+DVOL inputs use normal discovery. Metadata includes mode, engine version,
+`mid_grid_ms` and the native instrument triples in `instruments`.
+
+Midpoints reuse the core's validated books and exact e9 midpoint conversion.
+Absent, invalid, empty, crossed, stale (>60s), overflowing or warming books are
+null. Warmup follows features: 300 elapsed seconds from the first valid
+one-second feature tick. Sampling does not initialize or reset warmup. Output
+buffers at most 8,192 rows before writing a ZSTD-compressed row group; memory
+does not grow with the day. At 100ms there are 864,000 rows/day. With 12 books,
+raw Int64 payload is about 90 MB/day (85.7 MiB) before null encoding/compression;
+actual Parquet size depends on price activity and coverage.
+
+The launcher currently requires `--replay-only` for this option and publishes
+`WORK/mids/date=D/mids.parquet`. It validates the grid spacing, engine version
+and replay mode on resume; incompatible cached output requires a new work dir
+or explicit `--rebuild-stale`. Adding a grid to cached compatible features
+replays into staging and preserves the existing feature file. Marker-only skipped
+days remain skipped and have no mids file. Grid settings do not change feature
+mode metadata or existing feature stale checks.

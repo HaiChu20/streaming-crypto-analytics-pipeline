@@ -1,5 +1,6 @@
 pub mod features;
 pub mod input;
+pub mod mids;
 pub mod output;
 pub mod row;
 

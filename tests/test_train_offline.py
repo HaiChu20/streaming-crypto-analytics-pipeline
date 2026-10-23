@@ -415,3 +415,42 @@ def test_auxiliary_dvol_duplicates_fail_before_replay(launcher, cached):
     assert result.returncode != 0 and 'duplicate archive stream' in result.stderr
     assert all(str(path) in result.stderr for path in paths)
     assert not list(work.glob('.replay-*'))
+
+
+def test_mid_grid_adds_to_cached_features_resumes_and_rejects_stale_spacing(tmp_path):
+    archive = REPO / 'tests/fixtures/archive_v2'
+    work = tmp_path / 'grid work'
+    flags = ('--replay-only', '--exchange', 'kraken', '--market', 'spot',
+             '--exchange-clock-ms', '35', '--include-dvol', '--skip-marker-only-days')
+    first = run(archive, work, *flags)
+    assert first.returncode == 0, first.stdout + first.stderr
+    feature = work / 'features/date=2025-11-08/features.parquet'
+    before = feature.read_bytes(), feature.stat().st_mtime_ns
+    grid = run(archive, work, *flags, '--mid-grid-ms', '100')
+    assert grid.returncode == 0, grid.stdout + grid.stderr
+    mids = work / 'mids/date=2025-11-08/mids.parquet'
+    metadata = pq.read_metadata(mids)
+    assert metadata.num_rows == 864000
+    assert metadata.metadata[b'mid_grid_ms'] == b'100'
+    assert metadata.metadata[b'mode'] == b'ideal+exchange_clock_35ms+dvol'
+    assert (feature.read_bytes(), feature.stat().st_mtime_ns) == before
+    assert not (work / 'mids/date=2025-11-11/mids.parquet').exists()
+    saved = mids.stat().st_mtime_ns
+    resumed = run(archive, work, *flags, '--mid-grid-ms', '100')
+    assert resumed.returncode == 0, resumed.stdout + resumed.stderr
+    assert mids.stat().st_mtime_ns == saved
+    wrong = run(archive, work, *flags, '--mid-grid-ms', '200')
+    assert wrong.returncode != 0 and 'mid_grid_ms' in wrong.stderr
+    assert mids.stat().st_mtime_ns == saved
+    rebuilt = run(archive, work, *flags, '--mid-grid-ms', '200', '--rebuild-stale')
+    assert rebuilt.returncode == 0, rebuilt.stdout + rebuilt.stderr
+    assert pq.read_metadata(mids).num_rows == 432000
+
+
+@pytest.mark.parametrize('flags', [('--mid-grid-ms', '0'), ('--mid-grid-ms', '-1'),
+                                    ('--mid-grid-ms', '100')])
+def test_mid_grid_launcher_requires_positive_integer_and_replay_only(launcher, flags):
+    work, launch = launcher
+    result = launch(*flags)
+    assert result.returncode != 0 and '--mid-grid-ms requires' in result.stderr
+    assert not list(work.glob('.replay-*'))

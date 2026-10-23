@@ -274,3 +274,72 @@ without selections remain in the sampled day grid. Quantile boundary ties can
 increase coverage. Without early stopping or usable inner validation the status
 is `unavailable`, thresholds are null, and selection flags are false; pooled
 OOF status is `partial` if only some folds have thresholds.
+
+## Subsecond receive-clock lead/lag (R4)
+
+Generate separate wide mids with `scripts/train_offline.sh ARCHIVE WORK
+--replay-only --mid-grid-ms 100` (normal exchange/market/DVOL filters also work).
+Then run offline, without additional dependencies:
+
+```sh
+.venv/bin/python -m research.leadlag WORK/mids --max-lag-ms 10000 --json-out WORK/leadlag.json
+.venv/bin/python -m research.leadlag WORK/mids/date=*/mids.parquet \
+  --pairs binance_spot_BTCUSDT:kraken_spot_BTC_USD --threshold-bps 2 --json-out WORK/pair.json
+```
+
+Inputs can be mids roots, work roots, day directories or explicit files.
+`--pairs auto` (default) selects every unordered instrument pair. Explicit pairs
+use `FIRST:SECOND`, with column names minus `_mid_e9`. The compact table shows
+pooled peak lag, c(0), peak correlation and LLR; JSON contains all daily/pooled
+curves, overlap counts, 24 UTC-hour curves/LLRs and directional responses.
+Different replay modes or grid spacings cannot be mixed. Duplicate ticks or
+missing rows are errors; null values are expected. Files need not cover a full
+day for analysis, but must retain a regular epoch-aligned grid. Missing columns
+on individual days are treated as null. Returns never cross UTC days.
+
+For each pair/day, take log mid changes at consecutive grid points. If either
+instrument lacks either endpoint, mask both returns at that position. At lag k,
+Pearson correlation uses only overlapping valid positions t and t+k, without
+compressing gaps. **Positive k means the first instrument leads**:
+`c(k) = corr(first_return[t], second_return[t+k])`. The requested maximum lag is
+rounded down to whole grid steps. Peak selects the strongest absolute correlation
+(so inverse BTC/ETH associations can also lead); ties favor the smallest absolute
+lag. LLR is `sum(c(k)^2, k>0) / sum(c(k)^2, k<0)` (Huth & Abergel). Undefined
+correlations, zero-denominator LLRs and other undefined values serialize as null.
+
+The pooled curve is the equal-day mean of available daily correlations at each
+lag. Its peak and LLR come from that curve. Intervals report 2.5/50/97.5 percentiles
+of 1,000 day-bootstrap draws, using `research.evaluation.moving_day_blocks`, seed
+17 and one-day blocks. Peak correlation is bootstrapped at the pooled peak lag,
+held fixed across draws. A single day produces a degenerate interval; no
+intraday resampling is used. Hourly curves pool Pearson sufficient statistics
+across days, assigning the hour by the first instrument's return endpoint;
+follower endpoints can be in an adjacent hour of the same day.
+
+Response summaries are provided for both possible leaders, with the peak-lag
+leader named separately when nonzero. A shock is a single leader log move of
+at least `--threshold-bps` (default 2), including both signs. At t+h the signed
+follower response is `sign(leader_return[t]) * log(follower[t+h]/follower[t-1])`
+in bps, for h = 0/0.1/0.5/1/2/5/10 seconds. Thus 0s measures the simultaneous
+portion. Nonintegral horizons use the first grid point at or after h. Each horizon
+requires a complete valid follower path and stays within the day; event counts
+are included. The fraction already done is the mean simultaneous response divided
+by the mean 10s response on the **same 10s-valid events**. It is unbounded when
+responses reverse or overshoot, and null when the denominator is zero. Shocks
+may overlap; this is a descriptive response measure, not a causal estimate.
+
+The implementation processes one day at a time and only retains small daily
+summaries across days. FFT correlations use hour-sized chunks with lag halos,
+retaining boundary pairs while bounding scratch memory. Replay sampling itself
+buffers 8,192 rows. A 100ms day has 864,000 rows; 12 books plus timestamps occupy
+about 90 MB/day as raw Int64 values before Parquet compression/null encoding.
+The grid reuses feature validity, including the initial 300s warmup and >60s
+staleness timeout. See [replay options](../engine/replay/README.md#fine-mid-grid-for-leadlag-r4)
+for schema sanitizing and clock selection.
+
+Local synthetic benchmark (one 864,000-row day, 12 instruments, all 66 pairs,
+±10s lags): analysis took 11.0s; peak process RSS including fixture generation
+was 691 MB. The ZSTD synthetic mids Parquet was 42.9 MB. Price paths were noisy
+random walks, so this is a reproducible sizing example, not measured archive
+coverage or evidence of market lead/lag. Twenty days are processed sequentially;
+only daily summaries accumulate, rather than twenty days of grid rows.

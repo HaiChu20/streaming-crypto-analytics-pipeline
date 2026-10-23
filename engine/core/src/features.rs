@@ -432,6 +432,29 @@ impl Instrument {
         }
         Ok(())
     }
+    /// The same validated L2 source used by features and read-only mid sampling.
+    fn valid_book(&self, key: &Key, tick: i64) -> Option<(&crate::Book, i64)> {
+        let state = self.l2.as_ref()?;
+        if !fresh(self.last_recv.get("l2").copied(), tick) || !state.valid() {
+            return None;
+        }
+        let book = state.book()?;
+        let (bid, _) = book.best_bid()?;
+        let (ask, _) = book.best_ask()?;
+        if bid >= ask {
+            return None;
+        }
+        let factor = if key.0 == "okx" && key.1 == "perp" {
+            *self
+                .gates
+                .get("l2")?
+                .factors
+                .get(state.active_connection()?)?
+        } else {
+            UNIT
+        };
+        Some((book, factor))
+    }
     fn row(&mut self, key: &Key, tick: i64) -> Result<Row> {
         if let Some(last) = self.last_tick {
             for _ in ((last + SECOND)..tick).step_by(SECOND as usize) {
@@ -466,72 +489,57 @@ impl Instrument {
                 .map(|ns| (i128::from(tick) - ns) as f64 / 1_000_000.0),
             ..Default::default()
         };
-        if let Some(state) = &self.l2
-            && fresh(self.last_recv.get("l2").copied(), tick)
-            && state.valid()
-            && let Some(book) = state.book()
+        if let Some((book, factor)) = self.valid_book(key, tick)
             && let (Some((bid, bq)), Some((ask, aq))) = (book.best_bid(), book.best_ask())
+            && let Some(mid_e9) = book.mid().and_then(|mid| i64::try_from(mid.0).ok())
         {
-            let factor = if key.0 == "okx" && key.1 == "perp" {
-                self.gates
-                    .get("l2")
-                    .and_then(|g| state.active_connection().and_then(|id| g.factors.get(id)))
-                    .copied()
-            } else {
-                Some(UNIT)
-            };
-            if let Some(factor) = factor
-                && bid < ask
-                && let Some(mid_e9) = book.mid().and_then(|mid| i64::try_from(mid.0).ok())
-            {
-                row.book_valid = true;
-                row.best_bid = Some(bid.0 as f64 / UNIT as f64);
-                row.best_ask = Some(ask.0 as f64 / UNIT as f64);
-                let mid = book.mid().unwrap();
-                row.mid = Some(mid.0 as f64 / 1_000_000_000.0);
-                row.mid_e9 = Some(mid_e9);
-                let total = i128::from(bq.0) + i128::from(aq.0);
-                if total > 0 {
-                    row.microprice = Some(
-                        (i128::from(ask.0) * i128::from(bq.0)
-                            + i128::from(bid.0) * i128::from(aq.0)) as f64
-                            / total as f64
-                            / UNIT as f64,
-                    );
-                }
-                row.spread_bps = Some(
-                    (i128::from(ask.0) - i128::from(bid.0)) as f64 / UNIT as f64 / row.mid.unwrap()
-                        * 10000.0,
+            row.book_valid = true;
+            row.best_bid = Some(bid.0 as f64 / UNIT as f64);
+            row.best_ask = Some(ask.0 as f64 / UNIT as f64);
+            let mid = book.mid().unwrap();
+            row.mid = Some(mid.0 as f64 / 1_000_000_000.0);
+            row.mid_e9 = Some(mid_e9);
+            let total = i128::from(bq.0) + i128::from(aq.0);
+            if total > 0 {
+                row.microprice = Some(
+                    (i128::from(ask.0) * i128::from(bq.0) + i128::from(bid.0) * i128::from(aq.0))
+                        as f64
+                        / total as f64
+                        / UNIT as f64,
                 );
-                let bid = book
-                    .top(Side::Bid, 10)
-                    .iter()
-                    .map(|(_, q)| i128::from(q.0))
-                    .sum::<i128>();
-                let ask = book
-                    .top(Side::Ask, 10)
-                    .iter()
-                    .map(|(_, q)| i128::from(q.0))
-                    .sum::<i128>();
-                depth = [total * i128::from(factor), (bid + ask) * i128::from(factor)];
-                row.bid_depth10 = Some(scale(bid, factor));
-                row.ask_depth10 = Some(scale(ask, factor));
-                let bands = book
-                    .bands(mid_e9)
-                    .map(|side| side.map(|v| v.map(|v| scale(v, factor))));
-                [
-                    row.depth_bid_10bps,
-                    row.depth_bid_25bps,
-                    row.depth_bid_50bps,
-                ] = bands[0];
-                [
-                    row.depth_ask_10bps,
-                    row.depth_ask_25bps,
-                    row.depth_ask_50bps,
-                ] = bands[1];
-                if bid + ask > 0 {
-                    row.imbalance10 = Some((bid - ask) as f64 / (bid + ask) as f64);
-                }
+            }
+            row.spread_bps = Some(
+                (i128::from(ask.0) - i128::from(bid.0)) as f64 / UNIT as f64 / row.mid.unwrap()
+                    * 10000.0,
+            );
+            let bid = book
+                .top(Side::Bid, 10)
+                .iter()
+                .map(|(_, q)| i128::from(q.0))
+                .sum::<i128>();
+            let ask = book
+                .top(Side::Ask, 10)
+                .iter()
+                .map(|(_, q)| i128::from(q.0))
+                .sum::<i128>();
+            depth = [total * i128::from(factor), (bid + ask) * i128::from(factor)];
+            row.bid_depth10 = Some(scale(bid, factor));
+            row.ask_depth10 = Some(scale(ask, factor));
+            let bands = book
+                .bands(mid_e9)
+                .map(|side| side.map(|v| v.map(|v| scale(v, factor))));
+            [
+                row.depth_bid_10bps,
+                row.depth_bid_25bps,
+                row.depth_bid_50bps,
+            ] = bands[0];
+            [
+                row.depth_ask_10bps,
+                row.depth_ask_25bps,
+                row.depth_ask_50bps,
+            ] = bands[1];
+            if bid + ask > 0 {
+                row.imbalance10 = Some((bid - ask) as f64 / (bid + ask) as f64);
             }
         }
         if row.mid.is_some() {
@@ -845,6 +853,19 @@ impl Engine {
                 ))
             })
             .collect()
+    }
+    /// Read an existing book without advancing feature histories or warmup state.
+    /// Warmup is anchored to the first valid one-second feature tick.
+    pub fn mid_e9(&self, key: &(String, String, String), tick: i64) -> Option<i64> {
+        let state = self.instruments.get(key)?;
+        if state
+            .first_mid
+            .is_none_or(|first| tick - first < 300 * SECOND)
+        {
+            return None;
+        }
+        let (book, _) = state.valid_book(key, tick)?;
+        i64::try_from(book.mid()?.0).ok()
     }
     pub fn consume(&mut self, r: &Record) -> Result<()> {
         self.consume_inner(r, None)

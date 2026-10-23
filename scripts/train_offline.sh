@@ -3,7 +3,7 @@
 set -euo pipefail
 
 usage() {
-    echo "Usage: $0 <archive_root> <work_dir> [--jobs N] [--from YYYY-MM-DD] [--to YYYY-MM-DD] [--version V] [--allow-missing-days] [--rebuild-stale] [--replay-only] [--exchange NAME] [--market NAME] [--exchange-clock-ms N] [--include-dvol] [--skip-marker-only-days] [research.train flags: --label-spec PATH, --train-from YYYY-MM-DD, --threads, --lockbox-pct/--lockbox-from/--embargo-days, --fold-days/--min-train-days/--fold-embargo-s/--max-folds, --shuffle-test, --max-memory-gb, --open-lockbox/--i-understand-lockbox-reuse]" >&2
+    echo "Usage: $0 <archive_root> <work_dir> [--jobs N] [--from YYYY-MM-DD] [--to YYYY-MM-DD] [--version V] [--allow-missing-days] [--rebuild-stale] [--replay-only] [--mid-grid-ms N] [--exchange NAME] [--market NAME] [--exchange-clock-ms N] [--include-dvol] [--skip-marker-only-days] [research.train flags: --label-spec PATH, --train-from YYYY-MM-DD, --threads, --lockbox-pct/--lockbox-from/--embargo-days, --fold-days/--min-train-days/--fold-embargo-s/--max-folds, --shuffle-test, --max-memory-gb, --open-lockbox/--i-understand-lockbox-reuse]" >&2
 }
 fail() { echo "train_offline: $*" >&2; exit 1; }
 [[ $# -ge 2 ]] || { usage; exit 2; }
@@ -28,6 +28,7 @@ market_filter=""
 exchange_clock_ms=""
 skip_marker_only=0
 include_dvol=0
+mid_grid_ms=""
 replay_args=(--mode ideal)
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -39,6 +40,10 @@ while [[ $# -gt 0 ]]; do
                 --to) to_day=$2 ;;
                 --version) version=$2; version_set=1 ;;
             esac
+            shift 2 ;;
+        --mid-grid-ms)
+            [[ $# -ge 2 && $2 =~ ^[1-9][0-9]*$ ]] || fail "--mid-grid-ms requires a positive integer"
+            mid_grid_ms=$2
             shift 2 ;;
         --exchange|--market|--exchange-clock-ms)
             [[ $# -ge 2 && -n $2 ]] || fail "$1 requires a value"
@@ -73,6 +78,7 @@ while [[ $# -gt 0 ]]; do
         *) usage; fail "unknown option: $1" ;;
     esac
 done
+[[ -z $mid_grid_ms || $replay_only -eq 1 ]] || fail "--mid-grid-ms requires --replay-only"
 [[ -z $exchange_filter || $exchange_filter =~ ^(binance|kraken|okx|deribit)$ ]] || fail "unknown --exchange: $exchange_filter"
 [[ -z $market_filter || $market_filter =~ ^(spot|perp|index)$ ]] || fail "unknown --market: $market_filter"
 if [[ -n $exchange_clock_ms ]]; then
@@ -229,7 +235,7 @@ if [[ $include_dvol -eq 1 ]]; then replay_mode="${replay_mode}+dvol"; fi
 # Training includes every completed day in work_dir, even outside --from/--to.
 # Validate all of them before any replay or replacement, then plan selected days.
 replay_plan="$logs/replay-plan-$run_id.txt"
-"${python_cmd[@]}" - "$work_dir" "$days_file" "$engine_version" "$rebuild_stale" "$replay_mode" "$skip_marker_only" > "$replay_plan" <<'PY'
+"${python_cmd[@]}" - "$work_dir" "$days_file" "$engine_version" "$rebuild_stale" "$replay_mode" "$skip_marker_only" "$mid_grid_ms" > "$replay_plan" <<'PY'
 from pathlib import Path
 import json
 import sys
@@ -238,6 +244,7 @@ import pyarrow.parquet as pq
 work, days_file = map(Path, sys.argv[1:3])
 expected, rebuild = sys.argv[3], sys.argv[4] == '1'
 expected_mode, skip_marker_only = sys.argv[5], sys.argv[6] == '1'
+grid_ms = sys.argv[7]
 days = days_file.read_text().splitlines()
 stale = {}
 for path in sorted(work.glob('features/date=*/features.parquet')):
@@ -258,6 +265,17 @@ for path in sorted(work.glob('features/date=*/skipped.json')):
         raise SystemExit(f'{path}: resubmit with --skip-marker-only-days or use a new work dir')
     if saved.get('engine_version') != expected or saved.get('replay_mode') != expected_mode:
         stale[path.parent.name.removeprefix('date=')] = 'stale skipped.json provenance'
+if grid_ms:
+    for path in sorted(work.glob('mids/date=*/mids.parquet')):
+        try:
+            metadata = pq.read_metadata(path).metadata or {}
+            valid = (metadata.get(b'engine_version') == expected.encode()
+                     and metadata.get(b'mode') == expected_mode.encode()
+                     and metadata.get(b'mid_grid_ms') == grid_ms.encode())
+        except (OSError, ValueError):
+            valid = False
+        if not valid:
+            stale[path.parent.name.removeprefix('date=')] = 'stale mids engine_version/replay_mode/mid_grid_ms'
 if stale and (not rebuild or stale.keys() - set(days)):
     details = '\n'.join(f'  {day}: {reason}' for day, reason in stale.items())
     raise SystemExit(
@@ -267,6 +285,9 @@ if stale and (not rebuild or stale.keys() - set(days)):
 for day in days:
     exists = any((work / f'features/date={day}' / name).is_file() for name in ('features.parquet', 'skipped.json'))
     action = 'rebuild' if day in stale else ('reuse' if exists else 'replay')
+    if (grid_ms and action == 'reuse' and (work / f'features/date={day}/features.parquet').is_file()
+            and not (work / f'mids/date={day}/mids.parquet').is_file()):
+        action = 'mids'
     print(day, action)
 PY
 replay_day() {
@@ -280,8 +301,12 @@ replay_day() {
         return 0
     fi
     echo "Replay $day (log: $logs/$day.log)"
+    local day_replay_args=("${replay_args[@]}")
+    if [[ -n $mid_grid_ms ]]; then
+        day_replay_args+=(--mid-grid-ms "$mid_grid_ms" --mids-out "$staging/mids.parquet")
+    fi
     local replay_status=0
-    "$replay" --root "$archive_root" --date "$day" --out "$staging" "${replay_args[@]}" > "$report_tmp" 2> "$logs/$day.log" || replay_status=$?
+    "$replay" --root "$archive_root" --date "$day" --out "$staging" "${day_replay_args[@]}" > "$report_tmp" 2> "$logs/$day.log" || replay_status=$?
     if [[ $replay_status -eq 3 && $skip_marker_only -eq 1 ]]; then
         "${python_cmd[@]}" - "$report_tmp" "$work_dir/features/date=$day/skipped.json" "$engine_version" "$replay_mode" <<'PYSKIP'
 import json
@@ -308,7 +333,7 @@ PYSKIP
     # Publish only newly generated outputs. Source archives are never modified.
     # Staging and reports stay in work_dir, so these renames are atomic. Failed
     # or interrupted staging is retained and never treated as a completed day.
-    if ! "${python_cmd[@]}" - "$staging/date=$day/features.parquet" "$final" "$report_tmp" "$logs/$day.json" "$engine_version" "$replay_mode" <<'PY'
+    if ! "${python_cmd[@]}" - "$staging/date=$day/features.parquet" "$final" "$report_tmp" "$logs/$day.json" "$engine_version" "$replay_mode" "$mid_grid_ms" "$staging/mids.parquet" "$work_dir/mids/date=$day/mids.parquet" "$action" <<'PY'
 import json
 import os
 from pathlib import Path
@@ -324,6 +349,15 @@ if metadata.get(b'engine_version') != sys.argv[5].encode():
 mode = metadata.get(b'mode', metadata.get(b'replay_mode', b'ideal')).decode()
 if mode != sys.argv[6]:
     raise SystemExit(f'Replay produced an unexpected replay mode in {source}: {mode!r}')
+if sys.argv[7]:
+    mids_source, mids_target = map(Path, sys.argv[8:10])
+    mids_metadata = pq.read_metadata(mids_source).metadata or {}
+    if any(mids_metadata.get(key) != value.encode() for key, value in (
+            (b'engine_version', sys.argv[5]), (b'mode', sys.argv[6]), (b'mid_grid_ms', sys.argv[7]))):
+        raise SystemExit(f'Replay produced unexpected mid grid metadata in {mids_source}')
+    mids_target.parent.mkdir(parents=True, exist_ok=True)
+    os.rename(mids_source, mids_target)
+    report['mids_output'] = str(mids_target)
 target.parent.mkdir(parents=True, exist_ok=True)
 report['output'] = str(target)
 report_tmp.write_text(json.dumps(report, indent=2) + '\n')
@@ -331,7 +365,8 @@ os.rename(report_tmp, report_path)
 previous_skip = target.parent / 'skipped.json'
 if previous_skip.exists():
     os.rename(previous_skip, report_tmp.with_suffix('.skipped.json'))
-os.rename(source, target)  # The complete-day marker is published last.
+if sys.argv[10] != 'mids':
+    os.rename(source, target)  # The complete-day marker is published last.
 PY
     then
         echo "Could not publish $day; staging retained at $staging" >&2
