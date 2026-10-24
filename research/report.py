@@ -105,6 +105,8 @@ def selective_section(selective):
 
 def target_section(r):
     result = f"<article><h2>{escape(r['target'])} · {r['horizon_s']} seconds · entry delay {r.get('entry_delay_s', 0)} s</h2>"
+    if 'stride_s' in r:
+        result += f"<p>stride_s: {r['stride_s']}; eval_stride_s: {r.get('eval_stride_s', r['stride_s'])} seconds.</p>"
     result += '<h3>Data window, lockbox and embargo</h3>'
     window = r.get('data_window', {})
     result += table(['Start UTC', 'End UTC', 'Last label endpoint UTC'],

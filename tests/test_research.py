@@ -291,7 +291,7 @@ def test_tiny_end_to_end_cli_models_metadata_and_row_modes(tmp_path, synthetic_p
     assert not any(c.startswith('shuffle_') for c in oof.columns)
     np.testing.assert_array_equal(oof['reversal'].to_numpy(), -oof['momentum'].to_numpy())
     matrix, features = build_matrix(read_features([synthetic_path]), "BTC_spot")
-    x = matrix.select(features).head(2).to_numpy().astype(float)
+    x = matrix.select(metadata["features"]).head(2).to_numpy().astype(float)
     assert lgb.Booster(model_file=str(directory / "regressor.txt")).predict(x).shape == (2,)
     assert lgb.Booster(model_file=str(directory / "classifier.txt")).predict(x).shape == (2, 3)
     assert set(report["metrics"]) == {"regressor", "classifier", "zero", "momentum", "reversal", "prior", "ridge"}

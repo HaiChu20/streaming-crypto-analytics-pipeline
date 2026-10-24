@@ -58,7 +58,7 @@ while [[ $# -gt 0 ]]; do
             include_dvol=1; replay_args+=("$1"); shift ;;
         --skip-marker-only-days)
             skip_marker_only=1; replay_args+=("$1"); shift ;;
-        --threads|--label-spec|--train-from|--lockbox-pct|--lockbox-from|--embargo-days|--fold-days|--min-train-days|--fold-embargo-s|--max-folds|--max-memory-gb|--stride-s|--target|--horizon-s|--rounds|--purge-s)
+        --threads|--label-spec|--train-from|--lockbox-pct|--lockbox-from|--embargo-days|--fold-days|--min-train-days|--fold-embargo-s|--max-folds|--max-memory-gb|--stride-s|--eval-stride-s|--target|--horizon-s|--rounds|--purge-s)
             [[ $# -ge 2 && -n $2 ]] || fail "$1 requires a value"
             train_args+=("$1" "$2")
             case "$1" in
@@ -68,7 +68,7 @@ while [[ $# -gt 0 ]]; do
                 --threads) [[ $2 =~ ^[1-9][0-9]*$ ]] || fail "--threads must be a positive integer" ;;
             esac
             shift 2 ;;
-        --shuffle-test|--open-lockbox|--i-understand-lockbox-reuse)
+        --keep-constant-features|--shuffle-test|--open-lockbox|--i-understand-lockbox-reuse)
             train_args+=("$1")
             if [[ $1 == --open-lockbox ]]; then open_lockbox=1; fi
             shift ;;

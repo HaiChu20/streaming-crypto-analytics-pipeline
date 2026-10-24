@@ -63,6 +63,15 @@ def validate_entry_delay(entry_delay_s):
     return int(entry_delay_s)
 
 
+def resolve_eval_stride(stride_s, eval_stride_s=None):
+    eval_stride_s = stride_s if eval_stride_s is None else eval_stride_s
+    if (isinstance(stride_s, bool) or not isinstance(stride_s, (int, np.integer)) or stride_s < 1
+            or isinstance(eval_stride_s, bool) or not isinstance(eval_stride_s, (int, np.integer))
+            or eval_stride_s < 1 or eval_stride_s % stride_s):
+        raise ValueError('eval_stride_s must be a positive multiple of the positive stride_s')
+    return int(eval_stride_s)
+
+
 def delayed_labels(rows, target, horizon_s, spec=None, entry_delay_s=0):
     """Join a label starting at t+D to features at t; keep its true endpoints."""
     delay = validate_entry_delay(entry_delay_s)
@@ -295,8 +304,10 @@ def train_target(rows: pl.DataFrame, target: str, horizon_s: int, output_root: s
                  embargo_days=1, fold_days=7, min_train_days=14, fold_embargo_s=None,
                  max_folds=12, shuffle_test=False, max_memory_gb=None, num_threads=None,
                  params=None, risk_params=None, early_stopping=False, inner_valid_days=7,
-                 early_stopping_rounds=50, exclude_groups=(), exclude_features=(), entry_delay_s=0, train_from=None) -> dict:
+                 early_stopping_rounds=50, exclude_groups=(), exclude_features=(), entry_delay_s=0, train_from=None,
+                 eval_stride_s=None, keep_constant_features=False) -> dict:
     entry_delay_s = validate_entry_delay(entry_delay_s)
+    eval_stride_s = resolve_eval_stride(stride_s, eval_stride_s)
     lower = train_from_ns(train_from)
     if rows['replay_mode'].n_unique() > 1:
         raise ValueError('Cannot mix replay modes within one training run')
@@ -321,7 +332,7 @@ def train_target(rows: pl.DataFrame, target: str, horizon_s: int, output_root: s
                "train_from": train_from, "label_spec": spec, "label_spec_version": spec["version"],
                "status": "skipped", "reference": reference_for(target, spec), "date_split": split,
                'model_params': effective_model_params(params, risk_params, num_threads),
-               'entry_delay_s': entry_delay_s,
+               'entry_delay_s': entry_delay_s, 'stride_s': stride_s, 'eval_stride_s': eval_stride_s,
                'selective': {'status': 'unavailable', 'reason': 'no held-out predictions'},
                'confidence_thresholds': None,
                "labeled_rows": 0, "matrix_rows": 0}
@@ -331,9 +342,25 @@ def train_target(rows: pl.DataFrame, target: str, horizon_s: int, output_root: s
     calendar = Calendar.load(spec["calendar"]) if spec.get("calendar") else None
     matrix, features = build_matrix(rows, target, stride_s, spec, calendar=calendar)
     features, exclusions = select_features(features, exclude_groups, exclude_features)
+    constant = []
+    if features and not keep_constant_features:
+        unique = matrix.select(pl.col(features).n_unique()).row(0, named=True)
+        constant = sorted(name for name, count in unique.items() if count == 1)
+        features = [name for name in features if name not in constant]
+    exclusions.update(constant=constant, constant_count=len(constant),
+                      excluded=sorted(set(exclusions['excluded']) | set(constant)))
+    # Keep diagnostic baselines even when their predictor columns are excluded.
+    momentum_column = f'momentum_return_{horizon_s if horizon_s <= 300 else 900}s'
+    ref = reference_for(target, spec)
+    rv_column = f"{ref['exchange']}_{ref['market']}_rv_300s"
+    matrix = matrix.with_columns(
+        (pl.col(rv_column) if rv_column in matrix.columns else pl.lit(None, dtype=pl.Float64)).alias('_rv'),
+        *([pl.col(momentum_column).alias('_momentum')] if horizon_s >= 300 else []),
+    ).drop(exclusions['excluded'])
     skipped.update(features=features, exclusions=exclusions, **feature_schema(features))
     if horizon_s < 300:
         matrix = matrix.join(momentum_return(rows, target, horizon_s, spec), on='tick_ns', how='left')
+        matrix = matrix.rename({momentum_column: '_momentum'})
     labeled = matrix.join(delayed_labels(rows, target, horizon_s, spec, entry_delay_s), on="tick_ns", how="left")
     # A delayed emission after the target endpoint cannot be a forecast.
     data = labeled.filter(pl.col("return_pct").is_not_null()
@@ -350,6 +377,9 @@ def train_target(rows: pl.DataFrame, target: str, horizon_s: int, output_root: s
                                    data["label_available_ns"].to_numpy(), data["available_ns"].to_numpy(),
                                    fold_days=fold_days, min_train_days=min_train_days,
                                    fold_embargo_s=fold_embargo_s, max_folds=max_folds, train_from=train_from)
+        folds = [(train, test[ticks[test] % (eval_stride_s * NS) == 0]) for train, test in folds]
+        if any(not len(test) for _, test in folds):
+            raise InsufficientHistory('evaluation stride leaves a selected fold without test rows')
     except InsufficientHistory as exc:
         return dict(skipped, reason=f"not enough labeled rows: {exc}",
                     matrix_rows=matrix.height, labeled_rows=data.height)
@@ -357,12 +387,9 @@ def train_target(rows: pl.DataFrame, target: str, horizon_s: int, output_root: s
     x = feature_array(data, features)
     y = data["return_pct"].to_numpy()
     directions = data["direction"].to_numpy().astype(np.int32)
-    momentum = (data[f"momentum_return_{horizon_s}s"].to_numpy() if horizon_s <= 300 else
-                data["momentum_return_900s"].to_numpy() * (horizon_s / 900))
+    momentum = data["_momentum"].to_numpy() * (1 if horizon_s <= 300 else horizon_s / 900)
     adverse = {side: data[f"adverse_{side}_bps"].to_numpy() for side in ("long", "short")}
-    ref = reference_for(target, spec)
-    rv_column = f"{ref['exchange']}_{ref['market']}_rv_300s"
-    rv = data[rv_column].to_numpy() if rv_column in data.columns else np.full(data.height, np.nan)
+    rv = data["_rv"].to_numpy()
     def choose_inner(indices):
         if not early_stopping:
             return None
@@ -523,7 +550,7 @@ def train_target(rows: pl.DataFrame, target: str, horizon_s: int, output_root: s
         "late_prediction_rows_excluded": labeled.filter(pl.col("return_pct").is_not_null()
             & (pl.col("available_ns") >= pl.col("label_end_ns"))).height,
         "label_coverage_pct": 100 * data.height / matrix.height,
-        "stride_s": stride_s, "purge_s": horizon_s if purge_s is None else purge_s,
+        "stride_s": stride_s, "eval_stride_s": eval_stride_s, "purge_s": horizon_s if purge_s is None else purge_s,
         "rounds": rounds, "folds": results, "metrics": summary,
         "stop_models": {name: {"file": f"{name}.txt", "quantile": int(name[-2:]) / 100,
                                "label": f"adverse_{name.split('_')[1]}_bps"}
@@ -649,7 +676,8 @@ def open_lockbox(rows, output, version, targets=None, horizons=None, acknowledge
                 calendar = Calendar.load(spec['calendar']) if spec.get('calendar') else None
                 if calendar:
                     verify_calendar(calendar, report)
-                matrix, _ = build_matrix(held, report['target'], report['stride_s'], spec, calendar=calendar)
+                matrix, _ = build_matrix(held, report['target'], report.get('eval_stride_s', report['stride_s']),
+                                         spec, calendar=calendar)
                 h = report['horizon_s']
                 if h < 300:
                     matrix = matrix.join(momentum_return(held, report['target'], h, spec),
@@ -780,7 +808,9 @@ def write_experiment(output, args, argv, targets, horizons, reports, split, rows
             'status': ('failed' if error else 'evaluated') if args.open_lockbox else report.get('status', 'failed'),
             'reason': report.get('reason') if report else error, 'metrics': measured.get('metrics'),
             'stop_metrics': measured.get('stop_metrics'), 'split': report.get('date_split'),
-            'stride_s': report.get('stride_s', args.stride_s), 'rounds': report.get('rounds', args.rounds),
+            'stride_s': report.get('stride_s', args.stride_s),
+            'eval_stride_s': report.get('eval_stride_s', report.get('stride_s', args.eval_stride_s)),
+            'rounds': report.get('rounds', args.rounds),
             'entry_delay_s': report.get('entry_delay_s', args.entry_delay_s),
             'train_from': report.get('train_from', args.train_from),
             'params': report.get('model_params'),
@@ -793,7 +823,8 @@ def write_experiment(output, args, argv, targets, horizons, reports, split, rows
         split = splits[0] if all(s == splits[0] for s in splits) else splits
     entry = {'version': args.version, 'utc_time': datetime.now(timezone.utc).isoformat(), 'git': git,
              'argv': list(argv), 'mode': 'list_feature_groups' if args.list_feature_groups else ('open_lockbox' if args.open_lockbox else 'train'),
-             'targets': targets, 'horizons_s': horizons, 'stride_s': args.stride_s, 'rounds': args.rounds,
+             'targets': targets, 'horizons_s': horizons, 'stride_s': args.stride_s,
+             'eval_stride_s': args.eval_stride_s, 'rounds': args.rounds,
              'entry_delay_s': args.entry_delay_s, 'train_from': args.train_from,
              'params': effective_model_params(args.params, args.risk_params, num_threads),
              'exclude_groups': args.exclude_group, 'exclude_features': args.exclude_features,
@@ -820,6 +851,13 @@ def main(argv=None):
     parser.add_argument('--threads', type=int, default=available_cpus(),
                         help='LightGBM CPU threads; defaults to the CPUs available to this process')
     parser.add_argument('--stride-s', type=int, default=10)
+    parser.add_argument('--eval-stride-s', type=int,
+                        help='OOF and lockbox row spacing in seconds; positive multiple of --stride-s '
+                             '(default: --stride-s). E.g. --stride-s 5 --eval-stride-s 10 trains densely '
+                             'and evaluates the same ticks as --stride-s 10')
+    parser.add_argument('--keep-constant-features', action='store_true',
+                        help='Disable default removal of features constant on development matrix rows '
+                             '(including all-null and all-NaN columns)')
     parser.add_argument('--entry-delay-s', type=int, default=0,
                         help='Simulated entry delay; features stay at t and labels span t+D to t+D+h')
     parser.add_argument('--purge-s', type=int)
@@ -849,6 +887,7 @@ def main(argv=None):
     parser.add_argument('--i-understand-lockbox-reuse', action='store_true')
     parser.add_argument('--upload', action='store_true')
     args = parser.parse_args(argv)
+    args.eval_stride_s = resolve_eval_stride(args.stride_s, args.eval_stride_s)
     try:
         train_from_ns(args.train_from)
     except ValueError:
@@ -886,7 +925,7 @@ def main(argv=None):
             targets = sorted({report['target'] for report in frozen})
             horizons = sorted({report['horizon_s'] for report in frozen})
             # A shared read must retain full payloads for every saved model's stride.
-            load_stride = math.gcd(*(report['stride_s'] for report in frozen))
+            load_stride = math.gcd(*(report.get('eval_stride_s', report['stride_s']) for report in frozen))
         try:
             input_days = feature_dates(paths)
         except ValueError:
@@ -954,7 +993,8 @@ def main(argv=None):
                                       early_stopping=args.early_stopping, inner_valid_days=args.inner_valid_days,
                                       early_stopping_rounds=args.early_stopping_rounds,
                                       exclude_groups=args.exclude_group, exclude_features=args.exclude_features,
-                                      entry_delay_s=args.entry_delay_s, train_from=args.train_from)
+                                      entry_delay_s=args.entry_delay_s, train_from=args.train_from,
+                                      eval_stride_s=args.eval_stride_s, keep_constant_features=args.keep_constant_features)
                 reports.append(report)
                 if report['status'] == 'skipped':
                     print(f"Skipped {target}/{horizon}: {report['reason']}", flush=True)

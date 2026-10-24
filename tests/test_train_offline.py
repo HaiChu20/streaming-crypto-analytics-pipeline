@@ -259,6 +259,7 @@ def test_evaluation_flags_pass_through_and_ranges_print_before_replay(launcher):
     flags = ['--lockbox-pct', '30', '--lockbox-from', '2026-09-16', '--embargo-days', '1',
              '--fold-days', '7', '--min-train-days', '14', '--fold-embargo-s', '900',
              '--max-folds', '4', '--shuffle-test', '--max-memory-gb', '2', '--stride-s', '30',
+             '--eval-stride-s', '60', '--keep-constant-features',
              '--target', 'BTC_spot', '--horizon-s', '900', '--rounds', '3']
     result = launch('--version', 'flags', *flags)
     assert result.returncode == 0, result.stdout + result.stderr

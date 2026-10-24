@@ -441,7 +441,8 @@ def test_five_minute_trained_stop_models_and_live_vector_parity(tmp_path, compac
     models = load_models(tmp_path, "risk", horizons=[300])
     assert set(models[0].stops) == set(STOP_NAMES)
     assert report["stop_labeled_rows"]["long"] == report["labeled_rows"]
-    matrix, features = build_matrix(frame, "BTC_spot", spec=spec)
+    matrix, _ = build_matrix(frame, "BTC_spot", spec=spec)
+    features = models[0].metadata["features"]
     expected = matrix.filter(pl.col("tick_ns") == 300 * NS).select(features).to_numpy().astype(np.float64)
     svc = Service(models, Producer())
     feed(svc, *rows[:302])
