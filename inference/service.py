@@ -45,6 +45,9 @@ FLOATS += ["funding_min_to_next", "mark_index_bps"]
 FLOATS += [f"oi_chg_pct_{w}s" for w in (300, 900, 3600)]
 FLOATS += [f"depth_{side}_{bps}bps" for side in ("bid", "ask") for bps in (10, 25, 50)]
 FLOATS += ['dvol', 'dvol_chg_300s', 'dvol_chg_900s', 'dvol_chg_3600s', 'dvol_rv_gap']
+FLOATS += [f'lead_{pair}_{suffix}'
+           for pair in ('kp_ks', 'bs_ks', 'bp_ks', 'kp_bs', 'kp_bp')
+           for suffix in ('gap_dev_60s', 'gap_dev_300s', 'gap_chg_1s', 'gap_chg_5s')]
 SCHEMA = {**dict.fromkeys(STRINGS, pl.String), **dict.fromkeys(BOOLS, pl.Boolean),
           **dict.fromkeys(INTS, pl.Int64), **dict.fromkeys(FLOATS, pl.Float64),
           "replay_mode": pl.String}

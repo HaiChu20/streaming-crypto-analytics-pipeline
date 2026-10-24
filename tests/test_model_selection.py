@@ -191,7 +191,8 @@ NAMES = ['cal_hour_sin', 'binance_spot_liq_sell_base_60s', 'kraken_spot_l3_add_b
          'binance_perp_range_bps_60s', 'binance_spot_dvol', 'binance_spot_dvol_chg_900s',
          'binance_spot_spread_bps', 'kraken_spot_depth_ask_25bps', 'binance_perp_funding_rate',
          'binance_perp_open_interest', 'binance_perp_oi_chg_pct_300s', 'binance_perp_mark_index_bps',
-         'cross_cross_basis_bps_binance', 'binance_spot_book_valid', 'binance_spot_cov_1800s',
+         'cross_cross_lead_kp_ks_gap_dev_60s', 'cross_cross_basis_bps_binance',
+         'binance_spot_book_valid', 'binance_spot_cov_1800s',
          'ctx_usdt_kraken_spot_premium_bps']
 
 
@@ -205,6 +206,18 @@ def test_feature_groups_match_families_and_exclude_unrelated_suffixes():
     selected, info = select_features(NAMES, ['calendar', 'returns'], [r'_spread_bps$'])
     assert selected == [f for f in NAMES if f not in info['excluded']]
     assert 'momentum_return_900s' in info['excluded'] and info['groups'] == ['calendar', 'returns']
+
+
+def test_lead_group_excludes_all_pairs_and_cross_group_still_matches():
+    lead = [f'cross_cross_lead_{pair}_{suffix}'
+            for pair in ('kp_ks', 'bs_ks', 'bp_ks', 'kp_bs', 'kp_bp')
+            for suffix in ('gap_dev_60s', 'gap_dev_300s', 'gap_chg_1s', 'gap_chg_5s')]
+    other = ['cross_cross_basis_bps_binance', 'binance_spot_ret_1s']
+    selected, info = select_features(lead + other, ['lead'])
+    assert selected == other and info['excluded'] == sorted(lead)
+    assert all(re.search(FEATURE_GROUPS['cross'], name) for name in lead)
+    selected, info = select_features(lead + other, ['cross'])
+    assert selected == ['binance_spot_ret_1s']
 
 
 @pytest.mark.parametrize('groups,patterns', [(['unknown'], []), ([], ['absent']), ([], ['[']), ([], ['.*'])])

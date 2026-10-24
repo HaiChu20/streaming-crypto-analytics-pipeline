@@ -11,7 +11,7 @@ pub mod session;
 pub mod windows;
 
 pub const SECOND: i64 = 1_000_000_000;
-pub const ENGINE_VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), "-features-v6");
+pub const ENGINE_VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), "-features-v7");
 
 pub use book::{Book, Side};
 pub use fixed::{Fixed, Mid};

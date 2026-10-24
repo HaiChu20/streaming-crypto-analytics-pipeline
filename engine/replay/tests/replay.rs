@@ -587,6 +587,43 @@ fn parquet_optional_columns_metadata_and_atomic_publish() {
     assert_eq!(v["liq_buy_count_3600s"], 7);
 }
 #[test]
+fn parquet_round_trips_all_twenty_lead_columns_and_nulls() {
+    let out = scratch().join("lead.parquet");
+    let mut writer = Writer::new(&out).unwrap();
+    let empty = serde_json::to_value(Row::default()).unwrap();
+    let mut populated = empty.clone();
+    let mut value = 0.25;
+    for pair in ["kp_ks", "bs_ks", "bp_ks", "kp_bs", "kp_bp"] {
+        for suffix in ["gap_dev_60s", "gap_dev_300s", "gap_chg_1s", "gap_chg_5s"] {
+            let name = format!("lead_{pair}_{suffix}");
+            assert!(populated.as_object().unwrap().contains_key(&name));
+            populated[name] = json!(value);
+            value += 1.0;
+        }
+    }
+    for expected in [&populated, &empty] {
+        writer
+            .push(serde_json::from_value(expected.clone()).unwrap())
+            .unwrap();
+    }
+    assert_eq!(writer.finish().unwrap(), 2);
+    let reader = SerializedFileReader::new(File::open(out).unwrap()).unwrap();
+    for (actual, expected) in reader.get_row_iter(None).unwrap().zip([populated, empty]) {
+        let actual = row_json(actual.unwrap());
+        assert_eq!(
+            actual
+                .as_object()
+                .unwrap()
+                .keys()
+                .filter(|name| name.starts_with("lead_"))
+                .count(),
+            20
+        );
+        assert_eq!(actual, expected);
+    }
+}
+
+#[test]
 fn cli_reports_engine_version_without_replay_arguments() {
     let result = std::process::Command::new(env!("CARGO_BIN_EXE_engine-replay"))
         .arg("--engine-version")

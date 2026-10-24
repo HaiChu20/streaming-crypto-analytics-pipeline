@@ -59,7 +59,8 @@ def test_parity_full_multinstrument_frame_and_online_ticks():
         rows.append(row(t, market="perp", spread_bps=3.))
         if t != 910:
             rows.append(row(t, exchange="okx", symbol="BTC-USDT", spread_bps=4.))
-        rows.append(row(t, exchange="cross", market="cross", symbol="BTC", basis_bps_binance=1.5))
+        rows.append(row(t, exchange="cross", market="cross", symbol="BTC", basis_bps_binance=1.5,
+                        lead_kp_ks_gap_dev_60s=t * .01, lead_kp_bp_gap_chg_5s=-.25))
         rows.append(row(t, symbol="ETHUSDT", spread_bps=999.))
     frame = pl.DataFrame(rows, schema=SCHEMA)
     matrix, features = build_matrix(frame, "BTC_spot", spec=metadata()["label_spec"])

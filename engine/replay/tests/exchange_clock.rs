@@ -267,8 +267,8 @@ fn duplicate_archive_directories_error_names_both_paths_but_extensions_keep_prio
 }
 
 #[test]
-fn default_v3_feature_bytes_match_pre_exchange_clock_output() {
-    // FNV-1a of the complete Parquet captured from the pre-K1 release binary.
+fn default_v3_feature_bytes_match_features_v7_output() {
+    // FNV-1a of complete Parquet with the features-v7 schema and version.
     // This freezes rows, ordering, schema and metadata without a new dependency.
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/archive");
     let out = scratch();
@@ -282,6 +282,6 @@ fn default_v3_feature_bytes_match_pre_exchange_clock_output() {
     let hash = bytes.iter().fold(0xcbf29ce484222325u64, |h, b| {
         (h ^ u64::from(*b)).wrapping_mul(0x100000001b3)
     });
-    assert_eq!(bytes.len(), 5_695_854);
-    assert_eq!(hash, 0xb8443ba18016e54b);
+    assert_eq!(bytes.len(), 6_038_382);
+    assert_eq!(hash, 0x52c53e0368e93c25);
 }

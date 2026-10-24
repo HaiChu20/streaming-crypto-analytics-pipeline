@@ -149,8 +149,16 @@ impl Bucket {
         Ok(())
     }
 }
+#[derive(Serialize, Deserialize)]
+struct L1 {
+    bid: i64,
+    ask: i64,
+    update_id: u64,
+}
 #[derive(Default, Serialize, Deserialize)]
 struct Instrument {
+    #[serde(default)]
+    l1: Option<L1>,
     l2: Option<StreamBook>,
     l3: Option<StreamBook>,
     gates: BTreeMap<String, Gate>,
@@ -219,6 +227,10 @@ impl Instrument {
             match r.event.as_deref() {
                 Some("start") => gate.start(r)?,
                 Some("stop" | "drop") => {
+                    if r.feed == "l1" && (crash || gate.active.as_deref() == Some(&r.conn)) {
+                        self.l1 = None;
+                        self.last_recv.remove("l1");
+                    }
                     if (crash || gate.active.as_deref() == Some(&r.conn))
                         && matches!(r.feed.as_str(), "mark" | "ticker")
                     {
@@ -297,7 +309,40 @@ impl Instrument {
             }
             return Ok(());
         }
-        if r.kind == Kind::Control || matches!(r.feed.as_str(), "l1" | "trades_agg") {
+        if r.kind == Kind::Control || r.feed == "trades_agg" {
+            return Ok(());
+        }
+        if r.feed == "l1" {
+            if r.exchange != "binance" {
+                return Ok(());
+            }
+            let gate = self.gates.entry(r.feed.clone()).or_default();
+            let same_connection = gate.active.as_deref() == Some(&r.conn);
+            if !gate.accept(&r.conn) {
+                return Ok(());
+            }
+            if !same_connection {
+                self.l1 = None;
+                self.last_recv.remove("l1");
+            }
+            let payload: Value = serde_json::from_str(&r.payload)?;
+            let data = payload.get("data").unwrap_or(&payload);
+            let update_id = data["u"]
+                .as_u64()
+                .ok_or_else(|| error("missing L1 update ID"))?;
+            if self.l1.as_ref().is_some_and(|l1| update_id <= l1.update_id) {
+                return Ok(());
+            }
+            self.l1 = Some(L1 {
+                bid: fixed(&data["b"])?,
+                ask: fixed(&data["a"])?,
+                update_id,
+            });
+            if let Some(last) = self.last_recv.get_mut("l1") {
+                *last = r.recv_ns;
+            } else {
+                self.last_recv.insert("l1".into(), r.recv_ns);
+            }
             return Ok(());
         }
         let gate = self.gates.entry(r.feed.clone()).or_default();
@@ -454,6 +499,22 @@ impl Instrument {
             UNIT
         };
         Some((book, factor))
+    }
+    /// Exact e9 midpoint used only by the cross-venue lead features.
+    fn fast_mid(&self, key: &Key, tick: i64) -> Option<i128> {
+        if key.0 == "binance"
+            && fresh(self.last_recv.get("l1").copied(), tick)
+            && self.gates.get("l1").is_some_and(|gate| {
+                gate.active
+                    .as_ref()
+                    .is_some_and(|id| !gate.retired.contains(id))
+            })
+            && let Some(l1) = &self.l1
+            && l1.bid < l1.ask
+        {
+            return Some((i128::from(l1.bid) + i128::from(l1.ask)) * 5);
+        }
+        self.valid_book(key, tick)?.0.mid().map(|mid| mid.0)
     }
     fn row(&mut self, key: &Key, tick: i64) -> Result<Row> {
         if let Some(last) = self.last_tick {
@@ -808,12 +869,62 @@ impl Dvol {
     }
 }
 
+/// Five leader/follower pairs, each sampled on the one-second cross-row grid.
+#[derive(Default, Serialize, Deserialize)]
+struct LeadHistory {
+    last_tick: Option<i64>,
+    gaps: [VecDeque<Option<f64>>; 5],
+}
+impl LeadHistory {
+    fn update(&mut self, tick: i64, gaps: [Option<f64>; 5]) -> [[Option<f64>; 4]; 5] {
+        let skipped = self.last_tick.map_or(0, |last| {
+            ((tick - last) / SECOND - 1).clamp(0, 300) as usize
+        });
+        self.last_tick = Some(tick);
+        let mut values = [[None; 4]; 5];
+        for ((history, gap), values) in self.gaps.iter_mut().zip(gaps).zip(&mut values) {
+            for _ in 0..skipped {
+                if history.len() == 300 {
+                    history.pop_front();
+                }
+                history.push_back(None);
+            }
+            for (target, lag) in values[2..].iter_mut().zip([1, 5]) {
+                *target = gap
+                    .zip(history.len().checked_sub(lag).and_then(|i| history[i]))
+                    .map(|(now, past)| now - past);
+            }
+            if history.len() == 300 {
+                history.pop_front();
+            }
+            history.push_back(gap);
+            if gap.is_none() {
+                continue;
+            }
+            for (target, window) in values[..2].iter_mut().zip([60, 300]) {
+                let (sum, count) = history
+                    .iter()
+                    .rev()
+                    .take(window)
+                    .flatten()
+                    .fold((0.0, 0), |(sum, count), value| (sum + value, count + 1));
+                *target = gap
+                    .filter(|_| count >= window / 2)
+                    .map(|now| now - sum / count as f64);
+            }
+        }
+        values
+    }
+}
+
 #[derive(Default, Serialize, Deserialize)]
 pub struct Engine {
     #[serde(with = "instrument_entries")]
     instruments: BTreeMap<Key, Instrument>,
     #[serde(default)]
     dvol: BTreeMap<String, Dvol>,
+    #[serde(default)]
+    leads: BTreeMap<String, LeadHistory>,
     pub records: u64,
     pub book_breaks: u64,
     pub book_break_reasons: BTreeMap<String, u64>,
@@ -1113,6 +1224,57 @@ impl Engine {
                 mid("kraken", "spot", asset_),
                 mid("binance", "spot", asset_),
             );
+            let fast = |ex: &str, market: &str| {
+                self.instruments.iter().find_map(|(key, state)| {
+                    (key.0 == ex && key.1 == market && asset(&key.2) == Some(asset_))
+                        .then(|| state.fast_mid(key, tick))
+                        .flatten()
+                })
+            };
+            let kp = fast("kraken", "perp");
+            let ks = fast("kraken", "spot");
+            let bs = fast("binance", "spot");
+            let bp = fast("binance", "perp");
+            let gaps = [(kp, ks), (bs, ks), (bp, ks), (kp, bs), (kp, bp)].map(|(a, b)| {
+                a.zip(b)
+                    .filter(|(a, b)| *a > 0 && *b > 0)
+                    .map(|(a, b)| 10000.0 * (a as f64 / b as f64).ln())
+            });
+            let values = self
+                .leads
+                .entry(asset_.into())
+                .or_default()
+                .update(tick, gaps);
+            [
+                row.lead_kp_ks_gap_dev_60s,
+                row.lead_kp_ks_gap_dev_300s,
+                row.lead_kp_ks_gap_chg_1s,
+                row.lead_kp_ks_gap_chg_5s,
+            ] = values[0];
+            [
+                row.lead_bs_ks_gap_dev_60s,
+                row.lead_bs_ks_gap_dev_300s,
+                row.lead_bs_ks_gap_chg_1s,
+                row.lead_bs_ks_gap_chg_5s,
+            ] = values[1];
+            [
+                row.lead_bp_ks_gap_dev_60s,
+                row.lead_bp_ks_gap_dev_300s,
+                row.lead_bp_ks_gap_chg_1s,
+                row.lead_bp_ks_gap_chg_5s,
+            ] = values[2];
+            [
+                row.lead_kp_bs_gap_dev_60s,
+                row.lead_kp_bs_gap_dev_300s,
+                row.lead_kp_bs_gap_chg_1s,
+                row.lead_kp_bs_gap_chg_5s,
+            ] = values[3];
+            [
+                row.lead_kp_bp_gap_dev_60s,
+                row.lead_kp_bp_gap_dev_300s,
+                row.lead_kp_bp_gap_chg_1s,
+                row.lead_kp_bp_gap_chg_5s,
+            ] = values[4];
             if let Some(dvol) = self.dvol.get_mut(asset_) {
                 let realized = rows
                     .iter()
@@ -1166,6 +1328,397 @@ mod tests {
             json!({"data":[{"seqId":seq,"prevSeqId":prev,"checksum":0,
                 "bids":[[bid.to_string(),qty.to_string()]],"asks":[["10000","3"]]}]}),
         )
+    }
+    fn l1(market: &str, conn: &str, ns: i64, id: u64, bid: &str, ask: &str) -> Record {
+        message(
+            "binance",
+            market,
+            "l1",
+            "update",
+            conn,
+            ns,
+            json!({"u":id,"b":bid,"a":ask}),
+        )
+    }
+    fn lead_book(exchange: &str, market: &str, ns: i64, mid: i64) -> Record {
+        let bid = (mid - 1).to_string();
+        let ask = (mid + 1).to_string();
+        let payload = if exchange == "binance" {
+            json!({"lastUpdateId":1,"bids":[[bid,"1"]],"asks":[[ask,"1"]]})
+        } else {
+            let mut data = json!({"seq":ns / SECOND,"bids":[{"price":bid,"qty":"1"}],
+                "asks":[{"price":ask,"qty":"1"}]});
+            if market == "spot" {
+                let mut book = crate::Book::default();
+                book.objects(&data).unwrap();
+                data["checksum"] = json!(crate::kraken::l2_checksum(&book));
+                json!({"data":[data]})
+            } else {
+                data
+            }
+        };
+        message(exchange, market, "l2", "snapshot", "B", ns, payload)
+    }
+    #[test]
+    fn binance_l1_spot_and_futures_wrapped_and_unwrapped_exact_mid() {
+        for market in ["spot", "perp"] {
+            for wrapped in [false, true] {
+                let mut state = Instrument::default();
+                let key = ("binance".into(), market.into(), "BTCUSDT".into());
+                let mut record = l1(market, "A", SECOND, 10, "100.00000000", "102.00000001");
+                if market == "perp" || wrapped {
+                    let mut data: Value = serde_json::from_str(&record.payload).unwrap();
+                    if market == "perp" {
+                        data["e"] = json!("bookTicker");
+                        data["E"] = json!(123);
+                        data["T"] = json!(122);
+                    }
+                    record.payload = if wrapped {
+                        json!({"stream":"btcusdt@bookTicker","data":data}).to_string()
+                    } else {
+                        data.to_string()
+                    };
+                }
+                state.consume(&record, None).unwrap();
+                assert_eq!(state.fast_mid(&key, SECOND), Some(101_000_000_005));
+                assert_eq!(state.last_recv.get("l1"), Some(&i128::from(SECOND)));
+                assert!(state.row(&key, SECOND).unwrap().mid.is_none());
+            }
+        }
+    }
+    #[test]
+    fn fast_mid_falls_back_to_valid_l2_on_stale_locked_or_crossed_l1() {
+        let key = ("binance".into(), "spot".into(), "BTCUSDT".into());
+        let mut state = Instrument::default();
+        state
+            .consume(&lead_book("binance", "spot", SECOND, 100), None)
+            .unwrap();
+        assert_eq!(state.fast_mid(&key, SECOND), Some(100_000_000_000));
+        state
+            .consume(&l1("spot", "A", SECOND, 1, "109", "111"), None)
+            .unwrap();
+        assert_eq!(state.fast_mid(&key, 61 * SECOND), Some(110_000_000_000));
+        // Refresh L2 independently; L1 is now just beyond STALE_S.
+        state
+            .consume(
+                &message(
+                    "binance",
+                    "spot",
+                    "l2",
+                    "update",
+                    "B",
+                    62 * SECOND,
+                    json!({"U":2,"u":2,"b":[],"a":[]}),
+                ),
+                None,
+            )
+            .unwrap();
+        assert_eq!(state.fast_mid(&key, 62 * SECOND), Some(100_000_000_000));
+        for (id, bid, ask) in [(2, "110", "110"), (3, "111", "109")] {
+            state
+                .consume(&l1("spot", "A", 62 * SECOND, id, bid, ask), None)
+                .unwrap();
+            assert_eq!(state.fast_mid(&key, 62 * SECOND), Some(100_000_000_000));
+        }
+        state.l2.as_mut().unwrap().invalidate_malformed("B");
+        assert!(state.fast_mid(&key, 62 * SECOND).is_none());
+    }
+    #[test]
+    fn l1_connection_handover_ordering_retirement_stop_drop_and_crash() {
+        let key = ("binance".into(), "spot".into(), "BTCUSDT".into());
+        for (event, crash, carrying) in [
+            ("stop", false, "B"),
+            ("drop", false, "B"),
+            ("drop", true, "C"),
+            ("drop", true, "B"),
+        ] {
+            let mut state = Instrument::default();
+            state
+                .consume(&l1("spot", "A", SECOND, 100, "99", "101"), None)
+                .unwrap();
+            // Sequence IDs are scoped to the connection.
+            state
+                .consume(&l1("spot", "B", 2 * SECOND, 1, "109", "111"), None)
+                .unwrap();
+            for record in [
+                l1("spot", "A", 3 * SECOND, 999, "199", "201"),
+                l1("spot", "B", 4 * SECOND, 1, "199", "201"),
+                l1("spot", "B", 5 * SECOND, 0, "199", "201"),
+            ] {
+                state.consume(&record, None).unwrap();
+            }
+            assert_eq!(state.fast_mid(&key, 5 * SECOND), Some(110_000_000_000));
+            assert_eq!(state.last_recv["l1"], i128::from(2 * SECOND));
+            let mut control = message(
+                "binance",
+                "spot",
+                "l1",
+                "control",
+                "A",
+                6 * SECOND,
+                Value::Null,
+            );
+            control.event = Some("drop".into());
+            control.reason = Some("collector_crash".into());
+            state.consume(&control, None).unwrap(); // Retired crash cannot clear B.
+            assert!(state.l1.is_some());
+            control.reason = None;
+            control.event = Some("stop".into());
+            control.conn = "pending".into();
+            state.consume(&control, None).unwrap(); // Inactive stop cannot clear B.
+            assert!(state.l1.is_some());
+            control.event = Some(event.into());
+            control.reason = crash.then(|| "collector_crash".into());
+            control.conn = carrying.into();
+            state.consume(&control, None).unwrap();
+            assert!(state.l1.is_none() && !state.last_recv.contains_key("l1"));
+            assert!(state.fast_mid(&key, 6 * SECOND).is_none());
+            let conn = if crash { carrying } else { "C" };
+            state
+                .consume(&l1("spot", conn, 7 * SECOND, 1, "119", "121"), None)
+                .unwrap();
+            assert_eq!(state.fast_mid(&key, 7 * SECOND), Some(120_000_000_000));
+            state
+                .consume(&l1("spot", "A", 8 * SECOND, 1000, "199", "201"), None)
+                .unwrap();
+            assert_eq!(state.fast_mid(&key, 8 * SECOND), Some(120_000_000_000));
+        }
+    }
+    #[test]
+    fn non_binance_l1_and_okx_bbo_do_not_supply_fast_mid() {
+        for feed in ["l1", "bbo"] {
+            let mut state = Instrument::default();
+            state
+                .consume(
+                    &message(
+                        "okx",
+                        "spot",
+                        feed,
+                        "update",
+                        "A",
+                        SECOND,
+                        json!({"data":[{"bidPx":"99","askPx":"101"}]}),
+                    ),
+                    None,
+                )
+                .unwrap();
+            assert!(
+                state
+                    .fast_mid(&("okx".into(), "spot".into(), "BTC-USDT".into()), SECOND)
+                    .is_none()
+            );
+            assert!(state.l1.is_none() && !state.last_recv.contains_key("l1"));
+        }
+    }
+    #[test]
+    fn lead_history_means_changes_half_coverage_and_skipped_seconds() {
+        let mut history = LeadHistory::default();
+        for t in 0..=300 {
+            let values = history.update(t * SECOND, [Some(t as f64), None, None, None, None]);
+            assert_eq!(
+                values[0][0],
+                (t >= 29).then_some(if t < 60 { t as f64 / 2.0 } else { 29.5 })
+            );
+            assert_eq!(
+                values[0][1],
+                (t >= 149).then_some(if t < 300 { t as f64 / 2.0 } else { 149.5 })
+            );
+            assert_eq!(values[0][2], (t >= 1).then_some(1.0));
+            assert_eq!(values[0][3], (t >= 5).then_some(5.0));
+            assert_eq!(values[1..], [[None; 4]; 4]);
+        }
+        let values = history.update(302 * SECOND, [Some(302.0), None, None, None, None]);
+        assert_eq!(values[0][2..], [None, Some(5.0)]);
+        assert_eq!(history.gaps[0].len(), 300);
+        assert_eq!(history.gaps[0][298], None);
+        assert_eq!(history.update(303 * SECOND, [None; 5]), [[None; 4]; 5]);
+        let mut history = LeadHistory::default();
+        for t in 0..30 {
+            history.update(t * SECOND, [Some(t as f64); 5]);
+        }
+        let values = history.update(61 * SECOND, [Some(61.0); 5]);
+        // Only 28 previous gaps plus t=61 survive in the last 60 seconds.
+        assert_eq!(values, [[None; 4]; 5]);
+        let values = history.update(62 * SECOND, [Some(62.0); 5]);
+        assert_eq!(values[0], [None, None, Some(1.0), None]);
+        assert_eq!(
+            history.update(1000 * SECOND, [Some(1000.0); 5]),
+            [[None; 4]; 5]
+        );
+        assert!(history.gaps.iter().all(|gaps| gaps.len() == 300));
+    }
+    #[test]
+    fn cross_lead_pairs_use_fast_mids_and_only_same_asset_past_ticks() {
+        let mut engine = Engine::default();
+        let mut expected: [Vec<f64>; 5] = Default::default();
+        for t in 0..=150 {
+            for (market, mid) in [("spot", 100), ("perp", 110 + t)] {
+                engine
+                    .consume(&lead_book("kraken", market, t * SECOND, mid))
+                    .unwrap();
+            }
+            for (market, mid) in [("spot", 105 + 2 * t), ("perp", 108 + t)] {
+                engine
+                    .consume(&l1(
+                        market,
+                        "A",
+                        t * SECOND,
+                        t as u64,
+                        &(mid - 1).to_string(),
+                        &(mid + 1).to_string(),
+                    ))
+                    .unwrap();
+            }
+            let mut other = l1("spot", "A", t * SECOND, t as u64, "999", "1001");
+            other.symbol = "ETHUSDT".into();
+            engine.consume(&other).unwrap();
+            let rows = engine.tick(t * SECOND).unwrap();
+            for row in &rows {
+                let json = serde_json::to_value(row).unwrap();
+                let columns = json
+                    .as_object()
+                    .unwrap()
+                    .iter()
+                    .filter(|(name, _)| name.starts_with("lead_"))
+                    .collect::<Vec<_>>();
+                assert_eq!(columns.len(), 20);
+                if row.exchange != "cross" || row.asset == "ETH" {
+                    assert!(columns.iter().all(|(_, value)| value.is_null()));
+                }
+            }
+            let cross = rows
+                .iter()
+                .find(|row| row.exchange == "cross" && row.asset == "BTC")
+                .unwrap();
+            let json = serde_json::to_value(cross).unwrap();
+            let kp = (110 + t) as f64;
+            let bs = (105 + 2 * t) as f64;
+            let bp = (108 + t) as f64;
+            for (((pair, (a, b)), history), index) in ["kp_ks", "bs_ks", "bp_ks", "kp_bs", "kp_bp"]
+                .into_iter()
+                .zip([(kp, 100.0), (bs, 100.0), (bp, 100.0), (kp, bs), (kp, bp)])
+                .zip(&mut expected)
+                .zip(0..)
+            {
+                let gap = 10000.0 * (a / b).ln();
+                history.push(gap);
+                assert_eq!(engine.leads["BTC"].gaps[index].back(), Some(&Some(gap)));
+                for (suffix, window) in [("gap_dev_60s", 60), ("gap_dev_300s", 300)] {
+                    let values = &history[history.len().saturating_sub(window)..];
+                    let actual = json[format!("lead_{pair}_{suffix}")].as_f64();
+                    if values.len() < window / 2 {
+                        assert!(actual.is_none());
+                    } else {
+                        let mean = values.iter().sum::<f64>() / values.len() as f64;
+                        assert!((actual.unwrap() - (gap - mean)).abs() < 1e-9);
+                    }
+                }
+                for (suffix, lag) in [("gap_chg_1s", 1), ("gap_chg_5s", 5)] {
+                    let actual = json[format!("lead_{pair}_{suffix}")].as_f64();
+                    let expected = history.len().checked_sub(lag + 1).map(|i| gap - history[i]);
+                    assert_eq!(actual, expected);
+                }
+            }
+        }
+        // A missing Kraken spot leg nulls all three features targeting it.
+        let mut stop = message(
+            "kraken",
+            "spot",
+            "l2",
+            "control",
+            "B",
+            151 * SECOND,
+            Value::Null,
+        );
+        stop.event = Some("stop".into());
+        engine.consume(&stop).unwrap();
+        let mut restored: Engine =
+            serde_json::from_slice(&serde_json::to_vec(&engine).unwrap()).unwrap();
+        let rows = engine.tick(151 * SECOND).unwrap();
+        assert_eq!(
+            serde_json::to_value(&rows).unwrap(),
+            serde_json::to_value(restored.tick(151 * SECOND).unwrap()).unwrap()
+        );
+        let cross = serde_json::to_value(
+            rows.iter()
+                .find(|row| row.exchange == "cross" && row.asset == "BTC")
+                .unwrap(),
+        )
+        .unwrap();
+        for pair in ["kp_ks", "bs_ks", "bp_ks"] {
+            for suffix in ["gap_dev_60s", "gap_dev_300s", "gap_chg_1s", "gap_chg_5s"] {
+                assert!(cross[format!("lead_{pair}_{suffix}")].is_null());
+            }
+        }
+        assert!(cross["lead_kp_bs_gap_dev_60s"].as_f64().is_some());
+    }
+    #[test]
+    fn checkpoint_without_l1_and_lead_state_deserializes() {
+        let mut checkpoint = crate::session::Checkpoint::new(SECOND, BTreeMap::new());
+        checkpoint
+            .engine
+            .consume(&lead_book("binance", "spot", 0, 100))
+            .unwrap();
+        checkpoint.engine.tick(0).unwrap();
+        let mut old = serde_json::to_value(checkpoint).unwrap();
+        old["engine"].as_object_mut().unwrap().remove("leads");
+        for entry in old["engine"]["instruments"].as_array_mut().unwrap() {
+            entry[1].as_object_mut().unwrap().remove("l1");
+        }
+        let restored: crate::session::Checkpoint = serde_json::from_value(old).unwrap();
+        restored.validate().unwrap();
+        assert!(restored.engine.leads.is_empty());
+        let (key, state) = restored.engine.instruments.first_key_value().unwrap();
+        assert!(state.l1.is_none());
+        assert_eq!(state.fast_mid(key, SECOND), Some(100_000_000_000));
+    }
+    #[test]
+    fn fixture_existing_columns_are_byte_identical_with_and_without_l1() {
+        let mut records = [
+            include_str!("../../../tests/fixtures/binance/spot/l2.jsonl"),
+            include_str!("../../../tests/fixtures/binance/spot/trades.jsonl"),
+            include_str!("../../../tests/fixtures/binance/spot/l1.jsonl"),
+            include_str!("../../../tests/fixtures/binance/perp/l2.jsonl"),
+            include_str!("../../../tests/fixtures/binance/perp/trades.jsonl"),
+            include_str!("../../../tests/fixtures/binance/perp/l1.jsonl"),
+        ]
+        .into_iter()
+        .flat_map(str::lines)
+        .map(|line| Record::parse(line).unwrap())
+        .collect::<Vec<_>>();
+        records.sort_by_key(|r| r.recv_ns);
+        let start = window_tick(records[0].recv_ns, None).unwrap();
+        let end = window_tick(records.last().unwrap().recv_ns, None).unwrap() + 301 * SECOND;
+        let mut with = Engine::default();
+        let mut without = Engine::default();
+        let mut records = records.iter().peekable();
+        for tick in (start..=end).step_by(SECOND as usize) {
+            while records
+                .peek()
+                .is_some_and(|r| r.recv_ns <= i128::from(tick))
+            {
+                let record = records.next().unwrap();
+                with.consume(record).unwrap();
+                if record.feed != "l1" {
+                    without.consume(record).unwrap();
+                }
+            }
+            let old_columns = |rows: Vec<Row>| {
+                let mut json = serde_json::to_value(rows).unwrap();
+                for row in json.as_array_mut().unwrap() {
+                    row.as_object_mut()
+                        .unwrap()
+                        .retain(|name, _| !name.starts_with("lead_"));
+                }
+                serde_json::to_vec(&json).unwrap()
+            };
+            assert_eq!(
+                old_columns(with.tick(tick).unwrap()),
+                old_columns(without.tick(tick).unwrap())
+            );
+        }
+        assert!(with.instruments.values().any(|state| state.l1.is_some()));
+        assert!(with.data_anomalies.is_empty(), "{:?}", with.data_anomalies);
     }
     #[test]
     fn ofi_hook_ignores_snapshot_invalid_resync_and_overlapping_connections() {

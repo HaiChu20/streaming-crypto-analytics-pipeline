@@ -29,6 +29,7 @@ FEATURE_GROUPS = {
     'book': r'_(?:spread_bps|imbalance10|microprice_dev_bps|ask_depth10|bid_depth10|depth_(?:ask|bid)_\d+bps|book_age_ms)$',
     'positioning': r'_(?:funding_|open_interest$|oi_chg_pct_|mark_index_bps$|basis_bps_)',
     'cross': r'^cross_cross_',
+    'lead': r'_lead_',
     'quality': r'_(?:book_valid|warmup|cov_\d+s)$',
     'venue_kraken': r'^kraken_',
     'venue_binance': r'^binance_',

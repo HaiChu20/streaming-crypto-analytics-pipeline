@@ -164,3 +164,26 @@ receive metadata, maps markers to controls, and retains the original native line
 as payload. JSON decimal strings and number tokens both use exact fixed point;
 Kraken CRC32 uses their original decimal characters. See
 [replay usage](replay/README.md) and [validation](replay/VALIDATION.md).
+
+## Fast cross-venue lead features (features-v7)
+
+Binance spot and perpetual bookTicker (`l1`) quotes supply a private fast midpoint.
+Prices are parsed as exact fixed integers; the midpoint retains half an atom in
+10^-9 units. Only the active connection's increasing update IDs are accepted.
+Stop/drop and collector crashes clear its quotes. L1 uses the same 60-second
+freshness limit as L2; stale, locked, crossed or absent L1 falls back to validated
+L2. Kraken spot and perpetual fast mids use validated L2. L1 does not affect the
+existing book, flow, return, basis or mids-grid columns; OKX BBO remains unused.
+
+Each per-asset `cross` row adds 20 nullable columns: `lead_<pair>_<suffix>` for
+pairs `kp_ks`, `bs_ks`, `bp_ks`, `kp_bs`, `kp_bp` and suffixes `gap_dev_60s`,
+`gap_dev_300s`, `gap_chg_1s`, `gap_chg_5s`. Codes mean Kraken perp (`kp`), Kraken
+spot (`ks`), Binance spot (`bs`) and Binance perp (`bp`), ordered leader→follower.
+The gap is `10000 * ln(fast_mid_leader / fast_mid_follower)`. Deviations subtract
+the mean of available gaps in the last 60 or 300 one-second ticks, including the
+current tick, and require at least half that window to be covered. Changes
+subtract the exact one- or five-second lag. Missing legs or lag endpoints produce
+nulls; skipped seconds enter history as nulls. Histories retain at most 300 ticks
+per asset/pair and use only information consumed by the current tick. All 20
+columns are null on instrument rows. Research can exclude them with
+`--exclude-group lead` (or exclude all cross columns with `--exclude-group cross`).
