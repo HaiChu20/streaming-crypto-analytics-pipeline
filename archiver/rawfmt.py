@@ -40,6 +40,10 @@ def timestamp(ns: int) -> str:
 # Single source for file channel / wrapper line name. Kraken Futures line names
 # additionally distinguish snapshots using the native feed.
 CHANNELS = {
+    "coinbase": {"l2": ("book", "l2_data"), "trades": ("trades", "market_trades")},
+    "bybit": {"l1": ("bbo", "orderbook.1"), "l2": ("book", "orderbook.200"),
+              "trades": ("trades", "publicTrade"), "ticker": ("ticker", "tickers"),
+              "liquidations": ("liquidations", "allLiquidation")},
     "deribit": {"dvol": ("dvol", "dvol")},
     "binance": {"l2": ("depth", "depth"), "snapshot": ("snapshot", "snapshot"),
                 "l1": ("bookticker", "bookTicker"), "trades": ("trades", "trade"),
@@ -76,7 +80,8 @@ def path(root: Path, exchange: str, market: str, symbol: str, day: str, feed: st
     if exchange == "control":
         return root / "control" / f"{day}_control.jsonl"
     file = channel(exchange, market, feed, kind, native)[0]
-    return (root / {"binance": "Binance", "kraken": "Kraken", "okx": "OKX", "deribit": "Deribit"}[exchange]
+    return (root / {"binance": "Binance", "kraken": "Kraken", "okx": "OKX", "deribit": "Deribit",
+                    "coinbase": "Coinbase", "bybit": "Bybit"}[exchange]
             / {"spot": "Spot", "perp": "Futures", "index": "Index"}[market] / symbol.replace("/", "-") / f"{day}_{file}.jsonl")
 
 

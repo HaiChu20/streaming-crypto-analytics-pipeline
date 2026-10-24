@@ -22,6 +22,6 @@ def test_control_record():
 def test_config_maps_each_stream_to_one_partition():
     cfg = load_config()
     streams = all_streams(cfg)
-    assert len(streams) == 46
-    assert len({s.topic for s in streams}) == 23
-    assert len(stream_index(cfg)) == 46  # (topic, partition) is unique per stream
+    assert len(streams) == 66
+    assert len({s.topic for s in streams}) == 33
+    assert len(stream_index(cfg)) == 66  # (topic, partition) is unique per stream

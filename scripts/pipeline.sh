@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Start/stop the phase 1 pipeline on this Mac: 4 collectors + raw recorder (Kafka runs in Docker).
+# Start/stop the phase 1 pipeline on this Mac: 6 collectors + raw recorder (Kafka runs in Docker).
 #
 #   scripts/pipeline.sh start | stop | status | rotate | restart <name>
 #
@@ -8,7 +8,7 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 PY=.venv/bin/python
-NAMES=(binance okx kraken deribit recorder)
+NAMES=(binance okx kraken coinbase bybit deribit recorder)
 # Resolve .env through the same loader as collectors; print only the enable flag.
 if [[ -n "${INFERENCE_MODEL_VERSION:-}" ]] || [[ "$("$PY" -c 'from collectors.common import config; import os; print("enabled" if os.environ.get("INFERENCE_MODEL_VERSION") else "")')" == enabled ]]; then
   NAMES+=(inference)
@@ -85,7 +85,7 @@ case "${1:-}" in
     done
     ;;
   rotate)
-    for name in binance okx kraken deribit; do
+    for name in binance okx kraken coinbase bybit deribit; do
       if alive "$name"; then kill -HUP "$(cat "data/state/$name.pid")"; echo "rotating $name"; fi
     done
     ;;

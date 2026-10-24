@@ -28,6 +28,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from archiver import rawfmt  # noqa: E402
 from archiver.record_raw import OPEN  # noqa: E402
 from collectors.binance import PerpDepthSync, SpotDepthSync  # noqa: E402
+from collectors.bybit import BookSeq as BybitBookSeq  # noqa: E402
 from collectors.common.config import Stream, all_streams, connections, data_dir, load_config  # noqa: E402
 from collectors.kraken import L2Book, L3Book, L3TimestampError, _decimal_json  # noqa: E402
 from collectors.okx import BookSeq  # noqa: E402
@@ -39,6 +40,11 @@ def trade_ids(stream: Stream, payload: dict) -> list:
         return [data["a"] if stream.feed == "trades_agg" else data["t"]]
     if stream.exchange == "okx":
         return [t["tradeId"] for t in payload["data"]]
+    if stream.exchange == "coinbase":
+        return [t["trade_id"] for event in payload["events"] for t in event.get("trades", [])
+                if t["product_id"] == stream.symbol]
+    if stream.exchange == "bybit":
+        return [t["i"] for t in payload["data"] if t["s"] == stream.symbol]
     if stream.market == "perp":  # kraken futures
         return [t["uid"] for t in payload.get("trades", [payload])]
     return [t["trade_id"] for t in payload["data"]]
@@ -77,6 +83,36 @@ class BookCheck:
             elif self.state is not None and not self.state.on_update(book["prevSeqId"], book["seqId"]):
                 return f"seqId break prev={book['prevSeqId']} last={self.state.last}"
             return None
+        if s.exchange == "coinbase":
+            p = payload_text if isinstance(payload_text, dict) else orjson.loads(payload_text)
+            seq = p["sequence_num"]
+            if self.state is not None and seq <= self.state:
+                return f"sequence_num regression {self.state} -> {seq}"
+            self.state = seq
+            # Other products/channels, subscriptions and heartbeats share this sequence.
+            # Per-file gaps are expected; adjacency is checked on every frame by the collector.
+            for event in p["events"]:
+                if event.get("product_id") != s.symbol:
+                    continue
+                if event["type"] == "snapshot":
+                    self.synced = True
+                elif not self.synced:
+                    return "book update before first snapshot"
+            return None
+        if s.exchange == "bybit":
+            p = payload_text if isinstance(payload_text, dict) else orjson.loads(payload_text)
+            book = p["data"]
+            if self.state is None:
+                self.state = BybitBookSeq()
+            previous = self.state.last_u, self.state.last_seq
+            if s.feed == "l1":
+                valid = p["type"] == "snapshot" and self.state.on_l1(book["u"], book["seq"])
+            elif p["type"] == "snapshot":
+                self.state.on_snapshot(book["u"], book["seq"])
+                return None
+            else:
+                valid = self.state.on_update(book["u"], book["seq"])
+            return None if valid else f"update-id break u/seq={previous} -> {(book['u'], book['seq'])}"
         if s.market == "perp":  # kraken futures
             seq = (payload_text if isinstance(payload_text, dict) else orjson.loads(payload_text))["seq"]
             if kind != "snapshot" and self.state is not None and seq != self.state + 1:
@@ -144,6 +180,12 @@ def disk_record(rec: dict, stream: Stream) -> dict:
         return dict(kind="raw", payload=None, conn=conn, offset=offset)
     snapshot = (rec.get("channel") == "snapshot" or payload.get("type") == "snapshot"
                 or payload.get("action") == "snapshot" or payload.get("feed") in ("book_snapshot", "trade_snapshot"))
+    if stream.exchange == "coinbase":
+        snapshot = any(event.get("type") == "snapshot" and (
+            event.get("product_id") == stream.symbol or any(t["product_id"] == stream.symbol for t in event.get("trades", [])))
+            for event in payload.get("events", []))
+    if stream.exchange == "bybit" and stream.feed == "trades":
+        snapshot = False  # publicTrade calls every realtime batch a snapshot
     return dict(kind="snapshot" if snapshot else "update", payload=payload, conn=conn, offset=offset,
                 event=rec.get("event"))
 
@@ -224,7 +266,7 @@ def check_stream(stream: Stream, paths: list[Path], depth: int | None, deep: boo
             r["events"]["periodic_snapshot"] += 1
         if not deep or rec["kind"] == "raw":
             continue
-        if stream.is_book and conn not in broken:
+        if (stream.is_book or stream.exchange == "bybit" and stream.feed == "l1") and conn not in broken:
             check = binance_check if stream.exchange == "binance" else books.get(conn)
             if check is None:
                 check = books[conn] = BookCheck(stream, depth)

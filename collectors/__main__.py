@@ -1,6 +1,6 @@
 """Run one exchange's collectors until SIGINT/SIGTERM.
 
-    uv run python -m collectors binance|okx|kraken|deribit
+    uv run python -m collectors binance|okx|kraken|coinbase|bybit|deribit
 
 SIGHUP replaces every connection make-before-break (same procedure as the midnight rotation).
 """
@@ -11,13 +11,14 @@ import logging
 import signal
 import time
 
-from collectors import binance, deribit, kraken, okx
+from collectors import binance, bybit, coinbase, deribit, kraken, okx
 from collectors.common.config import data_dir, kafka_bootstrap, load_config
 from collectors.common.runner import run_exchange
 from collectors.common.session import Session
 from collectors.common.sinks import KafkaSink
 
-HANDLERS = {"binance": binance.handler_for, "okx": okx.handler_for, "kraken": kraken.handler_for}
+HANDLERS = {"binance": binance.handler_for, "okx": okx.handler_for, "kraken": kraken.handler_for,
+            "coinbase": coinbase.handler_for, "bybit": bybit.handler_for}
 
 
 def setup_logging() -> None:

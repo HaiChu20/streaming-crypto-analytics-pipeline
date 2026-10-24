@@ -94,6 +94,7 @@ class FixtureSink:
         self.bytes: dict[str, int] = {}
         self.total: dict[str, int] = {}
         self.events: dict[str, list[tuple[str, str | None]]] = {}
+        self.initial_snapshot_bytes: dict[str, int] = {}
         self.lost: set[str] = set()
         self._files: dict[Path, object] = {}
 
@@ -103,6 +104,8 @@ class FixtureSink:
             record = orjson.loads(value)
             self.events.setdefault(key, []).append((record["event"], record.get("reason")))
         else:
+            if key not in self.total and orjson.loads(value)["kind"] == "snapshot":
+                self.initial_snapshot_bytes[key] = len(value)
             self.total[key] = self.total.get(key, 0) + 1
             self.bytes[key] = self.bytes.get(key, 0) + len(value)
         if self.counts.get(key, 0) < self.limit:

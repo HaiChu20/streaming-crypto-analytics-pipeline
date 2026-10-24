@@ -13,7 +13,7 @@ kafka:
 
 rotation:
   # Make-before-break replacement just after 00:00 UTC, staggered per exchange (seconds).
-  stagger_s: {binance: 2, okx: 4, kraken: 6}
+  stagger_s: {binance: 2, okx: 4, kraken: 6, coinbase: 8, bybit: 10}
   ready_timeout_s: 30
   # Replace before Binance's 24h connection limit.
   max_age_h: {binance: 23}
@@ -78,6 +78,28 @@ exchanges:
         futures:
           url: wss://futures.kraken.com/ws/v1
           feeds: {l2: book, trades: trade, ticker: ticker}
+
+  coinbase:
+    spot:
+      symbols: {BTC: BTC-USD, ETH: ETH-USD}
+      connections:
+        public:
+          url: wss://advanced-trade-ws.coinbase.com
+          feeds: {l2: level2, trades: market_trades}
+
+  bybit:
+    spot:
+      symbols: {BTC: BTCUSDT, ETH: ETHUSDT}
+      connections:
+        public:
+          url: wss://stream.bybit.com/v5/public/spot
+          feeds: {l1: orderbook.1, l2: orderbook.200, trades: publicTrade}
+    perp:
+      symbols: {BTC: BTCUSDT, ETH: ETHUSDT}
+      connections:
+        public:
+          url: wss://stream.bybit.com/v5/public/linear
+          feeds: {l1: orderbook.1, l2: orderbook.200, trades: publicTrade, ticker: tickers, liquidations: allLiquidation}
 
   deribit:
     index:

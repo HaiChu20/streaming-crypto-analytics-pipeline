@@ -18,11 +18,13 @@ FILENAME = re.compile(r'(\d{8})_([a-z0-9]+)\.jsonl(?:\.(gz|open))?$')
 
 
 def channels(exchange, market):
-    # Same channel acceptance as engine/replay/src/input.rs::channel_feed.
+    # Recorder channels; Coinbase/Bybit engine replay support is a separate task.
     return ({'deribit': {'dvol'} if market == 'index' else set(),
              'binance': {'depth', 'snapshot', 'bookticker', 'trades'} |
                         ({'aggtrades', 'markprice', 'forceorder'} if market == 'perp' else set()),
              'okx': {'book', 'bbo', 'trades', 'tradesall'},
+             'coinbase': {'book', 'trades'} if market == 'spot' else set(),
+             'bybit': {'bbo', 'book', 'trades'} | ({'ticker', 'liquidations'} if market == 'perp' else set()),
              'kraken': {'book', 'trades'} | ({'level3'} if market == 'spot' else {'ticker'} if market == 'perp' else set())}
             .get(exchange, set()))
 

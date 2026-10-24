@@ -1,16 +1,29 @@
 # BTC/ETH market data pipeline
 
-Collects BTC and ETH **spot + perpetual** market data from Kraken, Binance and OKX. Every message passes through Kafka to a replayable raw archive on local disk: one JSONL file per channel per symbol per UTC day. Later phases add an S3 daily archive, a Rust feature engine, a dashboard, and 15/30-minute return models.
+Collects BTC and ETH **spot + perpetual** market data from Kraken, Binance, OKX and Bybit, plus **Coinbase spot**. Every message passes through Kafka to a replayable raw archive on local disk: one JSONL file per channel per symbol per UTC day. Later phases add an S3 daily archive, a Rust feature engine, a dashboard, and 15/30-minute return models.
 
 - **Plan / architecture:** [plan.md](plan.md), the only plan.
 - **Progress:** [STATUS.md](STATUS.md).
 
 ## What is collected
 
-| | Kraken | Binance | OKX |
-|---|---|---|---|
-| Spot | BTC/USD, ETH/USD: L2 `book`, L3 `level3`, `trade` | BTCUSDT, ETHUSDT: `bookTicker`, `depth@100ms` + REST snapshot, `trade` | BTC-USDT, ETH-USDT: `bbo-tbt`, `books`, `trades-all` |
-| Perp | PF_XBTUSD, PF_ETHUSD: `book`, `trade`, `ticker` | BTCUSDT, ETHUSDT: `bookTicker`, `depth@100ms` + REST snapshot, `trade`, `aggTrade`, `markPrice@1s`, `forceOrder` | -SWAP: `bbo-tbt`, `books`, `trades`, `trades-all` |
+| | Kraken | Binance | OKX | Coinbase | Bybit |
+|---|---|---|---|---|---|
+| Spot | BTC/USD, ETH/USD: L2 `book`, L3 `level3`, `trade` | BTCUSDT, ETHUSDT: `bookTicker`, `depth@100ms` + REST snapshot, `trade` | BTC-USDT, ETH-USDT: `bbo-tbt`, `books`, `trades-all` | BTC-USD, ETH-USD: `level2`, `market_trades` | BTCUSDT, ETHUSDT: `orderbook.1`, `orderbook.200`, `publicTrade` |
+| Perp | PF_XBTUSD, PF_ETHUSD: `book`, `trade`, `ticker` | BTCUSDT, ETHUSDT: `bookTicker`, `depth@100ms` + REST snapshot, `trade`, `aggTrade`, `markPrice@1s`, `forceOrder` | -SWAP: `bbo-tbt`, `books`, `trades`, `trades-all` | — | BTCUSDT, ETHUSDT linear: `orderbook.1`, `orderbook.200`, `publicTrade`, `tickers`, `allLiquidation` |
+
+Coinbase checks connection-wide `sequence_num` on all frames, including subscriptions and
+heartbeats; per-file checks require a snapshot and increasing sequence numbers because
+other products/channels leave expected holes. Bybit depth-200 deltas require `u = previous u + 1`
+(observed on spot and linear), with increasing cross-sequence `seq`; every snapshot resets
+state. L1 snapshots may repeat unchanged IDs. Gaps use the shared throttled reconnect path.
+Protocol references: [Coinbase public channels](https://docs.cdp.coinbase.com/coinbase-app/advanced-trade-apis/websocket/websocket-endpoints),
+[Coinbase subscription deadline](https://docs.cdp.coinbase.com/coinbase-app/advanced-trade-apis/websocket/websocket-overview),
+[Bybit orderbooks](https://bybit-exchange.github.io/docs/v5/websocket/public/orderbook) and
+[Bybit connection/keepalive limits](https://bybit-exchange.github.io/docs/v5/ws/connect).
+Both exchanges use public endpoints without keys. Coinbase subscribes to heartbeats;
+Bybit sends an application ping every 20 seconds. The linked public WebSocket docs specify no fixed
+connection lifetime, so the usual daily rotation applies.
 
 Each message is wrapped with our local receive time (`recv_ns`) and stored byte-for-byte. Connection `start` / `stop` / `drop` events are written in-band, next to the data they affect.
 
@@ -22,19 +35,19 @@ Requires Docker Desktop and [uv](https://docs.astral.sh/uv/); uv installs Python
 uv sync                                                  # dependencies
 cp .env.example .env                                     # add the Kraken key (only needed for L3)
 docker compose -f docker/kafka/docker-compose.yml up -d  # Kafka on localhost:9092, UI on :8080
-uv run python scripts/create_topics.py                   # 23 raw topics, 2 partitions each
-scripts/pipeline.sh start                                # 4 collectors + recorder
+uv run python scripts/create_topics.py                   # 33 raw topics, 2 partitions each
+scripts/pipeline.sh start                                # 6 collectors + recorder
 scripts/pipeline.sh status                               # stop | rotate (make-before-break reconnect)
 uv run python scripts/check_raw.py                       # data-quality report on data/raw
 ```
 
 **Other commands:**
-- `uv run python scripts/probe_feeds.py --seconds 60`: subscribes to every feed without Kafka, saves test fixtures, and prints rates and GiB/day.
+- `uv run python scripts/probe_feeds.py --seconds 60 --fixtures .pytest-tmp/probe --summary .pytest-tmp/probe-summary.json`: subscribes without Kafka, refuses to overwrite existing fixtures, and prints steady rates and estimated GB/day (initial snapshots excluded; one daily rotation snapshot added). Gzip estimates use retained frame samples.
 - `uv run pytest`: unit tests.
 
 Raw disk files use **v3**, matching the user's archive:
 `data/raw/<Exchange>/<Spot|Futures|Index>/<Pair>/<YYYYMMDD>_<channel>.jsonl`.
-Binance, OKX and Kraken Futures wrap the native message in `data`; Kraken spot
+Binance, OKX, Coinbase, Bybit and Kraken Futures wrap the native message in `data`; Kraken spot
 inserts metadata into the native message. Decimals are exact strings. Our files
 add `conn` and Kafka `offset`; readers also accept archive files without them and
 case-insensitive directory prefixes such as `KrakenRaw/Futurev6`.
@@ -111,7 +124,7 @@ terraform -chdir=infra/terraform test
 ## Layout
 
 ```text
-collectors/        exchange collectors: binance.py, okx.py, kraken.py, deribit.py; common/ (config, envelope, sinks, runner)
+collectors/        exchange collectors: binance.py, okx.py, kraken.py, coinbase.py, bybit.py, deribit.py; common/ (config, envelope, sinks, runner)
 archiver/          record_raw.py + rawfmt.py: Kafka → data/raw/<Exchange>/<Market>/<Pair>/<YYYYMMDD>_<channel>.jsonl
 config/            markets.yaml: exchanges, symbols, feeds, partitions, rotation
 scripts/           create_topics.py, probe_feeds.py, convert_raw.py, check_raw.py, pipeline.sh
