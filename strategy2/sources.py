@@ -47,7 +47,8 @@ def _csv(path):
             raise ValueError(f'{path}: expected one CSV')
         with archive.open(names[0]) as source:
             try:
-                return pl.read_csv(source, infer_schema_length=10000)
+                # Binance writes some unknown metrics as quoted empty strings.
+                return pl.read_csv(source, infer_schema_length=10000, null_values=[''])
             except pl.exceptions.NoDataError:
                 return pl.DataFrame()
 

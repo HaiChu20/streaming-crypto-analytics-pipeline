@@ -12,7 +12,7 @@ from strategy2.bars import MINUTE_MS, load_bars
 from strategy2.baselines import join_baselines
 from strategy2.dataset import TARGETS, build_dataset
 from strategy2.features import FEATURE_GROUPS, build_features
-from strategy2.sources import BANDS, HOUR_MS, METRICS, load_depth, load_funding, load_sources
+from strategy2.sources import BANDS, HOUR_MS, METRICS, load_depth, load_funding, load_metrics, load_sources
 
 START = 1767225600000  # 2026-01-01 UTC
 END = START + 2 * 1440 * MINUTE_MS
@@ -119,6 +119,17 @@ def test_funding_rest_union_and_conflict(history):
     write(.01)
     with pytest.raises(ValueError, match='conflicting duplicate funding'):
         load_funding(history, 'BTC', START, END)
+
+
+def test_metrics_quoted_empty_values_are_null(tmp_path):
+    path = tmp_path / 'binance/futures/um/daily/metrics/BTCUSDT/BTCUSDT-metrics-2026-01-01.zip'
+    path.parent.mkdir(parents=True)
+    with ZipFile(path, 'w') as archive:
+        archive.writestr('rows.csv', 'create_time,symbol,' + ','.join(METRICS) + '\n'
+                         '2026-01-01 00:05:00,BTCUSDT,1,2,"","",3,4\n')
+    result = load_metrics(tmp_path, 'BTC', START, END)
+    assert result['sum_open_interest'][0] == 1
+    assert result['count_toptrader_long_short_ratio'][0] is None
 
 
 def test_partial_and_empty_depth(tmp_path):
