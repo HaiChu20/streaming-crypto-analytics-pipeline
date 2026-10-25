@@ -20,7 +20,8 @@ from research.calendar import Calendar, verify_calendar
 from research.dataset import (FEATURE_GROUPS, build_matrix, feature_dates, feature_paths,
                               read_features, select_features, validate_replay_modes)
 from research.fitting import fit_booster, inner_split, parse_params, shrinkage_coefficient
-from research.labels import NS, load_spec, make_labels, momentum_return, reference_for, reference_present
+from research.labels import (NS, barrier_pct_for, load_spec, make_labels, momentum_return,
+                             reference_for, reference_present)
 from research.risk import (PARAMS as STOP_PARAMS, STOP_NAMES, evaluate_stops, fit_stop_models,
                            pinball_losses, predict_stops, stop_metrics)
 from research.evaluation import (DAY_NS, date_split, feature_array, memory_estimate,
@@ -155,7 +156,7 @@ def average_ranks(values):
     return ranks
 
 
-def metrics(actual, predicted, predicted_direction=None) -> dict:
+def metrics(actual, predicted, predicted_direction=None, actual_direction=None) -> dict:
     actual, predicted = np.asarray(actual), np.asarray(predicted)
     keep = np.isfinite(actual) & np.isfinite(predicted)
     y, p = actual[keep], predicted[keep]
@@ -166,10 +167,11 @@ def metrics(actual, predicted, predicted_direction=None) -> dict:
     error = p - y
     result.update(mae=float(np.mean(np.abs(error))), rmse=float(np.sqrt(np.mean(error ** 2))))
     direction = np.sign(p) if predicted_direction is None else np.asarray(predicted_direction)[keep]
-    nonflat = y != 0
+    actual_direction = np.sign(y) if actual_direction is None else np.asarray(actual_direction)[keep]
+    nonflat = actual_direction != 0
     result["directional_n"] = int(nonflat.sum())
     if nonflat.any():
-        result["directional_accuracy"] = float(np.mean(direction[nonflat] == np.sign(y[nonflat])))
+        result["directional_accuracy"] = float(np.mean(direction[nonflat] == actual_direction[nonflat]))
     if len(y) > 1:
         a, b = average_ranks(y), average_ranks(p)
         a, b = a - a.mean(), b - b.mean()
@@ -222,18 +224,20 @@ def regime_assignments(ticks, rv, edges):
             'day_phase': (ticks % DAY_NS >= 3600 * NS).astype(np.int8)}
 
 
-def forecast_metrics(actual, predictions, probabilities):
-    """Return metrics stay unchanged; class probabilities add proper scores."""
+def forecast_metrics(actual, predictions, probabilities, directions=None):
+    """Score exit returns and explicit classes (legacy default: return signs)."""
+    directions = np.sign(actual) if directions is None else np.asarray(directions)
     result = {}
     for name, prediction in predictions.items():
         probs = probabilities.get(name)
-        result[name] = metrics(actual, prediction, np.argmax(probs, axis=1) - 1 if probs is not None else None)
+        result[name] = metrics(actual, prediction,
+                               np.argmax(probs, axis=1) - 1 if probs is not None else None, directions)
         if probs is not None:
-            result[name].update(probability_scores(np.sign(actual), probs))
+            result[name].update(probability_scores(directions, probs))
     return result
 
 
-def direction_regimes(actuals, predictions, probabilities, regimes):
+def direction_regimes(actuals, predictions, probabilities, regimes, directions=None):
     result = {}
     for axis, labels in {'volatility_tercile': ['low', 'medium', 'high'],
                          'utc_hour_4h': ['00–04', '04–08', '08–12', '12–16', '16–20', '20–24'],
@@ -241,7 +245,8 @@ def direction_regimes(actuals, predictions, probabilities, regimes):
         groups = regimes[axis]
         result[axis] = {label: forecast_metrics(actuals[groups == i],
                            {name: values[groups == i] for name, values in predictions.items()},
-                           {name: values[groups == i] for name, values in probabilities.items()})
+                           {name: values[groups == i] for name, values in probabilities.items()},
+                           directions[groups == i] if directions is not None else None)
                        for i, label in enumerate(labels)}
     return result
 
@@ -336,6 +341,9 @@ def train_target(rows: pl.DataFrame, target: str, horizon_s: int, output_root: s
                'selective': {'status': 'unavailable', 'reason': 'no held-out predictions'},
                'confidence_thresholds': None,
                "labeled_rows": 0, "matrix_rows": 0}
+    barrier_pct = barrier_pct_for(horizon_s, spec)
+    if barrier_pct is not None:
+        skipped["barrier_pct"] = barrier_pct
     if not reference_present(rows, target, spec):
         return dict(skipped, reason="not enough labeled rows: no development reference rows" if split["development"] is None
                     else "reference instrument has no rows in input")
@@ -422,7 +430,7 @@ def train_target(rows: pl.DataFrame, target: str, horizon_s: int, output_root: s
         if shrinkage is not None:
             predictions['regressor_shrunk'] = predictions['regressor'] * shrinkage['coefficient']
         class_probs = {'classifier': probabilities, 'prior': prior}
-        fold_metrics = forecast_metrics(y[test], predictions, class_probs)
+        fold_metrics = forecast_metrics(y[test], predictions, class_probs, directions[test])
         edges = volatility_edges(rv[train])
         regimes = regime_assignments(ticks[test], rv[test], edges)
         saved = {"regressor": predictions['regressor'], 'classifier_expected': predictions['classifier'],
@@ -462,7 +470,8 @@ def train_target(rows: pl.DataFrame, target: str, horizon_s: int, output_root: s
                 shuffle_probs = shuffled_clf.predict(x[test], num_threads=num_threads)
                 shuffle_predictions = {'regressor': shuffled_reg.predict(x[test], num_threads=num_threads),
                                        'classifier': shuffle_probs @ means}
-                results[-1]['shuffle_test'] = forecast_metrics(y[test], shuffle_predictions, {'classifier': shuffle_probs})
+                results[-1]['shuffle_test'] = forecast_metrics(
+                    y[test], shuffle_predictions, {'classifier': shuffle_probs}, directions[test])
             saved.update({'shuffle_regressor': shuffle_predictions['regressor'],
                           'shuffle_classifier_expected': shuffle_predictions['classifier'],
                           **{'shuffle_p_' + name: shuffle_probs[:, j] for j, name in enumerate(('down', 'flat', 'up'))}})
@@ -475,10 +484,11 @@ def train_target(rows: pl.DataFrame, target: str, horizon_s: int, output_root: s
     oof = pl.concat(oof_frames, rechunk=False)
     del oof_frames, stop_oof
     actuals = oof['return_pct'].to_numpy()
+    oof_directions = oof['direction'].to_numpy()
     predictions, probabilities = oof_forecasts(oof)
-    summary = forecast_metrics(actuals, predictions, probabilities)
+    summary = forecast_metrics(actuals, predictions, probabilities, oof_directions)
     regime_summary = direction_regimes(actuals, predictions, probabilities,
-                                       {axis: oof[axis].to_numpy() for axis in regimes})
+                                       {axis: oof[axis].to_numpy() for axis in regimes}, oof_directions)
     bootstrap = bootstrap_comparisons(oof)
     calibrated = [fold['confidence_thresholds'] is not None for fold in results]
     selective = selective_metrics(oof, 'available' if all(calibrated) else
@@ -491,7 +501,7 @@ def train_target(rows: pl.DataFrame, target: str, horizon_s: int, output_root: s
         effective_days = len(np.unique(oof['tick_ns'].to_numpy()[np.isfinite(shuffled_predictions['classifier'])] // DAY_NS))
         shuffle_summary = {name: leak_check_metrics(dict(value, effective_days=effective_days))
                            for name, value in forecast_metrics(actuals, shuffled_predictions,
-                                                              {'classifier': shuffled_probs}).items()}
+                                                              {'classifier': shuffled_probs}, oof_directions).items()}
     final_start = 0 if lower is None else int(np.searchsorted(ticks, lower))
     all_rows = np.arange(final_start, len(x))
     final_x, final_y, final_directions = x[final_start:], y[final_start:], directions[final_start:]
@@ -582,6 +592,10 @@ def train_target(rows: pl.DataFrame, target: str, horizon_s: int, output_root: s
                    "These metrics are not trading P&L; no fees/spread/funding execution backtest.",
         "model_dir": str(directory.resolve()),
     }
+    if barrier_pct is not None:
+        report["barrier_pct"] = barrier_pct
+        report["metric_notes"] = report["metric_notes"].replace(
+            "accuracy excludes actual flats", 'accuracy excludes "no touch" (flat) rows')
     if calendar:
         report["calendar"] = calendar.metadata(int(ticks[-1]))
     (directory / "metadata.json").write_text(json.dumps(report, indent=2, allow_nan=False) + "\n")
@@ -708,7 +722,7 @@ def open_lockbox(rows, output, version, targets=None, horizons=None, acknowledge
                 if 'classifier_class_prior' in report:
                     class_probs['prior'] = np.tile(report['classifier_class_prior'], (len(x), 1))
                     predictions['prior'] = class_probs['prior'] @ report['classifier_class_mean_returns']
-                measured = forecast_metrics(y, predictions, class_probs)
+                measured = forecast_metrics(y, predictions, class_probs, data['direction'].to_numpy())
                 ref = reference_for(report['target'], spec)
                 rv_col = f"{ref['exchange']}_{ref['market']}_rv_300s"
                 rv = data[rv_col].to_numpy() if rv_col in data.columns else np.full(len(x), np.nan)
@@ -758,7 +772,7 @@ def open_lockbox(rows, output, version, targets=None, horizons=None, acknowledge
                     'entry_delay_s': report.get('entry_delay_s', 0),
                     'num_threads': num_threads,
                     'flat_labels': int((data['direction'] == 0).sum()),
-                    'regimes': direction_regimes(y, predictions, class_probs, regimes),
+                    'regimes': direction_regimes(y, predictions, class_probs, regimes, data['direction'].to_numpy()),
                     'notes': 'Saved models only; no refit or tuning; baseline calibration frozen on development.'}
                 outcomes[f"{report['target']}/{h}"] = report['lockbox_results']
                 (directory / 'metadata.json').write_text(json.dumps(report, indent=2, allow_nan=False) + '\n')
@@ -847,7 +861,7 @@ def main(argv=None):
     parser.add_argument('--label-spec', type=Path, default=Path(__file__).with_name('targets.yaml'))
     parser.add_argument('--train-from', help='Earliest UTC training day; test folds are unchanged')
     parser.add_argument('--target', action='append', choices=['BTC_spot', 'BTC_perp', 'ETH_spot', 'ETH_perp'])
-    parser.add_argument('--horizon-s', action='append', type=int, choices=[60, 120, 300, 900, 1800])
+    parser.add_argument('--horizon-s', action='append', type=int)
     parser.add_argument('--threads', type=int, default=available_cpus(),
                         help='LightGBM CPU threads; defaults to the CPUs available to this process')
     parser.add_argument('--stride-s', type=int, default=10)

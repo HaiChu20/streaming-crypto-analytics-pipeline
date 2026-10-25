@@ -39,15 +39,16 @@ def selective_metrics(frame, status):
         return {'status': status, 'reason': 'requires early stopping with inner-validation predictions'}
     ticks = frame['tick_ns'].to_numpy()
     y = frame['return_pct'].to_numpy()
+    directions = frame['direction'].to_numpy() if 'direction' in frame.columns else np.sign(y)
     difference = frame['p_up_minus_down'].to_numpy()
     reversal = frame['reversal'].to_numpy()
     levels = {}
     for q in CONFIDENCE_LEVELS:
         selected = frame[f'selected_q{q}'].to_numpy()
-        paired = (selected & np.isfinite(y) & (y != 0) & np.isfinite(difference)
+        paired = (selected & np.isfinite(y) & (directions != 0) & np.isfinite(difference)
                   & np.isfinite(reversal))
-        model_correct = np.sign(difference) == np.sign(y)
-        reversal_correct = np.sign(reversal) == np.sign(y)
+        model_correct = np.sign(difference) == directions
+        reversal_correct = np.sign(reversal) == directions
         # NaNs give empty days zero counts without dropping them from the day grid.
         scores = np.where(paired, model_correct.astype(float) - reversal_correct, np.nan)
         levels[str(q)] = {
