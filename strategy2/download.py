@@ -1,8 +1,8 @@
 """Download checksummed, resumable public history, with inclusive UTC dates.
 
 Dataset names: perp_klines, spot_klines, premium_index, funding_rate, metrics,
-book_depth, dvol, coinbase_klines. Monthly archives can contain dates before
---from. A partial final month uses daily klines/premium archives and REST funding
+book_depth, dvol, coinbase_klines, aggflow (opt-in). Monthly archives can contain
+dates before --from. A partial final month uses daily klines/premium archives and REST funding
 snapshots. Coinbase uses five requests per fully past UTC day.
 REST CSVs have local checksums plus range metadata. Partial DVOL snapshots can
 only be replaced by strict supersets with unchanged overlapping values. Expanding
@@ -20,14 +20,14 @@ from decimal import Decimal, InvalidOperation
 import fcntl
 import hashlib
 import json
-from io import StringIO
+from io import BytesIO, StringIO
 import os
 from pathlib import Path
 import re
 import sys
 import tempfile
 import time
-from threading import Lock
+from threading import BoundedSemaphore, Lock
 
 import httpx
 
@@ -37,8 +37,13 @@ COINBASE = "https://api.exchange.coinbase.com/products/{coin}-USD/candles"
 DERIBIT = "https://www.deribit.com/api/v2/public/get_volatility_index_data"
 USER_AGENT = "strategy2-public-history/1.0"
 COINS = ("BTC", "ETH", "SOL", "XRP", "DOGE")
+EXTRA_COINS = ("BNB", "ADA", "LINK", "AVAX", "LTC", "TRX", "DOT", "BCH", "ETC", "NEAR")
+ALL_COINS = COINS + EXTRA_COINS
+COINBASE_UNAVAILABLE = ("BNB", "TRX")
 DATASETS = ("perp_klines", "spot_klines", "premium_index", "funding_rate",
             "metrics", "book_depth", "dvol", "coinbase_klines")
+# Preserve the original default selection; large trade archives are opt-in.
+ALL_DATASETS = DATASETS + ("aggflow",)
 HOUR_MS = 3_600_000
 COVERAGE_FIELDS = ("dataset", "coin", "period", "url", "status", "bytes", "error", "missing_hours")
 
@@ -97,16 +102,18 @@ def plan_downloads(start: date, end: date, coins=COINS, datasets=DATASETS) -> li
     """Plan one coverage row per source archive/month, without network or disk I/O."""
     if end < start:
         raise ValueError("--to must be on or after --from")
-    if not coins or set(coins) - set(COINS):
-        raise ValueError(f"coins must be selected from {','.join(COINS)}")
-    if not datasets or set(datasets) - set(DATASETS):
-        raise ValueError(f"datasets must be selected from {','.join(DATASETS)}")
+    if not coins or set(coins) - set(ALL_COINS):
+        raise ValueError(f"coins must be selected from {','.join(ALL_COINS)}")
+    if not datasets or set(datasets) - set(ALL_DATASETS):
+        raise ValueError(f"datasets must be selected from {','.join(ALL_DATASETS)}")
     result = []
     for dataset in dict.fromkeys(datasets):
         for coin in dict.fromkeys(coins):
             if dataset == "dvol" and coin not in ("BTC", "ETH"):
                 continue
             if dataset == "coinbase_klines":
+                if coin in COINBASE_UNAVAILABLE:
+                    continue
                 day = start
                 today = datetime.now(timezone.utc).date()
                 while day <= end and day < today:
@@ -121,7 +128,7 @@ def plan_downloads(start: date, end: date, coins=COINS, datasets=DATASETS) -> li
                 following = _next_month(month)
                 first, last = max(start, month), min(end, following - timedelta(days=1))
                 monthly = (
-                    dataset in ("perp_klines", "spot_klines", "premium_index", "funding_rate")
+                    dataset in ("perp_klines", "spot_klines", "premium_index", "funding_rate", "aggflow")
                     and following <= end + timedelta(days=1))
                 if dataset == "dvol":
                     lower, upper = _ms(first), _ms(last + timedelta(days=1))
@@ -148,9 +155,11 @@ def plan_downloads(start: date, end: date, coins=COINS, datasets=DATASETS) -> li
                             path = f"{venue}/{cadence}/{kind}/{symbol}/1m/{symbol}-1m-{period}.zip"
                         else:
                             kind = {"funding_rate": "fundingRate", "metrics": "metrics",
-                                    "book_depth": "bookDepth"}[dataset]
+                                    "book_depth": "bookDepth", "aggflow": "aggTrades"}[dataset]
                             path = f"futures/um/{cadence}/{kind}/{symbol}/{symbol}-{kind}-{period}.zip"
-                        result.append(Download(dataset, coin, period, BINANCE + path, "binance/" + path))
+                        destination = (f"binance/aggflow/{coin}/{period}.parquet"
+                                       if dataset == "aggflow" else "binance/" + path)
+                        result.append(Download(dataset, coin, period, BINANCE + path, destination))
                         if monthly:
                             break
                         day += timedelta(days=1)
@@ -261,6 +270,69 @@ def _binance(item: Download, root: Path, client: httpx.Client) -> dict:
         except (ValueError, UnicodeError):
             return _row(item, "conflict", path.stat().st_size)
     return _row(item, status, path.stat().st_size)
+
+
+# Two workers at this cap leave room for Arrow batches and minute aggregates
+# within 6 GiB. Refuse unexpectedly large archives rather than spilling to disk.
+AGGFLOW_ZIP_RAM_LIMIT = 1536 * 1024 * 1024
+
+
+def _aggflow(item: Download, root: Path, client: httpx.Client) -> dict:
+    from .aggflow import aggregate_zip
+    import pyarrow.parquet as pq
+
+    path = root / item.path
+
+    def present(expected=None):
+        metadata = pq.read_metadata(path).metadata or {}
+        status = ("conflict" if expected is not None
+                  and metadata.get(b"zip_sha256") != expected.encode() else "present")
+        return _row(item, status, int(metadata.get(b"zip_bytes", b"0")))
+
+    if path.exists():
+        return present()
+    response = _get(client, item.url + ".CHECKSUM")
+    if response.status_code == 404:
+        return _row(item, "missing")
+    try:
+        expected = _checksum(response.content)
+    except (ValueError, UnicodeError):
+        return _row(item, "checksum_failed")
+    for attempt in range(4):
+        try:
+            with BytesIO() as compressed:
+                digest = hashlib.sha256()
+                size = 0
+                with client.stream("GET", item.url, headers={"User-Agent": USER_AGENT}) as archive:
+                    if archive.status_code == 404:
+                        return _row(item, "missing")
+                    archive.raise_for_status()
+                    for chunk in archive.iter_raw():
+                        size += len(chunk)
+                        if size > AGGFLOW_ZIP_RAM_LIMIT:
+                            raise ValueError("aggTrades archive exceeds RAM limit")
+                        digest.update(chunk)
+                        compressed.write(chunk)
+                if digest.hexdigest() != expected:
+                    return _row(item, "checksum_failed", size)
+                compressed.seek(0)
+                table = aggregate_zip(compressed).to_arrow()
+            break
+        except (httpx.TransportError, httpx.HTTPStatusError) as exc:
+            retryable = (isinstance(exc, httpx.TransportError)
+                         or exc.response.status_code in (408, 429)
+                         or exc.response.status_code >= 500)
+            if not retryable or attempt == 3:
+                raise
+            time.sleep(.5 * 2**attempt)
+    table = table.replace_schema_metadata({b"zip_bytes": str(size).encode(),
+                                           b"zip_sha256": expected.encode()})
+    output = BytesIO()
+    pq.write_table(table, output)
+    # Use the existing atomic no-clobber publisher; only aggregate bytes reach disk.
+    if _atomic_write(path, output.getvalue()):
+        return _row(item, "downloaded", size)
+    return present(expected)
 
 
 @contextmanager
@@ -474,6 +546,8 @@ def _coinbase(item: Download, root: Path, client: httpx.Client) -> dict:
 
 
 def download(item: Download, root: Path, client: httpx.Client) -> dict:
+    if item.dataset == "aggflow":
+        return _aggflow(item, root, client)
     if item.path.endswith(".csv"):
         with _snapshot_lock(root / item.path):
             handler = {"dvol": _dvol, "funding_rate": _funding, "coinbase_klines": _coinbase}[item.dataset]
@@ -482,24 +556,31 @@ def download(item: Download, root: Path, client: httpx.Client) -> dict:
 
 
 def run_downloads(plan: list[Download], root: Path, jobs: int = 4,
-                  client: httpx.Client | None = None) -> list[dict]:
+                  client: httpx.Client | None = None, *, aggflow_jobs: int = 2) -> list[dict]:
     """Download with bounded workers, then atomically replace the coverage report."""
-    if jobs <= 0:
-        raise ValueError("--jobs must be positive")
+    if jobs <= 0 or aggflow_jobs <= 0:
+        raise ValueError("--jobs and --aggflow-jobs must be positive")
     if client is None:
         with httpx.Client(timeout=60, follow_redirects=True,
                           limits=httpx.Limits(max_connections=jobs), trust_env=False) as owned:
-            return run_downloads(plan, root, jobs, owned)
+            return run_downloads(plan, root, jobs, owned, aggflow_jobs=aggflow_jobs)
+
+    slots = BoundedSemaphore(jobs)
 
     def worker(item):
-        try:
-            return download(item, root, client)
-        except Exception as exc:
-            message = " ".join(f"{type(exc).__name__}: {exc}".split())[:240]
-            return _row(item, "error", error=message)
+        with slots:
+            try:
+                return download(item, root, client)
+            except Exception as exc:
+                message = " ".join(f"{type(exc).__name__}: {exc}".split())[:240]
+                return _row(item, "error", error=message)
 
-    with ThreadPoolExecutor(max_workers=jobs) as pool:
-        rows = list(pool.map(worker, plan))
+    # Separate queues keep normal downloads moving while bounding archive RAM.
+    with ThreadPoolExecutor(max_workers=jobs) as pool, \
+            ThreadPoolExecutor(max_workers=min(jobs, aggflow_jobs)) as aggpool:
+        futures = [(aggpool if item.dataset == "aggflow" else pool).submit(worker, item)
+                   for item in plan]
+        rows = [future.result() for future in futures]
     output = StringIO(newline="")
     writer = csv.DictWriter(output, fieldnames=COVERAGE_FIELDS)
     writer.writeheader()
@@ -513,26 +594,32 @@ def _main(argv: list[str] | None = None) -> int:
     parser.add_argument("--root", type=Path, required=True)
     parser.add_argument("--from", dest="start", type=date.fromisoformat, required=True)
     parser.add_argument("--to", dest="end", type=date.fromisoformat, required=True)
-    parser.add_argument("--coins", default=",".join(COINS))
-    parser.add_argument("--datasets", default=",".join(DATASETS), help=",".join(DATASETS))
+    parser.add_argument("--coins", default=",".join(COINS), help="comma-separated coins, or all (15)")
+    parser.add_argument("--datasets", default=",".join(DATASETS), help=",".join(ALL_DATASETS))
     parser.add_argument("--jobs", type=int, default=4)
+    parser.add_argument("--aggflow-jobs", type=int, default=2, help="aggflow workers, capped by --jobs")
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args(argv)
     try:
-        if args.jobs <= 0:
-            raise ValueError("--jobs must be positive")
-        plan = plan_downloads(args.start, args.end,
-                              tuple(part.strip().upper() for part in args.coins.split(",")),
-                              tuple(part.strip() for part in args.datasets.split(",")))
+        if args.jobs <= 0 or args.aggflow_jobs <= 0:
+            raise ValueError("--jobs and --aggflow-jobs must be positive")
+        coins = (ALL_COINS if args.coins.strip().lower() == "all" else
+                 tuple(part.strip().upper() for part in args.coins.split(",")))
+        datasets = tuple(part.strip() for part in args.datasets.split(","))
+        plan = plan_downloads(args.start, args.end, coins, datasets)
     except ValueError as exc:
         parser.error(str(exc))
+    if "coinbase_klines" in datasets:
+        skipped = [coin for coin in COINBASE_UNAVAILABLE if coin in coins]
+        if skipped:
+            print(f"Coverage note: Coinbase has no USD product for {', '.join(skipped)}; skipped")
     if args.dry_run:
         print(f"{len(plan)} files planned (ZIP archives also fetch each URL + .CHECKSUM)")
         for item in plan:
             print(item.url)
         return 0
     try:
-        rows = run_downloads(plan, args.root, args.jobs)
+        rows = run_downloads(plan, args.root, args.jobs, aggflow_jobs=args.aggflow_jobs)
     except (httpx.HTTPError, OSError, ValueError, KeyError, TypeError) as exc:
         print(f"Download failed: {exc}", file=sys.stderr)
         return 1
