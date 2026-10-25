@@ -13,7 +13,7 @@ import polars as pl
 
 from .bars import MINUTE_MS, _boundary_ms, load_bars
 from .baselines import join_baselines
-from .features import COINS, _v2_columns, add_touch_history, build_features, feature_groups
+from .features import ALL_COINS, COINS, _v2_columns, add_touch_history, build_features, feature_groups
 from .labels import first_touch_labels
 from .sources import coverage, load_coinbase, load_perp_closes, load_sources
 
@@ -37,7 +37,7 @@ def build_coin(root, coin, start, end, *, step_min=5, latency_min=1,
     start_ms, end_ms = _boundary_ms(start), _boundary_ms(end, end=True)
     warmup_ms = start_ms - 31 * 1440 * MINUTE_MS
     sources = load_sources(root, coin, warmup_ms, end_ms)
-    if version == 'v2':
+    if version in ('v2', 'v3'):
         sources['coinbase'] = load_coinbase(root, coin, warmup_ms, end_ms)
         if market_bars is None:
             market_bars = {other: load_perp_closes(root, other, warmup_ms, end_ms) for other in COINS}
@@ -65,17 +65,18 @@ def build_coin(root, coin, start, end, *, step_min=5, latency_min=1,
         frame = frame.join(labels, on='ts_ms', how='left')
         frame = frame.with_columns((pl.col('entry_ms') + horizon * MINUTE_MS).alias(f'label_end_ms_{target}'))
         frame = join_baselines(frame, bars, target, barrier, horizon)
-    if version == 'v2':
+    if version in ('v2', 'v3'):
         frame = _v2_columns(add_touch_history(frame))
         frame = frame.filter(pl.col('ts_ms').is_between(start_ms, end_ms, closed='left'))
     return frame.sort('ts_ms'), coverage(sources)
 
 
-def build_dataset(root, out, start, end, coins=COINS, *, step_min=5, latency_min=1, version='v1'):
+def build_dataset(root, out, start, end, coins=None, *, step_min=5, latency_min=1, version='v1'):
     """Write one zstd Parquet per coin and a reproducibility/coverage report."""
     groups = feature_groups(version)
-    if not coins or set(coins) - set(COINS):
-        raise ValueError(f'coins must be selected from {COINS}')
+    coins = (ALL_COINS if version == 'v3' else COINS) if coins is None else coins
+    if not coins or set(coins) - set(ALL_COINS):
+        raise ValueError(f'coins must be selected from {ALL_COINS}')
     if end is None or _boundary_ms(end, end=True) <= _boundary_ms(start):
         raise ValueError('end must be after start')
     started = perf_counter()
@@ -98,7 +99,7 @@ def build_dataset(root, out, start, end, coins=COINS, *, step_min=5, latency_min
     end_ms = _boundary_ms(end, end=True)
     # Reuse compact price context, never full coin feature tables.
     market_bars = None
-    if version == 'v2':
+    if version in ('v2', 'v3'):
         market_bars = {coin: load_perp_closes(root, coin, warmup_ms, end_ms) for coin in COINS}
         btc, eth = market_bars['BTC'], market_bars['ETH']
     else:
@@ -142,12 +143,14 @@ def main(argv=None):
     parser.add_argument('--out', required=True)
     parser.add_argument('--from', dest='start', required=True)
     parser.add_argument('--to', dest='end', required=True)
-    parser.add_argument('--coins', nargs='+', default=list(COINS))
-    parser.add_argument('--version', choices=('v1', 'v2'), default='v1')
+    parser.add_argument('--coins', nargs='+', help='Coin symbols, comma-separated or all')
+    parser.add_argument('--version', choices=('v1', 'v2', 'v3'), default='v1')
     parser.add_argument('--step-min', type=int, default=5)
     parser.add_argument('--latency-min', type=int, default=1)
     args = parser.parse_args(argv)
-    coins = tuple(coin.upper() for part in args.coins for coin in part.split(','))
+    coins = tuple(coin.upper() for part in args.coins for coin in part.split(',')) if args.coins else None
+    if coins == ('ALL',):
+        coins = ALL_COINS
     build_dataset(args.root, args.out, args.start, args.end, coins,
                   step_min=args.step_min, latency_min=args.latency_min, version=args.version)
 

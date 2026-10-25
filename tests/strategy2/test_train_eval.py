@@ -12,7 +12,7 @@ import polars as pl
 import pytest
 
 from strategy2.evaluate import (binary_auc, classification_metrics, evaluate,
-                                log_loss_rows)
+                                log_loss_rows, summarize)
 from strategy2.signal import make_signal, round_trip_cost
 from strategy2.simulate import (funding_crossings, simulate, simulation_report,
                                 trade_metrics, weekly_bootstrap)
@@ -384,3 +384,78 @@ def test_feature_metadata_cannot_include_outcomes(trained):
     (altered / "metadata.json").write_text(json.dumps({"features": ["f_coin_id", "label_a"]}))
     with pytest.raises(ValueError, match=r"f_\*"):
         train(altered, root, "leaky", config=config, threads=1)
+
+
+@pytest.mark.parametrize('model', ['three_class', 'two_stage'])
+@pytest.mark.parametrize('groups,features,chosen', [
+    ('B', ['f_signal'], ['B']),
+    ('H,B', ['f_signal', 'f_coin_id'], ['B', 'H']),
+    (None, ['f_signal', 'f_coin_id'], ['B', 'H']),
+])
+def test_feature_group_training_without_coin_id(tmp_path, model, groups, features, chosen):
+    data = synthetic_dataset(tmp_path / 'features')
+    (data / 'metadata.json').write_text(json.dumps({
+        'feature_columns': ['f_signal', 'f_coin_id'],
+        'features': [{'name': 'f_signal', 'group': 'B'}, {'name': 'f_coin_id', 'group': 'H'}]}))
+    config = config_small() | {'model': model, 'test_months': 1, 'num_boost_round': 5}
+    output = train(data, tmp_path, 'subset', config=config, threads=1, feature_groups=groups)
+    metadata = json.loads((output / 'metadata.json').read_text())
+    assert metadata['features'] == features
+    assert metadata['feature_groups'] == chosen
+    for path in output.glob('*-importance.csv'):
+        assert pl.read_csv(path)['feature'].to_list() == features
+
+
+@pytest.mark.parametrize('groups,structured,match', [
+    ('Z', True, 'Unknown feature groups'), ('', True, 'at least one'),
+    ('B', False, 'requires dataset metadata'),
+])
+def test_feature_group_validation(tmp_path, groups, structured, match):
+    data = synthetic_dataset(tmp_path / 'features')
+    if structured:
+        (data / 'metadata.json').write_text(json.dumps({'features': [
+            {'name': 'f_signal', 'group': 'B'}, {'name': 'f_coin_id', 'group': 'H'}]}))
+    with pytest.raises(ValueError, match=match):
+        train(data, tmp_path, 'invalid', config=config_small(), threads=1, feature_groups=groups)
+    assert not (tmp_path / 'models').exists()
+
+
+def test_coin_filter_metrics_simulation_comparison_and_summary(trained):
+    root, _, config, output = trained
+    frame = pl.read_parquet(output / 'oof.parquet').filter(pl.col('coin') == 'BTC')
+    reference = root / 'btc-reference.parquet'
+    frame.write_parquet(reference)
+    report = evaluate(output, compare=reference, coins=['btc'])
+    assert report['coins'] == ['BTC']
+    assert report['coin_filter'] == ['BTC']
+    assert set(report['per_coin']) == {'BTC'}
+    assert report['metrics']['model']['rows'] == frame.height
+    assert report['comparison']['rows'] == frame.height
+    assert report['simulation'] == simulation_report(frame, config, 'a')
+    assert report['paired_side_log_loss_difference']['reference']['mean'] == 0
+    summary = summarize([output], root / 'btc-summary', coins=['BTC'])
+    assert {row['coins'] for row in summary['rows']} == {'BTC'}
+    assert 'coins' in (root / 'btc-summary/summary.csv').read_text().splitlines()[0]
+    with pytest.raises(ValueError, match='selected coins'):
+        evaluate(output, coins=['NEAR'])
+
+
+def test_subset_train_and_coin_filter_clis(tmp_path):
+    data = synthetic_dataset(tmp_path / 'features')
+    (data / 'metadata.json').write_text(json.dumps({'features': [
+        {'name': 'f_signal', 'group': 'B'}, {'name': 'f_coin_id', 'group': 'H'}]}))
+    config = config_small() | {'test_months': 1, 'num_boost_round': 5}
+    path = tmp_path / 'config.json'
+    path.write_text(json.dumps(config))
+    result = subprocess.run([sys.executable, '-m', 'strategy2.train', '--data', str(data),
+        '--work', str(tmp_path), '--version', 'subset', '--target', 'a', '--config', str(path),
+        '--threads', '1', '--feature-groups', 'B'], capture_output=True, text=True, timeout=90)
+    assert result.returncode == 0, result.stderr
+    output = tmp_path / 'models/s2/a/subset'
+    assert json.loads((output / 'metadata.json').read_text())['features'] == ['f_signal']
+    for args in ([str(output)], ['--summary', str(output), '--out', str(tmp_path / 'summary')]):
+        result = subprocess.run([sys.executable, '-m', 'strategy2.evaluate', *args, '--coins', 'ETH'],
+            capture_output=True, text=True, timeout=90)
+        assert result.returncode == 0, result.stderr
+        assert json.loads((output / 'report.json').read_text())['coins'] == ['ETH']
+    assert 'ETH' in (tmp_path / 'summary/summary.csv').read_text()

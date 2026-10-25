@@ -205,6 +205,7 @@ def render_html(report):
              "<style>body{font:15px system-ui;margin:2rem;max-width:1100px;color:#17212b}table{border-collapse:collapse}td,th{padding:.5rem;border:1px solid #bbb;text-align:right}pre{white-space:pre-wrap;overflow-wrap:anywhere}summary{cursor:pointer;font-weight:bold;margin:1rem 0}</style>",
              "<h1>Strategy 2 development evaluation</h1>",
              f"<p>Target {html.escape(report['target'])}; version {html.escape(report['version'])}. Sealed lockbox excluded.</p>",
+             f"<p>Coins: {html.escape(', '.join(report['coins']))}</p>",
              "<table><tr><th>Source</th><th>Rows</th><th>Log loss</th><th>Touch AUC</th><th>Side accuracy</th></tr>"]
     def fmt(value):
         return f"{value:.6f}" if isinstance(value, float) else html.escape(str(value))
@@ -235,7 +236,7 @@ def align_reference(frame, reference, intersection=False):
     return left, right
 
 
-def evaluate(directory, compare=None, compare_intersection=False, costs=None):
+def evaluate(directory, compare=None, compare_intersection=False, costs=None, coins=None):
     directory = Path(directory)
     metadata = json.loads((directory / "metadata.json").read_text())
     frame = pl.read_parquet(directory / "oof.parquet")
@@ -243,6 +244,13 @@ def evaluate(directory, compare=None, compare_intersection=False, costs=None):
         raise ValueError("No OOF observations")
     if frame["ts_ms"].max() >= metadata["lockbox_exclusive_ms"]:
         raise ValueError("OOF contains sealed lockbox rows")
+    coin_filter = None if coins is None else list(dict.fromkeys(
+        coin.strip().upper() for part in ([coins] if isinstance(coins, str) else coins)
+        for coin in part.split(",")))
+    if coin_filter is not None:
+        frame = frame.filter(pl.col("coin").is_in(coin_filter))
+        if frame.is_empty():
+            raise ValueError("No OOF observations for selected coins")
     reference = None
     if compare is not None:
         path = Path(compare)
@@ -254,6 +262,8 @@ def evaluate(directory, compare=None, compare_intersection=False, costs=None):
         reference = pl.read_parquet(path)
         if len(reference) and reference["ts_ms"].max() >= metadata["lockbox_exclusive_ms"]:
             raise ValueError("Reference OOF contains sealed lockbox rows")
+        if coin_filter is not None:
+            reference = reference.filter(pl.col("coin").is_in(coin_filter))
         frame, reference = align_reference(frame, reference, compare_intersection)
     config = metadata["config"]
     if costs is not None:
@@ -271,6 +281,7 @@ def evaluate(directory, compare=None, compare_intersection=False, costs=None):
                    "selected": scenario["ev_selection"]["periods"].get(period)}
             for name, scenario in simulation["scenarios"].items()}
     report.update(target=metadata["target"], version=metadata["version"], git_sha=metadata["git_sha"],
+                  coins=sorted(frame["coin"].unique().to_list()), coin_filter=coin_filter,
                   generated_at=datetime.now(timezone.utc).isoformat(), simulation=simulation,
                   comparison={"reference": str(compare) if compare is not None else None,
                               "intersection": compare_intersection, "rows": len(frame)})
@@ -279,10 +290,10 @@ def evaluate(directory, compare=None, compare_intersection=False, costs=None):
     return report
 
 
-def summarize(directories, out, costs=None):
+def summarize(directories, out, costs=None, coins=None):
     rows = []
     for directory in directories:
-        report = evaluate(directory, costs=costs)
+        report = evaluate(directory, costs=costs, **({"coins": coins} if coins is not None else {}))
         for period, diagnostics in report["periods"].items():
             model = diagnostics["metrics"]["model"]
             side = model["side"]
@@ -292,6 +303,7 @@ def summarize(directories, out, costs=None):
                 trades = selection["periods"].get(period, {})
                 ci = trades.get("mean_net_return_ci") or {}
                 rows.append({"run": str(directory), "target": report["target"], "period": period,
+                    "coins": ",".join(report["coins"]),
                     "scenario": name, "label": scenario["label"], "side_log_loss": side["log_loss"],
                     "side_auc": side["auc"], "calibration_max_gap_500": max(gaps) if gaps else None,
                     "touch_auc": model["touch_auc"], "log_loss": model["log_loss"],
@@ -306,13 +318,14 @@ def summarize(directories, out, costs=None):
                 best[target] = {"run": row["run"], "side_log_loss": row["side_log_loss"]}
     output = Path(out)
     output.mkdir(parents=True, exist_ok=True)
-    result = {"selection_period": "tuning", "selection_metric": "side_log_loss", "best_by_target": best, "rows": rows}
+    result = {"selection_period": "tuning", "selection_metric": "side_log_loss", "best_by_target": best,
+              "coins": sorted({coin for row in rows for coin in row["coins"].split(",")}), "rows": rows}
     (output / "summary.json").write_text(json.dumps(result, indent=2, allow_nan=False))
     with (output / "summary.csv").open("w", newline="") as stream:
         writer = csv.DictWriter(stream, fieldnames=list(rows[0]) if rows else [])
         writer.writeheader()
         writer.writerows(rows)
-    columns = ["run", "target", "period", "scenario", "side_log_loss", "side_auc", "calibration_max_gap_500",
+    columns = ["run", "target", "coins", "period", "scenario", "side_log_loss", "side_auc", "calibration_max_gap_500",
                "touch_auc", "log_loss", "chosen_ev_threshold", "trades", "mean_net_return", "ci_low", "ci_high", "selection_note"]
     print("\t".join(columns))
     for row in rows:
@@ -327,19 +340,20 @@ def main():
     parser.add_argument("--compare", help="Reference run directory or OOF parquet")
     parser.add_argument("--compare-intersection", action="store_true", help="Explicitly restrict BOTH runs to common keys")
     parser.add_argument("--costs", type=Path, help="YAML cost_scenarios replacing the run's simulation scenarios")
+    parser.add_argument("--coins", nargs="+", help="Restrict evaluation and simulation to these coins")
     parser.add_argument("--summary", nargs="+", metavar="RUN")
     parser.add_argument("--out", type=Path, default=Path("."))
     args = parser.parse_args()
     if args.summary:
         if args.compare or args.directory:
             parser.error("--summary cannot be combined with directory/--compare")
-        summarize(args.summary, args.out, costs=args.costs)
+        summarize(args.summary, args.out, costs=args.costs, coins=args.coins)
     else:
         if args.directory is None:
             parser.error("directory or --summary is required")
         if args.compare_intersection and args.compare is None:
             parser.error("--compare-intersection requires --compare")
-        report = evaluate(args.directory, args.compare, args.compare_intersection, costs=args.costs)
+        report = evaluate(args.directory, args.compare, args.compare_intersection, costs=args.costs, coins=args.coins)
         print(json.dumps({"model": report["metrics"]["model"], "trades": report["simulation"]["trades"],
                           "ev_selection": report["simulation"]["ev_selection"]}))
 

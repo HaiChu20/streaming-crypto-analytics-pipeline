@@ -200,7 +200,7 @@ def train_two_stage(fit, valid, test, features, target, config, params, output, 
         train_y = (y_fit[touched_fit] == 1) if side else touched_fit
         valid_y = (y_valid[touched_valid] == 1) if side else touched_valid
         training = lgb.Dataset(train_x, label=train_y, feature_name=features,
-                               categorical_feature=["f_coin_id"])
+                               categorical_feature=[f for f in features if f == "f_coin_id"])
         validation = lgb.Dataset(valid_x, label=valid_y, reference=training)
         stage_params = dict(params)
         stage_params.pop("num_class", None)
@@ -244,7 +244,7 @@ def baseline_probabilities(frame, source):
     return result
 
 
-def train(data, work, version, target="a", coins=None, config=None, threads=None):
+def train(data, work, version, target="a", coins=None, config=None, threads=None, feature_groups=None):
     config = deepcopy(config if config is not None else load_config())
     lockbox = validate_config(config)
     if target not in config["targets"]:
@@ -274,6 +274,22 @@ def train(data, work, version, target="a", coins=None, config=None, threads=None
         raise ValueError("Feature metadata must list numeric f_* features including f_coin_id")
     if len(set(features)) != len(features) or any(not f.startswith("f_") for f in features):
         raise ValueError("Feature list must contain distinct f_* columns only")
+    records = source_metadata.get("features", [])
+    group_map = {item["name"]: item["group"] for item in records
+                 if isinstance(item, dict) and "name" in item and "group" in item}
+    if feature_groups is not None:
+        requested = feature_groups.split(",") if isinstance(feature_groups, str) else feature_groups
+        requested = {group.strip().upper() for group in requested}
+        if not requested or "" in requested:
+            raise ValueError("feature-groups must select at least one group")
+        if any(name not in group_map for name in features):
+            raise ValueError("feature-groups requires dataset metadata features with name and group")
+        unknown = requested - {group_map[name] for name in features}
+        if unknown:
+            raise ValueError(f"Unknown feature groups: {sorted(unknown)}")
+        features = [name for name in features if group_map[name] in requested]
+    chosen_groups = (list(dict.fromkeys(group_map[name] for name in features))
+                     if all(name in group_map for name in features) else None)
     for feature in features:
         if feature not in frame.columns or not frame.schema[feature].is_numeric():
             raise ValueError(f"Missing or nonnumeric feature: {feature}")
@@ -316,7 +332,7 @@ def train(data, work, version, target="a", coins=None, config=None, threads=None
             p_valid, p_test = (combine_probabilities(p["move"], p["side"]) for p in (cv, ct))
         else:
             training = lgb.Dataset(fit.select(features).to_numpy(), label=y_fit,
-                                   feature_name=features, categorical_feature=["f_coin_id"])
+                                   feature_name=features, categorical_feature=[f for f in features if f == "f_coin_id"])
             validation = lgb.Dataset(valid.select(features).to_numpy(), label=y_valid, reference=training)
             model = lgb.train(params, training, num_boost_round=int(config["num_boost_round"]),
                               valid_sets=[validation], callbacks=[lgb.early_stopping(
@@ -381,7 +397,8 @@ def train(data, work, version, target="a", coins=None, config=None, threads=None
     pl.concat(oof).sort(["ts_ms", "coin"]).write_parquet(output / "oof.parquet")
     sha = subprocess.run(["git", "rev-parse", "HEAD"], capture_output=True, text=True, check=True).stdout.strip()
     metadata = {"target": target, "version": version, "config": config, "git_sha": sha,
-                "features": features, "class_order": ["up", "down", "none"], "folds": folds,
+                "features": features, "feature_groups": chosen_groups,
+                "class_order": ["up", "down", "none"], "folds": folds,
                 "lockbox_exclusive_ms": lockbox, "num_threads": params["num_threads"],
                 "timeout_mean_method": "Signed none-row returns, conditional on predicted direction in inner validation; zero when absent."}
     (output / "metadata.json").write_text(json.dumps(metadata, indent=2, default=str))
@@ -395,12 +412,13 @@ def main():
     parser.add_argument("--version", required=True)
     parser.add_argument("--target", required=True, choices=("a", "b", "c"))
     parser.add_argument("--coins", nargs="+")
+    parser.add_argument("--feature-groups", help="Comma-separated dataset groups, e.g. A,B,K; default: all")
     parser.add_argument("--config", default=str(DEFAULT_CONFIG))
     parser.add_argument("--threads", type=int)
     parser.add_argument("--override", action="append", default=[], help="Merge a candidate YAML over --config")
     args = parser.parse_args()
     print(train(args.data, args.work, args.version, args.target, args.coins,
-                load_config(args.config, args.override), args.threads))
+                load_config(args.config, args.override), args.threads, args.feature_groups))
 
 
 if __name__ == "__main__":

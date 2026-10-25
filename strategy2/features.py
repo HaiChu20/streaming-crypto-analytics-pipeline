@@ -4,7 +4,8 @@ Bars/premium become available after 60s, metrics after 5m, depth after 30s,
 and DVOL after 1h. All joins use availability <= decision time. Missing bar
 minutes stay null. Rolling statistics require at least 90% valid samples.
 Returns and positive-level changes are logarithmic; premium differences are
-arithmetic. Volatility is in fractional price units. V2 adds groups I and J.
+arithmetic. Volatility is in fractional price units. V2 adds groups I and J;
+v3 adds group K (multi-day trend).
 """
 
 from math import ceil
@@ -18,7 +19,10 @@ from .sources import BANDS, HOUR_MS, METRICS
 
 DAY = 1440
 COINS = ('BTC', 'ETH', 'SOL', 'XRP', 'DOGE')
+EXTRA_COINS = ('BNB', 'ADA', 'LINK', 'AVAX', 'LTC', 'TRX', 'DOT', 'BCH', 'ETC', 'NEAR')
+ALL_COINS = COINS + EXTRA_COINS
 ROUND = dict(zip(COINS, (1000., 100., 10., .1, .01)))
+ROUND.update(zip(EXTRA_COINS, (10., .01, .1, .1, 1., .001, .1, 10., .1, .01)))
 GROUP_FEATURES = {
     'A': [*[f'rv_{w}' for w in (15, 60, 240, 1440, 10080)], 'parkinson_60', 'parkinson_240',
           'down_share_60', 'up_share_60', 'jump_share_60', 'vol_of_vol', 'barrier_sigma_a', 'barrier_sigma_b'],
@@ -53,13 +57,23 @@ GROUP_FEATURES.update({
 })
 FEATURE_GROUPS_V2 = {**FEATURE_GROUPS_V1,
                      **{f'f_{name}': group for group in ('I', 'J') for name in GROUP_FEATURES[group]}}
+GROUP_FEATURES['K'] = [
+    *[f'return_{days * DAY}' for days in (3, 7, 14, 30)],
+    *[f'return_daily_z_{days * DAY}' for days in (3, 7, 14, 30)],
+    'high_distance_frac_28800', 'low_distance_frac_28800',
+    'sma_deviation_10080', 'sma_deviation_43200', 'positive_day_share_14',
+    'rel_strength_10080', 'rel_strength_43200', 'btc_return_10080', 'btc_return_43200',
+]
+FEATURE_GROUPS_V3 = {**FEATURE_GROUPS_V2,
+                     **{f'f_{name}': 'K' for name in GROUP_FEATURES['K']}}
 FEATURE_GROUPS = FEATURE_GROUPS_V1
 
 
 def feature_groups(version):
-    if version not in ('v1', 'v2'):
-        raise ValueError('version must be v1 or v2')
-    return FEATURE_GROUPS_V1 if version == 'v1' else FEATURE_GROUPS_V2
+    versions = {'v1': FEATURE_GROUPS_V1, 'v2': FEATURE_GROUPS_V2, 'v3': FEATURE_GROUPS_V3}
+    if version not in versions:
+        raise ValueError('version must be v1, v2 or v3')
+    return versions[version]
 
 
 def _div(a, b):
@@ -104,7 +118,7 @@ def build_features(coin, sources, *, start=None, end=None, step_min=5,
     trade-count z uses completed hourly observations from the previous 30 days.
     """
     groups = feature_groups(version)
-    if coin not in COINS or not isinstance(step_min, int) or step_min < 1:
+    if coin not in ALL_COINS or not isinstance(step_min, int) or step_min < 1:
         raise ValueError('unsupported coin or invalid step_min')
     bars = sources['perp']
     if start is None:
@@ -133,7 +147,7 @@ def build_features(coin, sources, *, start=None, end=None, step_min=5,
     sample = (frame['ts_ms'] % (step_min * MINUTE_MS) == 0)
     result = {'ts_ms': frame['ts_ms'].filter(sample),
               'coin': pl.Series('coin', [coin] * int(sample.sum())),
-              'f_coin_id': pl.Series('f_coin_id', np.full(int(sample.sum()), COINS.index(coin), dtype=np.int8))}
+              'f_coin_id': pl.Series('f_coin_id', np.full(int(sample.sum()), ALL_COINS.index(coin), dtype=np.int8))}
 
     def add(name, expression):
         result['f_' + name] = frame.select('ts_ms', expression.cast(pl.Float64).alias('f_' + name)).to_series(1).filter(sample)
@@ -278,16 +292,20 @@ def build_features(coin, sources, *, start=None, end=None, step_min=5,
             _change(close, window) - beta * _change(pl.col('btc_close'), window))
     add('btc_rv_60', _roll(btc_r.pow(2), 60).sqrt())
     add('eth_btc_trend_240', _change(pl.col('eth_close'), 240) - _change(pl.col('btc_close'), 240))
-    if version == 'v2':
+    if version in ('v2', 'v3'):
         frame = _v2_frame(frame, coin, sources, market_bars or {}, btc_bars, eth_bars)
         for group in ('I', 'J'):
             for name in GROUP_FEATURES[group]:
                 if not name.startswith(('touch_up_share_', 'touch_rate_')):
                     add(name, pl.col('_' + name))
+    if version == 'v3':
+        frame = _v3_frame(frame)
+        for name in GROUP_FEATURES['K']:
+            add(name, pl.col('_' + name))
     for name in ('last_funding_rate', 'next_funding_ms', 'funding_interval_ms'):
         result[name] = frame[name].filter(sample)
     output = pl.DataFrame(result)
-    if version == 'v2':
+    if version in ('v2', 'v3'):
         output = add_touch_history(output, labels)
         output = _v2_columns(output)
     return output.with_columns(*[pl.when(pl.col(name).is_finite()).then(pl.col(name)).otherwise(None).alias(name)
@@ -295,8 +313,9 @@ def build_features(coin, sources, *, start=None, end=None, step_min=5,
 
 
 def _v2_columns(frame):
-    """Keep the original column order, then append I and J in contract order."""
-    extra = [name for name in FEATURE_GROUPS_V2 if name not in FEATURE_GROUPS_V1]
+    """Keep the original column order, then append versioned groups in order."""
+    extra = [name for name in FEATURE_GROUPS_V3
+             if name not in FEATURE_GROUPS_V1 and name in frame.columns]
     return frame.select(*[name for name in frame.columns if name not in extra], *extra)
 
 
@@ -360,6 +379,50 @@ def _v2_frame(frame, coin, sources, market_bars, btc_bars, eth_bars):
         _div(premium - _roll(premium, 7 * DAY, 'mean'),
              _roll(premium, 7 * DAY, 'std')).alias('_cb_premium_z'),
         _div(cb60, cb60 + spot60).alias('_cb_volume_share_60'))
+
+
+def _v3_frame(frame):
+    """Completed UTC daily returns and minute-grid trends; full elapsed windows.
+
+    Group B already supplies 7d extrema distances; G encodes day of week.
+    K's 20d extrema distances are close/high - 1 and close/low - 1.
+    Daily volatility is the sample std of the last 30 completed UTC-day log
+    returns, carried only within the next UTC day. All rolling statistics keep
+    the existing 90% coverage rule, but never use a shortened warmup window.
+    """
+    close = pl.col('close')
+    age = pl.int_range(pl.len())
+    daily = frame.select('ts_ms', _change(close, DAY).alias('_day_return')).filter(
+        pl.col('ts_ms') % (DAY * MINUTE_MS) == 0).with_columns(
+        pl.when(pl.int_range(pl.len()) >= 30).then(
+            _roll(pl.col('_day_return'), 30, 'std')).alias('_trend_daily_std'),
+        pl.when(pl.int_range(pl.len()) >= 14).then(
+            _roll((pl.col('_day_return') > 0).cast(pl.Float64), 14, 'mean'))
+            .alias('_positive_day_share_14'))
+    frame = _asof(frame, daily.drop('_day_return').rename({'ts_ms': 'available_ms'}),
+                  DAY * MINUTE_MS - 1)
+    expressions = []
+    for days in (3, 7, 14, 30):
+        window = days * DAY
+        ret = _change(close, window)
+        expressions.extend([ret.alias(f'_return_{window}'),
+            _div(ret, pl.col('_trend_daily_std') * np.sqrt(days)).alias(f'_return_daily_z_{window}')])
+    for kind, field in (('high', 'high'), ('low', 'low')):
+        extreme = _roll(pl.col(field), 20 * DAY, 'max' if kind == 'high' else 'min')
+        expressions.append(pl.when(age >= 20 * DAY).then(_div(close, extreme) - 1)
+                           .alias(f'_{kind}_distance_frac_28800'))
+    for days in (7, 30):
+        window = days * DAY
+        returns = [_change(pl.col('_mkt_' + other), window) for other in COINS]
+        market = pl.when(pl.sum_horizontal([r.is_not_null().cast(pl.Int8) for r in returns]) >= 4
+                        ).then(pl.mean_horizontal(returns))
+        expressions.extend([
+            pl.when(age >= window).then(_div(close, _roll(close, window, 'mean')) - 1)
+                .alias(f'_sma_deviation_{window}'),
+            (_change(close, window) - market).alias(f'_rel_strength_{window}'),
+            _change(pl.col('btc_close'), window).alias(f'_btc_return_{window}'),
+        ])
+    return frame.with_columns(expressions)
 
 
 def add_touch_history(decisions, labels=None):

@@ -13,7 +13,7 @@ import pytest
 from strategy2.bars import MINUTE_MS, load_bars
 from strategy2.baselines import join_baselines
 from strategy2.dataset import TARGETS, build_coin, build_dataset
-from strategy2.features import (COINS, FEATURE_GROUPS, FEATURE_GROUPS_V1, FEATURE_GROUPS_V2,
+from strategy2.features import (ALL_COINS, COINS, EXTRA_COINS, ROUND, FEATURE_GROUPS, FEATURE_GROUPS_V1, FEATURE_GROUPS_V2, FEATURE_GROUPS_V3,
                                 add_touch_history, build_features, feature_groups)
 from strategy2.labels import first_touch_labels
 from strategy2.sources import BANDS, HOUR_MS, METRICS, load_depth, load_funding, load_metrics, load_sources, load_coinbase, load_perp_closes
@@ -147,7 +147,7 @@ def test_partial_and_empty_depth(tmp_path):
     assert load_depth(tmp_path, 'BTC', START, END).height == 0
 
 
-@pytest.mark.parametrize('version', ['v1', 'v2'])
+@pytest.mark.parametrize('version', ['v1', 'v2', 'v3'])
 def test_generic_no_lookahead_all_sources(tmp_path, version):
     # More than 30 days exercises long-window features as well as short ones.
     mirror(tmp_path, n=47_000)
@@ -521,7 +521,7 @@ def test_v2_dataset_metadata_labels_warmup_and_v1_columns(history, tmp_path):
         START + 2000*MINUTE_MS, version='v2')
     assert second['f_touch_rate_24h_a'][0] == 1  # Includes labels from the preceding day.
     with pytest.raises(ValueError, match='version'):
-        build_features('ETH', {}, version='v3')
+        build_features('ETH', {}, version='v4')
 
 
 def test_touch_history_same_coin_and_exact_availability_boundary():
@@ -549,3 +549,140 @@ def test_breakout_compares_last_fifteen_minutes_with_prior_day(history, directio
     assert result[name][1490] == 0.
     assert result[name][1501] == 1.
     assert result[name][1516] == 0.
+
+
+@pytest.mark.parametrize('version,hashes', [
+    ('v1', (
+        'aed3778873a89f3b0f216078726fcb6997c41c80357a402cb19c1d570180226c',
+        '268f7491597d3dee8c9e07c02f08a6532bc472d5a8e9e92ea02862652dd73715',
+        'd9e022653bcdf943dddab7b6439f8a2da5dc482846594ece7418a78e4f1fef86',
+        '7a3feb32869069a24852425ef52071362ca68bb31815baa44d5334e5f2ea80b0',
+        'e05a3a01de6d4407eb9673351e02508d47fc2bc628e12e538f88eae35ca8b812')),
+    ('v2', (
+        '1d6916785cea76083e5fd9ecc252385a0c3e27b93715e7d12196403983377929',
+        '49dc4718f1b2f6df58a1cbea1f1345127fa76cbe95da173824ff7d40a63e46cc',
+        '262322c425901b0542869ed8ac445d5dbd6c8c7be51bd0255e948e8a9dc96f98',
+        'be594d1dea616b7bc6c647168753f885853cc68a004c6c3c904a460f41ccdd2c',
+        'efc20e81723ebd823e681781a5458946e4d4b5cdd3952443e4280f1b8388c7a1')),
+])
+def test_core_frozen_bytes_before_v3(history, version, hashes):
+    # Captured from unmodified dfe4dc7. >32 days exercises long-window values.
+    sources, market, _ = v2_inputs(history, 47_000)
+    for coin, expected in zip(COINS, hashes):
+        frame = build_features(coin, sources, start=START, end=START + 47_000 * MINUTE_MS,
+            btc_bars=synthetic_bars(47_000, .0001), eth_bars=synthetic_bars(47_000, .0002),
+            market_bars=market, version=version)
+        buffer = BytesIO()
+        frame.write_parquet(buffer, compression='zstd')
+        assert hashlib.sha256(buffer.getvalue()).hexdigest() == expected, coin
+        if version == 'v2':
+            extended = build_features(coin, sources, start=START, end=START + 47_000 * MINUTE_MS,
+                btc_bars=synthetic_bars(47_000, .0001), eth_bars=synthetic_bars(47_000, .0002),
+                market_bars=market, version='v3').select(frame.columns)
+            buffer = BytesIO()
+            extended.write_parquet(buffer, compression='zstd')
+            assert hashlib.sha256(buffer.getvalue()).hexdigest() == expected, coin
+
+
+@pytest.mark.parametrize('coin,level', tuple(zip(EXTRA_COINS, (10., .01, .1, .1, 1., .001, .1, 10., .1, .01))))
+def test_extra_coins_same_schema_btc_context_and_missing_sources(history, coin, level):
+    sources = load_sources(history, coin, START, END)
+    assert sources['dvol']['dvol'][0] == 40  # All extras use BTC DVOL.
+    sources['perp'] = synthetic_bars(1000, .0001, 1.234 * level)
+    result = build_features(coin, sources, start=START, end=START + 1000 * MINUTE_MS,
+        step_min=1, btc_bars=synthetic_bars(1000, .0002), version='v3')
+    assert ROUND[coin] == level
+    assert result['f_coin_id'].unique().to_list() == [ALL_COINS.index(coin)]
+    assert result['f_btc_return_60'][900] == pytest.approx(.012)
+    close = sources['perp']['close'][899]
+    assert result['f_round_distance'][900] == pytest.approx(abs(round(close / level) * level - close) / close)
+    assert result['f_dvol'][120] == 41
+    for name, group in FEATURE_GROUPS_V3.items():
+        if group in ('D', 'E', 'J') and name != 'f_minutes_to_funding':
+            assert result[name].null_count() == result.height
+    if coin in ('BNB', 'TRX'):
+        assert load_coinbase(history, coin, START, END).is_empty()
+    assert set(n for n in result.columns if n.startswith('f_')) == set(FEATURE_GROUPS_V3)
+
+
+def test_v3_trend_formulas_full_windows_and_sampling(history):
+    n = 48_001
+    sources, market, _ = v2_inputs(history, n)
+    log_price = .000001 * np.arange(n) + .12 * np.sin(np.arange(n) / (3 * 1440))
+    close = 100 * np.exp(log_price)
+    own = synthetic_bars(n, 0.).with_columns(pl.Series('close', close),
+        pl.Series('high', close * 1.002), pl.Series('low', close * .998))
+    sources['perp'] = own
+    def build(step):
+        return build_features('ETH', sources, start=START, end=START + n * MINUTE_MS,
+            step_min=step, btc_bars=market['BTC'], market_bars=market, version='v3')
+    result = build(1)
+    i = 47_600
+    row = result.row(i, named=True)
+    midnight = i // 1440 * 1440
+    daily_returns = np.diff(log_price[np.arange(midnight - 30 * 1440, midnight + 1, 1440) - 1])
+    for days in (3, 7, 14, 30):
+        w = days * 1440
+        ret = log_price[i - 1] - log_price[i - w - 1]
+        assert row[f'f_return_{w}'] == pytest.approx(ret)
+        assert row[f'f_return_daily_z_{w}'] == pytest.approx(ret / (daily_returns.std(ddof=1) * np.sqrt(days)))
+        assert result[f'f_return_{w}'][w] is None
+        assert result[f'f_return_{w}'][w + 1] is not None
+        assert result[f'f_return_daily_z_{w}'][30 * 1440 - 1] is None
+    for days in (7, 30):
+        w = days * 1440
+        assert row[f'f_sma_deviation_{w}'] == pytest.approx(close[i - 1] / close[i - w:i].mean() - 1)
+        assert result[f'f_sma_deviation_{w}'][w - 1] is None
+        assert row[f'f_btc_return_{w}'] == pytest.approx(.0001 * w)
+        # Own ETH replaces the synthetic ETH context; the other four core coins stay fixed.
+        ret = log_price[i - 1] - log_price[i - w - 1]
+        market_return = (ret + (.0001 + .0003 + .0004 + .0005) * w) / 5
+        assert row[f'f_rel_strength_{w}'] == pytest.approx(ret - market_return)
+    assert row['f_high_distance_frac_28800'] == pytest.approx(close[i - 1] / (close[i - 28800:i].max() * 1.002) - 1)
+    assert row['f_low_distance_frac_28800'] == pytest.approx(close[i - 1] / (close[i - 28800:i].min() * .998) - 1)
+    assert result['f_high_distance_frac_28800'][28800 - 1] is None
+    assert row['f_positive_day_share_14'] == pytest.approx((daily_returns[-14:] > 0).mean())
+    assert result['f_positive_day_share_14'][14 * 1440 - 1] is None
+    assert_frame_equal(build(5), result.filter(pl.col('ts_ms') % (5 * MINUTE_MS) == 0), check_exact=True)
+
+
+def test_v3_dataset_contract_preserves_v2(history, tmp_path):
+    metadata = build_dataset(history, tmp_path / 'out', '2026-01-01', '2026-01-02', ['ETH'], version='v3')
+    frame = pl.read_parquet(tmp_path / 'out/s2-features-v3/ETH.parquet')
+    v2, _ = build_coin(history, 'ETH', '2026-01-01', '2026-01-02', version='v2')
+    assert frame.columns[:v2.width] == v2.columns
+    assert_frame_equal(frame.select(v2.columns), v2, check_exact=True)
+    assert metadata['feature_columns'] == list(FEATURE_GROUPS_V3)
+    assert metadata['features'] == [{'name': n, 'group': g} for n, g in FEATURE_GROUPS_V3.items()]
+    assert set(metadata['targets']) == {'a', 'b', 'c'}
+    assert metadata['parameters']['warmup_days'] == 31
+    assert set(metadata['coins']['ETH']['null_share_by_group']) == set('ABCDEFGHIJK')
+
+
+@pytest.mark.parametrize('version,option,expected', [
+    ('v1', [], COINS), ('v2', [], COINS), ('v3', [], ALL_COINS),
+    ('v1', ['--coins', 'all'], ALL_COINS), ('v3', ['--coins', 'bnb,ada'], ('BNB', 'ADA')),
+])
+def test_dataset_cli_coin_defaults(monkeypatch, version, option, expected):
+    import strategy2.dataset as module
+    captured = {}
+    def fake(root, out, start, end, coins, **kwargs):
+        captured['coins'] = coins if coins is not None else (ALL_COINS if kwargs['version'] == 'v3' else COINS)
+    monkeypatch.setattr(module, 'build_dataset', fake)
+    module.main(['--root', 'synthetic', '--out', 'synthetic', '--from', '2026-01-01',
+                 '--to', '2026-01-02', '--version', version, *option])
+    assert captured['coins'] == expected
+
+
+@pytest.mark.parametrize('version,expected', [('v1', COINS), ('v2', COINS), ('v3', ALL_COINS)])
+def test_build_dataset_default_universe(history, tmp_path, monkeypatch, version, expected):
+    import strategy2.dataset as module
+    frame, _ = build_coin(history, 'ETH', '2026-01-01', '2026-01-02', version=version)
+    def fake(root, coin, start, end, **kwargs):
+        assert tuple(kwargs['market_bars']) == COINS if version != 'v1' else kwargs['market_bars'] is None
+        return frame.with_columns(pl.lit(coin).alias('coin'),
+            pl.lit(ALL_COINS.index(coin), dtype=pl.Int8).alias('f_coin_id')), {}
+    monkeypatch.setattr(module, 'build_coin', fake)
+    metadata = build_dataset(history, tmp_path / 'out', '2026-01-01', '2026-01-02', version=version)
+    assert tuple(metadata['coins']) == expected
+    assert metadata['parameters']['coins'] == list(expected)
