@@ -59,8 +59,16 @@ store through the standard SDK. Configure its environment for your existing stor
 | `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, optional `AWS_SESSION_TOKEN` | Environment credentials, if used instead of another standard SDK credential provider |
 
 Credentials resolve through the standard SDK chain, including environment,
-existing profiles and available role providers. Use an existing profile when
-selecting one; no credential setup or infrastructure provisioning runs here.
+existing profiles and available role providers.
+
+**Provision AWS (optional).** [infra/terraform](../infra/terraform/) creates a
+private, encrypted S3 bucket, a least-privilege IAM user limited to that bucket
+and a monthly budget alert. Set `AWS_ADMIN_PROFILE`, `S3_BUCKET`, `AWS_REGION`
+and `TF_VAR_budget_email` in `.env`, then run `scripts/aws_setup.sh`. It runs
+`terraform init`/`apply` with the admin profile (review the plan before typing
+`yes`) and stores a new access key in the separate `AWS_PROFILE` used by the
+archiver. Requires Terraform and the AWS CLI. The offline tests use a mocked provider:
+`terraform -chdir=infra/terraform test`.
 
 ```bash
 uv run python -m archiver.archive_daily --date YYYY-MM-DD
