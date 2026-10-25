@@ -170,7 +170,10 @@ def train(data, work, version, target="a", coins=None, config=None, threads=None
     frame = frame.filter(pl.col("ts_ms") >= timestamp_ms(config["dev_from"]))
     metadata_path = root / "metadata.json"
     source_metadata = json.loads(metadata_path.read_text()) if metadata_path.exists() else {}
-    features = source_metadata.get("features", source_metadata.get("feature_columns"))
+    # The dataset writes names in feature_columns and {name, group} records in features.
+    features = source_metadata.get("feature_columns", source_metadata.get("features"))
+    if isinstance(features, list) and features and isinstance(features[0], dict):
+        features = [item["name"] for item in features]
     if features is None:
         features = sorted(name for name in frame.columns if name.startswith("f_"))
     if not isinstance(features, list) or not features or "f_coin_id" not in features:
