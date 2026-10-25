@@ -114,6 +114,7 @@ docs/         Strategy, operations, architecture and historical notes
 docker/       Kafka, ClickHouse and Grafana configuration
 engine/       Rust core, replay and live engine
 inference/    Saved-model streaming prediction service
+infra/        AWS Terraform: S3 archive bucket, least-privilege IAM user, budget alert
 ops/          Optional macOS archive scheduling
 research/     Labels, matrices, training and evaluation
 scripts/      Operations, audits and offline launcher
