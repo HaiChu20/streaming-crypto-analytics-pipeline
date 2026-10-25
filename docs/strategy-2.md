@@ -361,6 +361,61 @@ These cases are reported in the coverage file, never filled in silently.
 | 2 | `strategy2/bars.py`, `strategy2/labels.py`, `strategy2/baselines.py`, `strategy2/base_rates.py` | Synthetic bars: up, down, none, same-minute tie, incomplete window; no-lookahead tests; header and timestamp quirks |
 | 3 | `strategy2/features.py`, `train.py`, `evaluate.py`, `signal.py` | Every feature shifted-data test (no future values); simulator hand-computed cases |
 
+## 11b. v1 result and v2 plan
+
+**v1 (development folds 2024-04 → 2026-03, five coins, trained on Roihu):**
+- **Touch prediction is strong.** AUC 0.856 for A and 0.842 for B, against 0.831 and 0.797 for the volatility-only baseline. Log loss beats every baseline, with the 95% bootstrap CI of the gain excluding 0.
+- **Direction is weak.** 52% overall; 62–65% in the top 2–5% by confidence. The model is **overconfident**: when it predicts 64% it is right 57.6% of the time, and at 76% it is right 63.7%.
+- **The trade simulation loses** −0.085% per trade (A) and −0.075% (B) after taker costs. The break-even win rate is 63% for A and 56.5% for B.
+- **Verdict:** fails acceptance criteria 3 and 4. The lockbox stays closed.
+- **Why:** feature importance is almost entirely volatility. One 3-class model spends its capacity on "move or not".
+
+**v2 changes:**
+
+1. **Two-stage model.**
+   - The *move model* is a binary classifier for touch vs none.
+   - The *side model* is a binary classifier for up-first vs down-first, trained only on touched rows, with its own (more regularised) settings.
+   - They combine as `p_up = p_move·p_side`, `p_down = p_move·(1−p_side)` and `p_none = 1 − p_move`.
+2. **Honest confidence.**
+   - The side model is calibrated on a **6-month** inner validation of touched rows (v1 used 2 months, per class, over all rows). Calibration is isotonic, or Platt if the data is thin.
+   - EV gating uses that calibrated `p_side`.
+3. **Tuning versus confirmation.**
+   - Every candidate runs on all 24 folds.
+   - Settings and the EV threshold are chosen **only on the first 12 folds** (2024-04 → 2025-03).
+   - The chosen candidate is judged on the **last 12 folds** (2025-04 → 2026-03), which no selection used.
+   - All candidates are reported.
+4. **Direction features (`s2-features-v2` = v1 plus groups I and J).**
+   - **I. Market and persistence.**
+     - Five-coin market return over 15/60/240 min, and the coin's relative strength against it.
+     - Returns scaled by volatility.
+     - Imbalance z-scores versus 7 days.
+     - Premium change over 60 min.
+     - Funding × OI-change interaction.
+     - Breakout flags.
+     - Recent first-touch history: share of up-first among the last 24 h of labels **whose label already ended before T**.
+   - **J. Coinbase premium.** Coinbase USD versus Binance USDT spot, from public Coinbase 1-minute candles: level, 60/240-minute change, 7-day z-score, and Coinbase volume share. XRP starts on Coinbase on 2023-07-13; earlier rows are null.
+5. **Cost scenarios.**
+   - The headline stays taker/taker: 0.13% round trip with slippage.
+   - A reported sensitivity uses a maker entry and taker exit: 0.02% + 0.05% + 0.02% stop slippage, about 0.09%.
+   - A maker fill is not guaranteed, so the sensitivity is never the headline.
+6. **Side-model grid (four settings, all reported).**
+
+   | Candidate | Settings |
+   | --- | --- |
+   | v1-like | 15 leaves, min leaf 500 |
+   | Small | 7 leaves, 2000, feature fraction 0.5 |
+   | Medium | 31 leaves, 1000, feature fraction 0.5, λ₂ 20 |
+   | Very small | 7 leaves, 5000, feature fraction 0.3, extra-trees |
+
+   Each runs on both feature versions (v1 and v2). That makes **16 runs**, as one Slurm array job.
+
+**v2 acceptance, on the confirmation folds:**
+- the side model's calibration is within 2 pp per decile;
+- side log loss beats v1 and the prior, with the bootstrap CI excluding 0;
+- net expectancy under the headline costs is positive with a bootstrap lower bound > 0, at the EV threshold chosen on the tuning folds, with at least 100 trades.
+
+If it fails, we report it and move to the remaining tier-2 data: liquidations, large-trade flow and option flow.
+
 ## 12. Risks and open questions
 
 - **Live parity for `bookDepth`.** Binance's ±5% depth may need more book
