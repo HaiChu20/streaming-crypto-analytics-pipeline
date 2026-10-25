@@ -143,6 +143,34 @@ def load_dvol(root, currency, start, end):
     return _finish(frames, ['dvol'], start, end, HOUR_MS)
 
 
+def load_coinbase(root, coin, start, end):
+    """Coinbase minute opens; missing trade minutes remain absent."""
+    coin = coin.upper()
+    if not coin.isalnum():
+        raise ValueError('invalid coin')
+    lower, upper = _boundary_ms(start), _boundary_ms(end, end=True)
+    first = pl.Series([lower]).cast(pl.Datetime('ms', 'UTC')).dt.strftime('%Y-%m-%d')[0]
+    last = pl.Series([upper - 1]).cast(pl.Datetime('ms', 'UTC')).dt.strftime('%Y-%m-%d')[0]
+    columns = ['open', 'high', 'low', 'close', 'volume']
+    schema = {'ts_ms': pl.Int64, **{name: pl.Float64 for name in columns}}
+    frames = [pl.read_csv(path, schema_overrides=schema)
+              for path in sorted((Path(root) / 'coinbase/candles_1m' / f'{coin}-USD').glob('*.csv'))
+              if first <= path.stem <= last]
+    result = _finish(frames, columns, start, end, MINUTE_MS)
+    if (result['ts_ms'] % MINUTE_MS != 0).any():
+        raise ValueError('off-grid Coinbase candle')
+    return result
+
+
+def load_perp_closes(root, coin, start, end):
+    """Compact market context: discard unused kline columns per archive."""
+    lower, upper = _boundary_ms(start), _boundary_ms(end, end=True)
+    frames = [_read_zip(path).select('ts_ms', 'close').filter(
+        pl.col('ts_ms').is_between(lower, upper, closed='left'))
+        for path in _files(root, 'klines', coin, start, end, minute=True)]
+    return _finish(frames, ['close'], start, end, MINUTE_MS).drop('available_ms')
+
+
 def load_sources(root, coin, start, end):
     """Load one coin at a time. BTC DVOL supplies non-ETH market context."""
     return {
