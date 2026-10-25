@@ -34,15 +34,14 @@ def _row_scores(frame, stops, shrunk):
     if missing:
         raise ValueError(f'OOF missing required columns: {", ".join(missing)}')
     y = frame['return_pct'].to_numpy()
-    directions = frame['direction'].to_numpy()
     probs = frame.select('p_down', 'p_flat', 'p_up').to_numpy()
-    # Class metrics use the saved outcome class, argmax in [-1, 0, 1] order,
+    # forecast_metrics uses sign(return_pct), argmax in [-1, 0, 1] order,
     # and the finite classifier expected-return mask when that column is saved.
-    valid = np.isfinite(y) & (directions != 0)
+    valid = np.isfinite(y) & (y != 0)
     valid &= (np.isfinite(frame['classifier_expected'].to_numpy()) if 'classifier_expected' in frame.columns
               else np.isfinite(probs).all(axis=1))
-    accuracy = np.where(valid, (np.argmax(probs, axis=1) - 1 == directions).astype(float), np.nan)
-    log_loss, brier = probability_losses(directions, probs)
+    accuracy = np.where(valid, (np.argmax(probs, axis=1) - 1 == np.sign(y)).astype(float), np.nan)
+    log_loss, brier = probability_losses(np.sign(y), probs)
     scores = {'classifier_directional_accuracy': accuracy,
               'classifier_log_loss': log_loss, 'classifier_brier_score': brier}
     for name in ['regressor', 'ridge'] + (['regressor_shrunk'] if shrunk else []):
