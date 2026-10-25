@@ -38,7 +38,7 @@ and UNCERTAIN annotation instead of marking that new connection broken.
 ### Real-day replay after FIX2
 
 ```sh
-/usr/bin/time -l engine/target/release/engine-replay --root data --date 2026-10-17 --allow-open --out /private/tmp/claude-502/-Users-bfhach-Projects-streaming-crypto-analytics-pipeline/60166cad-1579-46c0-bd19-31bf3993d4db/scratchpad/features
+/usr/bin/time -l engine/target/release/engine-replay --root data --date 2026-10-17 --allow-open --out "<scratch>/features"
 ```
 
 - Input: 42 streams; 16,054,399,210 capped bytes;
@@ -114,11 +114,11 @@ That independent replay's sampled prefix is unchanged; it was not rerun for FIX2
 
 ### Artifacts
 
-- Parquet: `/private/tmp/claude-502/-Users-bfhach-Projects-streaming-crypto-analytics-pipeline/60166cad-1579-46c0-bd19-31bf3993d4db/scratchpad/features/date=2026-10-17/features.parquet`
-- Input caps/metrics: `/private/tmp/claude-502/-Users-bfhach-Projects-streaming-crypto-analytics-pipeline/60166cad-1579-46c0-bd19-31bf3993d4db/scratchpad/p5b-fix2-report.json`
-- Timing/RSS: `/private/tmp/claude-502/-Users-bfhach-Projects-streaming-crypto-analytics-pipeline/60166cad-1579-46c0-bd19-31bf3993d4db/scratchpad/p5b-fix2-time.txt`
-- Ordering/staleness/tail audit: `/private/tmp/claude-502/-Users-bfhach-Projects-streaming-crypto-analytics-pipeline/60166cad-1579-46c0-bd19-31bf3993d4db/scratchpad/p5b-fix2-audit.json`
-- Independent Python reference: `/private/tmp/claude-502/-Users-bfhach-Projects-streaming-crypto-analytics-pipeline/60166cad-1579-46c0-bd19-31bf3993d4db/scratchpad/p5b-fix-crosscheck.json`
+- Parquet: `<scratch>/features/date=2026-10-17/features.parquet`
+- Input caps/metrics: `<scratch>/p5b-fix2-report.json`
+- Timing/RSS: `<scratch>/p5b-fix2-time.txt`
+- Ordering/staleness/tail audit: `<scratch>/p5b-fix2-audit.json`
+- Independent Python reference: `<scratch>/p5b-fix-crosscheck.json`
 
 Feature contract and official exchange field-semantic citations remain in
 [replay guide](../../engine/replay/README.md). Raw data and the running pipeline were not modified.

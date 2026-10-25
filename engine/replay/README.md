@@ -356,7 +356,7 @@ received value/availability, and connection controls do not erase known candles.
 State retains the hour plus 180-second endpoint grace and pending candles, and
 is included in checkpoints, `as_live` and `--from-state` replay. Archive input
 accepts numeric and exact-string OHLC values; the reader retains the inner row's
-text without decimal reserialization. See [server backfill](../../README.md#deribit-dvol-p22-features-v5)
+text without decimal reserialization. See [server backfill](../../docs/operations.md#deribit-dvol-p22-features-v5)
 for receive-day files and operational instructions.
 
 Earlier DVOL validation and before/after fixture measurements are in the
