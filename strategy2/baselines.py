@@ -12,9 +12,10 @@ PROB_COLUMNS = ('p_up_first', 'p_down_first', 'p_none')
 def vol_only(bars, barrier_pct, horizon_min, lookback_min=60):
     """Zero-drift arithmetic Brownian exit from (-a, a), a=barrier_pct.
 
-    One row per entry timestamp. Sigma is the RMS of the last lookback_min
-    close-to-close log returns, strictly before entry (61 completed bars for
-    60 returns). A gap or insufficient history yields null probabilities.
+    One row per DECISION timestamp ts_ms. Join on ts_ms, never entry_ms:
+    the latency bar is unavailable at the decision. Sigma is the RMS of the
+    last lookback_min close-to-close log returns, strictly before ts_ms
+    (61 completed bars for 60 returns). Gaps yield null probabilities.
     The survival series is 4/pi * sum((-1)^k/(2k+1) *
     exp(-(2k+1)^2*pi^2*sigma^2*horizon/(8*a^2))).
     """
@@ -57,7 +58,10 @@ def prior(training_labels):
 
 
 def momentum(bars, horizon_min):
-    """Direction at entry from horizon-length close return, strictly before entry."""
+    """Direction at decision ts_ms from closes strictly before ts_ms.
+
+    Join on decision ts_ms, never entry_ms, to exclude the latency bar.
+    """
     _timestamps(bars)
     if not isinstance(horizon_min, (int, np.integer)) or horizon_min < 1:
         raise ValueError('horizon_min must be a positive integer')
@@ -71,3 +75,16 @@ def momentum(bars, horizon_min):
 def reversal(bars, horizon_min):
     """Opposite of the momentum direction; for accuracy comparisons only."""
     return momentum(bars, horizon_min).with_columns(-pl.col('direction'))
+
+
+def join_baselines(decisions, bars, target, barrier_pct, horizon_min):
+    """Attach forecasts on DECISION ts_ms, regardless of entry_ms/latency.
+
+    Every forecast uses only bars whose close is available by the decision.
+    """
+    probabilities = vol_only(bars, barrier_pct, horizon_min).rename(dict(zip(
+        PROB_COLUMNS, (f'vol_p_up_{target}', f'vol_p_down_{target}', f'vol_p_none_{target}'))))
+    directions = momentum(bars, horizon_min).rename({'direction': f'mom_dir_{target}'})
+    return decisions.join(probabilities, on='ts_ms', how='left').join(
+        directions, on='ts_ms', how='left').with_columns(
+            (-pl.col(f'mom_dir_{target}')).alias(f'rev_dir_{target}'))
