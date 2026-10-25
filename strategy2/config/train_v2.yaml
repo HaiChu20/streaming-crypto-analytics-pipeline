@@ -1,0 +1,33 @@
+model: two_stage
+inner_validation_months: 6
+side_calibration: isotonic
+calibration: true
+tuning_until: '2025-04-01'
+move_lightgbm:
+  num_leaves: 15
+  min_data_in_leaf: 500
+  feature_fraction: 0.7
+  bagging_fraction: 0.7
+  bagging_freq: 1
+  lambda_l2: 10
+  learning_rate: 0.03
+side_lightgbm:
+  num_leaves: 15
+  min_data_in_leaf: 500
+  feature_fraction: 0.7
+  bagging_fraction: 0.7
+  bagging_freq: 1
+  lambda_l2: 10
+  learning_rate: 0.03
+cost_scenarios:
+  headline:
+    entry_fee: 0.0005
+    exit_fee: 0.0005
+    slippage_entry: 0.0001
+    slippage_exit: 0.0002
+  maker_entry:
+    entry_fee: 0.0002
+    exit_fee: 0.0005
+    slippage_entry: 0.0
+    slippage_exit: 0.0002
+ev_threshold_sweep: [0, 0.0005, 0.001, 0.0015, 0.002, 0.003]

@@ -1,0 +1,6 @@
+side_lightgbm:
+  num_leaves: 31
+  min_data_in_leaf: 1000
+  feature_fraction: 0.5
+  lambda_l2: 20
+  learning_rate: 0.03

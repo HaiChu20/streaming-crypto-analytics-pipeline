@@ -1,6 +1,7 @@
 """Evaluate saved development OOF predictions and render a self-contained report."""
 
 import argparse
+import csv
 from datetime import datetime, timezone
 import html
 import json
@@ -9,7 +10,7 @@ from pathlib import Path
 import numpy as np
 import polars as pl
 
-from strategy2.simulate import simulation_report, weekly_bootstrap
+from strategy2.simulate import period_frames, simulation_report, weekly_bootstrap
 from strategy2.train import (baseline_probabilities, class_indices, confidence,
                              threshold_name)
 
@@ -34,8 +35,7 @@ def binary_auc(labels, scores):
     starts = np.r_[0, np.flatnonzero(np.diff(sorted_scores)) + 1]
     ends = np.r_[starts[1:], len(scores)]
     ranks = np.empty(len(scores), dtype=float)
-    for start, end in zip(starts, ends):
-        ranks[order[start:end]] = (start + 1 + end) / 2
+    ranks[order] = np.repeat((starts + 1 + ends) / 2, ends - starts)
     return float((ranks[labels].sum() - positive * (positive + 1) / 2) / (positive * negative))
 
 
@@ -55,15 +55,65 @@ def calibration_table(labels, probabilities):
     return result
 
 
-def classification_metrics(labels, probabilities):
+def side_probabilities(frame, source="model"):
+    column = "p_side" if source == "model" else "raw_p_side" if source == "raw" else None
+    if column and column in frame.columns:
+        return frame[column].to_numpy()
+    p = source_probabilities(frame, source)
+    return np.divide(p[:, 0], p[:, 0] + p[:, 1], out=np.full(len(frame), 0.5),
+                     where=p[:, 0] + p[:, 1] > 0)
+
+
+def binary_log_loss_rows(labels, probabilities):
+    y, p = np.asarray(labels, dtype=bool), np.asarray(probabilities, dtype=float)
+    if len(y) != len(p) or not np.isfinite(p).all() or (p < 0).any() or (p > 1).any():
+        raise ValueError("Invalid side probabilities")
+    return -np.log(np.clip(np.where(y, p, 1 - p), 1e-15, 1))
+
+
+def side_metrics(labels, probabilities):
+    labels, probabilities = np.asarray(labels), np.asarray(probabilities, dtype=float)
+    touched = labels != 0
+    y, p = labels[touched] == 1, probabilities[touched]
+    losses = binary_log_loss_rows(y, p)
+    win = np.maximum(p, 1 - p)
+    correct = (p >= 0.5) == y
+    def row(selected, lower, upper):
+        return {"lower": float(lower), "upper": float(upper), "rows": int(selected.sum()),
+                "predicted": float(win[selected].mean()) if selected.any() else None,
+                "realised": float(correct[selected].mean()) if selected.any() else None}
+    edges = np.array([0.5, 0.55, 0.6, 0.65, 0.7, 0.8, 1.0])
+    bins = np.minimum(np.searchsorted(edges, win, side="right") - 1, len(edges) - 2)
+    table = [row(bins == i, lo, hi) for i, (lo, hi) in enumerate(zip(edges[:-1], edges[1:]))]
+    order = np.argsort(win, kind="stable")
+    decile_id = np.empty(len(p), dtype=int)
+    decile_id[order] = np.minimum(np.arange(len(p)) * 10 // max(1, len(p)), 9)
+    deciles = []
+    for i in range(10):
+        selected = decile_id == i
+        deciles.append(dict(decile=i + 1, **row(selected, win[selected].min() if selected.any() else 0.5,
+                                               win[selected].max() if selected.any() else 1)))
+    return {"rows": int(touched.sum()), "log_loss": float(losses.mean()) if len(p) else None,
+            "brier": float(np.mean((p - y) ** 2)) if len(p) else None,
+            "auc": binary_auc(y, p), "calibration": table, "calibration_deciles": deciles}
+
+
+def classification_metrics(labels, probabilities, p_side=None):
     labels, probabilities = np.asarray(labels), np.asarray(probabilities, dtype=float)
     if not len(labels):
         return {"rows": 0, "log_loss": None, "touch_auc": None,
-                "side_accuracy": None, "calibration": None}
+                "side_accuracy": None, "calibration": None, "side": side_metrics([], []),
+                "side_log_loss": None, "side_brier": None, "side_auc": None}
     losses = log_loss_rows(labels, probabilities)
     touched = labels != 0
     directions = np.sign(probabilities[:, 0] - probabilities[:, 1])
+    if p_side is None:
+        p_side = np.divide(probabilities[:, 0], probabilities[:, 0] + probabilities[:, 1],
+                           out=np.full(len(labels), 0.5), where=probabilities[:, 0] + probabilities[:, 1] > 0)
+    side = side_metrics(labels, p_side)
+    directions = np.sign(np.asarray(p_side) - 0.5)
     return {"rows": len(labels), "log_loss": float(losses.mean()),
+            "side": side, "side_log_loss": side["log_loss"], "side_brier": side["brier"], "side_auc": side["auc"],
             "touch_auc": binary_auc(touched, 1 - probabilities[:, 2]),
             "side_accuracy": float((directions[touched] == labels[touched]).mean()) if touched.any() else None,
             "calibration": calibration_table(labels, probabilities)}
@@ -80,6 +130,10 @@ def selective_metrics(frame, probabilities, source, fractions):
     labels = frame["label"].to_numpy()
     scores = confidence(probabilities)
     directions = np.sign(probabilities[:, 0] - probabilities[:, 1])
+    if source in ("model", "raw") and ("p_side" if source == "model" else "raw_p_side") in frame.columns:
+        sides = side_probabilities(frame, source)
+        scores = np.maximum(sides, 1 - sides)
+        directions = np.sign(sides - 0.5)
     result = {}
     for fraction in fractions:
         column = threshold_name(source, fraction)
@@ -95,7 +149,7 @@ def selective_metrics(frame, probabilities, source, fractions):
     return result
 
 
-def evaluate_frame(frame, config):
+def evaluate_frame(frame, config, reference=None, include_periods=True):
     sources = ["model", "vol", "mom", "rev", "prior"]
     if config.get("calibration"):
         sources.insert(1, "raw")
@@ -109,8 +163,8 @@ def evaluate_frame(frame, config):
         eligible = np.isfinite(probabilities).all(axis=1)
         sub = frame.filter(pl.Series(eligible))
         p = probabilities[eligible]
-        report["metrics"][source] = classification_metrics(sub["label"].to_numpy(), p)
-        report["metrics"][source]["available_coverage"] = float(eligible.mean())
+        report["metrics"][source] = classification_metrics(sub["label"].to_numpy(), p, side_probabilities(sub, source))
+        report["metrics"][source]["available_coverage"] = float(eligible.mean()) if len(eligible) else None
         report["metrics"][source]["selective"] = selective_metrics(sub, p, source, config["selective_fractions"])
         if source not in ("model", "raw"):
             difference = (log_loss_rows(sub["label"].to_numpy(), source_probabilities(sub, "model"))
@@ -119,11 +173,28 @@ def evaluate_frame(frame, config):
                 difference, sub["ts_ms"].to_list(), config.get("bootstrap_draws", 1000), config.get("bootstrap_seed", 17))
         for (coin,), group in sub.group_by("coin"):
             report["per_coin"].setdefault(coin, {})[source] = classification_metrics(
-                group["label"].to_numpy(), source_probabilities(group, source))
+                group["label"].to_numpy(), source_probabilities(group, source), side_probabilities(group, source))
         years = sub.with_columns(pl.from_epoch("ts_ms", time_unit="ms").dt.year().alias("year"))
         for (year,), group in years.group_by("year"):
             report["per_year"].setdefault(str(year), {})[source] = classification_metrics(
-                group["label"].to_numpy(), source_probabilities(group, source))
+                group["label"].to_numpy(), source_probabilities(group, source), side_probabilities(group, source))
+    touched = frame["label"].to_numpy() != 0
+    y = frame["label"].to_numpy()[touched] == 1
+    losses = binary_log_loss_rows(y, side_probabilities(frame)[touched])
+    baseline = binary_log_loss_rows(y, side_probabilities(frame, "prior")[touched])
+    bootstrap = lambda values: weekly_bootstrap(values, frame["ts_ms"].to_numpy()[touched],
+        config.get("bootstrap_draws", 1000), config.get("bootstrap_seed", 17))
+    report["paired_side_log_loss_difference"] = {"prior": bootstrap(losses - baseline)}
+    if reference is not None:
+        if not frame.select("ts_ms", "coin", "label").equals(reference.select("ts_ms", "coin", "label")):
+            raise ValueError("Reference rows must be aligned with matching labels")
+        report["paired_side_log_loss_difference"]["reference"] = bootstrap(
+            losses - binary_log_loss_rows(y, side_probabilities(reference)[touched]))
+    if include_periods:
+        parts = period_frames(frame, config)
+        references = period_frames(reference, config) if reference is not None else {}
+        report["periods"] = {period: evaluate_frame(part, config, references.get(period), False)
+                             for period, part in parts.items()}
     return report
 
 
@@ -140,13 +211,30 @@ def render_html(report):
         lines.append("<tr>" + "".join(f"<td>{fmt(value)}</td>" for value in
                      (source, metrics["rows"], metrics["log_loss"], metrics["touch_auc"], metrics["side_accuracy"])) + "</tr>")
     lines.append("</table>")
-    for key in ("notes", "paired_log_loss_difference", "metrics", "simulation", "per_coin", "per_year"):
+    for key in ("notes", "paired_log_loss_difference", "metrics", "simulation", "per_coin", "per_year", "paired_side_log_loss_difference", "periods"):
         lines.append(f"<details><summary>{html.escape(key.replace('_', ' ').title())}</summary><pre>{html.escape(json.dumps(report[key], indent=2))}</pre></details>")
     lines.append("</html>")
     return "\n".join(lines)
 
 
-def evaluate(directory):
+def align_reference(frame, reference, intersection=False):
+    keys = ["ts_ms", "coin"]
+    for part in (frame, reference):
+        if part.select(pl.struct(keys).is_duplicated().any()).item():
+            raise ValueError("Duplicate reference/OOF keys")
+    common = frame.select(keys).join(reference.select(keys), on=keys, how="inner")
+    if not intersection and (len(common) != len(frame) or len(common) != len(reference)):
+        raise ValueError("Mismatched OOF row sets; use --compare-intersection to restrict both runs")
+    if not len(common):
+        raise ValueError("No common OOF observations")
+    left = frame.join(common, on=keys, how="semi").sort(keys)
+    right = reference.join(common, on=keys, how="semi").sort(keys)
+    if not left.select("label").equals(right.select("label")):
+        raise ValueError("Reference outcomes do not match")
+    return left, right
+
+
+def evaluate(directory, compare=None, compare_intersection=False):
     directory = Path(directory)
     metadata = json.loads((directory / "metadata.json").read_text())
     frame = pl.read_parquet(directory / "oof.parquet")
@@ -154,22 +242,98 @@ def evaluate(directory):
         raise ValueError("No OOF observations")
     if frame["ts_ms"].max() >= metadata["lockbox_exclusive_ms"]:
         raise ValueError("OOF contains sealed lockbox rows")
+    reference = None
+    if compare is not None:
+        path = Path(compare)
+        if path.is_dir():
+            reference_metadata = json.loads((path / "metadata.json").read_text())
+            if reference_metadata["target"] != metadata["target"]:
+                raise ValueError("Reference target does not match")
+            path = path / "oof.parquet"
+        reference = pl.read_parquet(path)
+        if len(reference) and reference["ts_ms"].max() >= metadata["lockbox_exclusive_ms"]:
+            raise ValueError("Reference OOF contains sealed lockbox rows")
+        frame, reference = align_reference(frame, reference, compare_intersection)
     config = metadata["config"]
-    report = evaluate_frame(frame, config)
+    report = evaluate_frame(frame, config, reference)
+    simulation = simulation_report(frame, config, metadata["target"])
+    for period in report["periods"]:
+        report["periods"][period]["simulation"] = {
+            name: {"label": scenario["label"], **scenario["periods"][period],
+                   "chosen_ev_threshold": scenario["ev_selection"]["threshold"],
+                   "selected": scenario["ev_selection"]["periods"].get(period)}
+            for name, scenario in simulation["scenarios"].items()}
     report.update(target=metadata["target"], version=metadata["version"], git_sha=metadata["git_sha"],
-                  generated_at=datetime.now(timezone.utc).isoformat(),
-                  simulation=simulation_report(frame, config, metadata["target"]))
+                  generated_at=datetime.now(timezone.utc).isoformat(), simulation=simulation,
+                  comparison={"reference": str(compare) if compare is not None else None,
+                              "intersection": compare_intersection, "rows": len(frame)})
     (directory / "report.json").write_text(json.dumps(report, indent=2, allow_nan=False))
     (directory / "report.html").write_text(render_html(report))
     return report
 
 
+def summarize(directories, out):
+    rows = []
+    for directory in directories:
+        report = evaluate(directory)
+        for period, diagnostics in report["periods"].items():
+            model = diagnostics["metrics"]["model"]
+            side = model["side"]
+            gaps = [abs(bin["predicted"] - bin["realised"]) for bin in side["calibration"] if bin["rows"] >= 500]
+            for name, scenario in report["simulation"]["scenarios"].items():
+                selection = scenario["ev_selection"]
+                trades = selection["periods"].get(period, {})
+                ci = trades.get("mean_net_return_ci") or {}
+                rows.append({"run": str(directory), "target": report["target"], "period": period,
+                    "scenario": name, "label": scenario["label"], "side_log_loss": side["log_loss"],
+                    "side_auc": side["auc"], "calibration_max_gap_500": max(gaps) if gaps else None,
+                    "touch_auc": model["touch_auc"], "log_loss": model["log_loss"],
+                    "chosen_ev_threshold": selection["threshold"], "trades": trades.get("trades", 0),
+                    "mean_net_return": trades.get("mean_net_return"), "ci_low": ci.get("ci_low"),
+                    "ci_high": ci.get("ci_high"), "selection_note": selection["reason"]})
+    best = {}
+    for row in rows:
+        if row["period"] == "tuning" and row["scenario"] == "headline" and row["side_log_loss"] is not None:
+            target = row["target"]
+            if target not in best or row["side_log_loss"] < best[target]["side_log_loss"]:
+                best[target] = {"run": row["run"], "side_log_loss": row["side_log_loss"]}
+    output = Path(out)
+    output.mkdir(parents=True, exist_ok=True)
+    result = {"selection_period": "tuning", "selection_metric": "side_log_loss", "best_by_target": best, "rows": rows}
+    (output / "summary.json").write_text(json.dumps(result, indent=2, allow_nan=False))
+    with (output / "summary.csv").open("w", newline="") as stream:
+        writer = csv.DictWriter(stream, fieldnames=list(rows[0]) if rows else [])
+        writer.writeheader()
+        writer.writerows(rows)
+    columns = ["run", "target", "period", "scenario", "side_log_loss", "side_auc", "calibration_max_gap_500",
+               "touch_auc", "log_loss", "chosen_ev_threshold", "trades", "mean_net_return", "ci_low", "ci_high", "selection_note"]
+    print("\t".join(columns))
+    for row in rows:
+        print("\t".join(f"{row[c]:.6g}" if isinstance(row[c], float) else str(row[c]) for c in columns))
+    print("Best candidate by tuning side log loss: " + json.dumps(best))
+    return result
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("directory")
+    parser.add_argument("directory", nargs="?")
+    parser.add_argument("--compare", help="Reference run directory or OOF parquet")
+    parser.add_argument("--compare-intersection", action="store_true", help="Explicitly restrict BOTH runs to common keys")
+    parser.add_argument("--summary", nargs="+", metavar="RUN")
+    parser.add_argument("--out", type=Path, default=Path("."))
     args = parser.parse_args()
-    report = evaluate(args.directory)
-    print(json.dumps({"model": report["metrics"]["model"], "trades": report["simulation"]["trades"]}))
+    if args.summary:
+        if args.compare or args.directory:
+            parser.error("--summary cannot be combined with directory/--compare")
+        summarize(args.summary, args.out)
+    else:
+        if args.directory is None:
+            parser.error("directory or --summary is required")
+        if args.compare_intersection and args.compare is None:
+            parser.error("--compare-intersection requires --compare")
+        report = evaluate(args.directory, args.compare, args.compare_intersection)
+        print(json.dumps({"model": report["metrics"]["model"], "trades": report["simulation"]["trades"],
+                          "ev_selection": report["simulation"]["ev_selection"]}))
 
 
 if __name__ == "__main__":

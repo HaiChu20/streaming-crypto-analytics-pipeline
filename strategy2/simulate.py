@@ -5,7 +5,8 @@ from datetime import datetime, timezone
 import numpy as np
 import polars as pl
 
-from strategy2.signal import make_signal, round_trip_cost
+from strategy2.signal import round_trip_cost
+from strategy2.train import timestamp_ms
 
 DAY_MS = 86_400_000
 
@@ -24,7 +25,8 @@ def weekly_bootstrap(values, ts_ms, draws=1000, seed=17):
         raise ValueError("Bootstrap needs aligned finite observations")
     if not len(values):
         return {"mean": None, "ci_low": None, "ci_high": None, "weeks": 0}
-    _, inverse = np.unique(week_blocks(ts_ms), return_inverse=True)
+    # Epoch day zero is Thursday: adding three groups Monday-through-Sunday.
+    _, inverse = np.unique((np.asarray(ts_ms, dtype=np.int64) // DAY_MS + 3) // 7, return_inverse=True)
     sums = np.bincount(inverse, weights=values)
     counts = np.bincount(inverse)
     rng = np.random.default_rng(seed)
@@ -50,49 +52,74 @@ def funding_crossings(entry_ms, exit_ms, next_funding_ms, funding_interval_ms):
 
 
 def simulate(rows, config, target="a", ev_threshold=None):
-    """Return trade dictionaries. Rows use the target-independent OOF schema."""
+    """Vectorise probability/EV gating; schedule only gated rows, one coin at a time."""
     frame = rows if isinstance(rows, pl.DataFrame) else pl.DataFrame(rows)
     if frame.is_empty():
         return []
+    p = frame.select("p_up", "p_down", "p_none").to_numpy()
+    if (not np.isfinite(p).all() or (p < 0).any() or (p > 1).any()
+            or not np.allclose(p.sum(axis=1), 1, rtol=1e-9, atol=1e-6)):
+        raise ValueError("Invalid probability distributions")
+    move = frame["p_move"].to_numpy() if "p_move" in frame.columns else 1 - p[:, 2]
+    side = frame["p_side"].to_numpy() if "p_side" in frame.columns else np.divide(
+        p[:, 0], p[:, 0] + p[:, 1], out=np.full(len(frame), 0.5), where=p[:, 0] + p[:, 1] > 0)
+    if (not np.isfinite(move).all() or not np.isfinite(side).all()
+            or (move < 0).any() or (move > 1).any() or (side < 0).any() or (side > 1).any()):
+        raise ValueError("Invalid two-stage probabilities")
+    direction = np.sign(side - 0.5).astype(np.int8)
+    def setting(key):
+        default = config.get(key, 0.0)
+        return frame[key].fill_null(default).to_numpy() if key in frame.columns else default
+    timeout = np.where(direction > 0, setting("timeout_mean_long"), setting("timeout_mean_short"))
+    cost = round_trip_cost(config)
+    two_stage = "p_move" in frame.columns or "p_side" in frame.columns
+    edge = move * np.abs(2 * side - 1) if two_stage else np.abs(p[:, 0] - p[:, 1])
+    none = 1 - move if two_stage else p[:, 2]
+    ev = edge * config["targets"][target]["barrier"] + none * timeout - cost
+    threshold = setting("ev_threshold") if ev_threshold is None else ev_threshold
+    gate = (direction != 0) & (ev > threshold)
+    gated = frame.with_columns(pl.Series("_direction", direction), pl.Series("_ev", ev)).filter(pl.Series(gate))
+    prices = frame["entry_price"].to_numpy()
+    if not np.isfinite(prices).all() or (prices <= 0).any():
+        raise ValueError("entry_price must be positive")
+    if gated.is_empty():
+        return []
     trades = []
-    available = {}
-    for row in frame.sort(["ts_ms", "coin"]).iter_rows(named=True):
-        coin, entry = row["coin"], int(row["entry_ms"])
-        # The decision, not its future fill, must occur after the previous exit.
-        if row["ts_ms"] < available.get(coin, -1):
-            continue
-        cfg = dict(config, entry_ms=entry)
-        for key in ("timeout_mean_long", "timeout_mean_short", "ev_threshold"):
-            if row.get(key) is not None:
-                cfg[key] = row[key]
-        if ev_threshold is not None:
-            cfg["ev_threshold"] = ev_threshold
-        signal = make_signal(row["ts_ms"], coin, target, row["p_up"], row["p_down"],
-                             row["p_none"], row["entry_price"], cfg)
-        if not signal["trade"]:
-            continue
-        label = int(row["label"])
-        if label not in (-1, 0, 1):
-            raise ValueError("Invalid outcome label")
-        minutes = row["minutes_to_touch"] if label else config["targets"][target]["horizon_minutes"]
-        if minutes is None or minutes <= 0:
-            raise ValueError("Touched rows need a positive minutes_to_touch")
-        exit_ms = entry + int(minutes * 60_000)
-        crossings = funding_crossings(entry, exit_ms, row.get("next_funding_ms"),
-                                      row.get("funding_interval_ms"))
-        rate = row.get("last_funding_rate")
-        if crossings and (rate is None or not np.isfinite(rate)):
-            raise ValueError("Funding crossing has no finite last_funding_rate")
-        funding = signal["direction"] * rate * crossings if crossings else 0.0
-        gross = signal["direction"] * row["exit_return"]
-        cost = round_trip_cost(cfg)
-        trades.append({"ts_ms": row["ts_ms"], "coin": coin, "entry_ms": entry,
-                       "exit_ms": exit_ms, "direction": signal["direction"],
-                       "outcome": label * signal["direction"], "gross_return": gross,
-                       "cost": cost, "funding": funding, "funding_crossings": crossings,
-                       "net_return": gross - cost - funding, "ev": signal["ev"]})
-        available[coin] = exit_ms
-    return trades
+    horizon = config["targets"][target]["horizon_minutes"]
+    for group in gated.sort(["coin", "ts_ms"]).partition_by("coin", maintain_order=True):
+        times = group["ts_ms"].to_numpy()
+        entries = group["entry_ms"].to_numpy()
+        labels = group["label"].to_numpy()
+        minutes = np.where(labels != 0, group["minutes_to_touch"].to_numpy(), horizon)
+        selected = []
+        index = 0
+        while index < len(group):
+            if labels[index] not in (-1, 0, 1):
+                raise ValueError("Invalid outcome label")
+            if not np.isfinite(minutes[index]) or minutes[index] <= 0:
+                raise ValueError("Touched rows need a positive minutes_to_touch")
+            exit_ms = int(entries[index]) + int(minutes[index] * 60_000)
+            selected.append(index)
+            # Decision timestamp, rather than future fill, must follow the prior exit.
+            index = max(index + 1, int(np.searchsorted(times, exit_ms, side="left")))
+        for row in group[selected].iter_rows(named=True):
+            entry, direction = int(row["entry_ms"]), int(row["_direction"])
+            label = int(row["label"])
+            minutes = row["minutes_to_touch"] if label else horizon
+            exit_ms = entry + int(minutes * 60_000)
+            crossings = funding_crossings(entry, exit_ms, row.get("next_funding_ms"), row.get("funding_interval_ms"))
+            rate = row.get("last_funding_rate")
+            if crossings and (rate is None or not np.isfinite(rate)):
+                raise ValueError("Funding crossing has no finite last_funding_rate")
+            funding = direction * rate * crossings if crossings else 0.0
+            gross = direction * row["exit_return"]
+            trades.append({"ts_ms": row["ts_ms"], "coin": row["coin"], "entry_ms": entry,
+                           "exit_ms": exit_ms, "direction": direction, "outcome": label * direction,
+                           "gross_return": gross, "cost": cost, "funding": funding,
+                           "funding_crossings": crossings, "net_return": gross - cost - funding,
+                           "ev": row["_ev"]})
+    return sorted(trades, key=lambda trade: (trade["ts_ms"], trade["coin"]))
+
 
 
 def trade_metrics(trades, config, target="a", start_ms=None, end_ms=None):
@@ -130,22 +157,78 @@ def trade_metrics(trades, config, target="a", start_ms=None, end_ms=None):
     return result
 
 
+def period_frames(frame, config):
+    """Periods are assigned by decision/test time, with an exclusive tuning cutoff."""
+    cutoff = timestamp_ms(config.get("tuning_until", "2025-04-01"))
+    return {"all": frame, "tuning": frame.filter(pl.col("ts_ms") < cutoff),
+            "confirmation": frame.filter(pl.col("ts_ms") >= cutoff)}
+
+
+def choose_ev_threshold(tuning_sweep, minimum_trades=100):
+    eligible = [row for row in tuning_sweep if row["trades"] >= minimum_trades
+                and row["mean_net_return"] is not None]
+    if not eligible:
+        return None
+    # Deterministic tie-break: prefer the lower threshold.
+    return min(eligible, key=lambda row: (-row["mean_net_return"], row["ev_threshold"]))["ev_threshold"]
+
+
 def simulation_report(rows, config, target="a"):
     frame = rows if isinstance(rows, pl.DataFrame) else pl.DataFrame(rows)
-    start, end = int(frame["ts_ms"].min()), int(frame["ts_ms"].max()) + 300_000
-    trades = simulate(frame, config, target)
-    report = trade_metrics(trades, config, target, start, end)
-    report["accounting"] = "Fixed unit notional per coin; summed cash returns; daily realised P&L including zero-trade days. Funding holds the last known rate constant."
-    report["per_coin"] = {coin: trade_metrics([t for t in trades if t["coin"] == coin], config, target, start, end)
-                          for coin in sorted(frame["coin"].unique())}
-    years = sorted({datetime.fromtimestamp(t / 1000, timezone.utc).year for t in frame["ts_ms"]})
-    report["per_year"] = {}
-    for year in years:
-        lo = int(datetime(year, 1, 1, tzinfo=timezone.utc).timestamp() * 1000)
-        hi = int(datetime(year + 1, 1, 1, tzinfo=timezone.utc).timestamp() * 1000)
-        report["per_year"][str(year)] = trade_metrics(
-            [t for t in trades if lo <= t["exit_ms"] < hi], config, target, max(start, lo), min(end, hi))
-    report["ev_threshold_sweep"] = [dict(ev_threshold=threshold, **trade_metrics(
-        simulate(frame, config, target, threshold), config, target, start, end))
-        for threshold in config.get("ev_threshold_sweep", [config.get("ev_threshold", 0.0)])]
-    return report
+    periods = period_frames(frame, config)
+    cutoff = timestamp_ms(config.get("tuning_until", "2025-04-01"))
+    bounds = {period: (int(part["ts_ms"].min()), int(part["ts_ms"].max()) + 300_000)
+              if len(part) else (None, None) for period, part in periods.items()}
+    def split_trades(trades, period):
+        if period == "all":
+            return trades
+        return [t for t in trades if (t["ts_ms"] < cutoff) == (period == "tuning")]
+    def metrics(trades, cfg, period):
+        return trade_metrics(split_trades(trades, period), cfg, target, *bounds[period])
+    scenarios = config.get("cost_scenarios", {"headline": config.get("costs", {})})
+    if "headline" not in scenarios:
+        raise ValueError("cost_scenarios requires a headline scenario")
+    ordered = ["headline", *[name for name in scenarios if name != "headline"]]
+    result = {"scenarios": {}}
+    for name in ordered:
+        cfg = dict(config, costs=scenarios[name])
+        default_trades = simulate(frame, cfg, target)
+        by_period = {}
+        for period, part in periods.items():
+            selected = split_trades(default_trades, period)
+            report = metrics(default_trades, cfg, period)
+            report["per_coin"] = {coin: trade_metrics([t for t in selected if t["coin"] == coin],
+                cfg, target, *bounds[period]) for coin in sorted(part["coin"].unique())}
+            report["per_year"] = {}
+            years = part.select(pl.from_epoch("ts_ms", time_unit="ms").dt.year()).to_series().unique().sort()
+            for year in years:
+                lo, hi = timestamp_ms(f"{year}-01-01"), timestamp_ms(f"{year + 1}-01-01")
+                start, end = bounds[period]
+                report["per_year"][str(year)] = trade_metrics([t for t in selected if lo <= t["exit_ms"] < hi],
+                    cfg, target, max(start, lo), min(end, hi))
+            report["ev_threshold_sweep"] = []
+            by_period[period] = report
+        sweep_trades = {}
+        for threshold in config.get("ev_threshold_sweep", [config.get("ev_threshold", 0.0)]):
+            trades = simulate(frame, cfg, target, threshold)
+            sweep_trades[threshold] = trades
+            for period in periods:
+                by_period[period]["ev_threshold_sweep"].append(dict(
+                    ev_threshold=threshold, **metrics(trades, cfg, period)))
+        chosen = choose_ev_threshold(by_period["tuning"]["ev_threshold_sweep"])
+        selection = {"threshold": chosen, "selection_period": "tuning", "minimum_tuning_trades": 100,
+                     "reason": None if chosen is not None else "No threshold reaches 100 tuning trades.",
+                     "periods": {period: metrics(sweep_trades[chosen], cfg, period) for period in periods}
+                     if chosen is not None else {}}
+        scenario = {"label": "Headline: taker entry / taker exit" if name == "headline" else
+                    f"Sensitivity: {name} (maker fills are not guaranteed)",
+                    "round_trip_cost": round_trip_cost(cfg), "periods": by_period, "ev_selection": selection}
+        result["scenarios"][name] = scenario
+    # Preserve v1's public report fields, including the per-fold EV mechanism.
+    headline = result["scenarios"]["headline"]
+    result.update(headline["periods"]["all"])
+    result["periods"] = headline["periods"]
+    result["ev_selection"] = headline["ev_selection"]
+    result["accounting"] = ("Fixed unit notional per coin; summed cash returns; daily realised P&L including zero-trade days. "
+        "Funding holds the last known rate constant. Periods use decision timestamps; schedules run continuously across the cutoff.")
+    return result

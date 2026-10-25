@@ -35,23 +35,27 @@ def month_shift(ts_ms, months):
     return int(datetime(index // 12, index % 12 + 1, 1, tzinfo=timezone.utc).timestamp() * 1000)
 
 
-def load_config(path=None):
+def load_config(path=None, overrides=()):
     with DEFAULT_CONFIG.open() as stream:
         config = yaml.safe_load(stream)
-    if path and Path(path).resolve() != DEFAULT_CONFIG.resolve():
-        with Path(path).open() as stream:
-            update = yaml.safe_load(stream) or {}
-        def merge(base, extra):
-            for key, value in extra.items():
-                if isinstance(value, dict) and isinstance(base.get(key), dict):
-                    merge(base[key], value)
-                else:
-                    base[key] = value
-        merge(config, update)
+    def merge(base, extra):
+        for key, value in extra.items():
+            if isinstance(value, dict) and isinstance(base.get(key), dict):
+                merge(base[key], value)
+            else:
+                base[key] = value
+    for extra_path in ([path] if path else []) + list(overrides):
+        with Path(extra_path).open() as stream:
+            merge(config, yaml.safe_load(stream) or {})
+    config.setdefault("model", "three_class")
     return config
 
 
 def validate_config(config):
+    if config.get("model", "three_class") not in ("three_class", "two_stage"):
+        raise ValueError("model must be three_class or two_stage")
+    if config.get("side_calibration", "isotonic") not in ("isotonic", "platt", "none"):
+        raise ValueError("side_calibration must be isotonic, platt or none")
     lockbox = timestamp_ms(config["lockbox_from"])
     if lockbox > LOCKBOX_MS or config.get("include_lockbox", False):
         raise ValueError("Lockbox from 2026-04-01 is sealed; this command cannot include it")
@@ -129,6 +133,96 @@ def apply_calibration(probabilities, calibrators):
                                   for c, knots in enumerate(calibrators)])
     totals = calibrated.sum(axis=1, keepdims=True)
     return np.divide(calibrated, totals, out=np.full_like(calibrated, 1 / 3), where=totals > 0)
+
+
+def fit_binary_calibration(scores, labels, method="isotonic"):
+    """Fit on inner validation only. Platt uses a damped Newton fit on logits."""
+    scores, labels = np.asarray(scores, dtype=float), np.asarray(labels, dtype=float)
+    if not len(scores) or len(scores) != len(labels):
+        raise ValueError("Calibration requires aligned nonempty observations")
+    if method == "none":
+        return {"method": "none"}
+    if method == "isotonic":
+        return {"method": method, **fit_isotonic(scores, labels)}
+    if method != "platt":
+        raise ValueError("Unknown binary calibration method")
+    clipped = np.clip(scores, 1e-8, 1 - 1e-8)
+    logits = np.log(clipped / (1 - clipped))
+    x = np.column_stack([logits, np.ones(len(logits))])
+    # A tiny ridge keeps separated or constant-score samples well posed.
+    ridge = 1e-6
+    beta = np.array([0.0, np.log((labels.sum() + 0.5) / (len(labels) - labels.sum() + 0.5))])
+    def objective(b):
+        z = x @ b
+        return np.mean(np.logaddexp(0, z) - labels * z) + ridge * np.dot(b, b) / 2
+    for _ in range(50):
+        z = np.clip(x @ beta, -40, 40)
+        p = 1 / (1 + np.exp(-z))
+        gradient = x.T @ (p - labels) / len(labels) + ridge * beta
+        hessian = (x.T * (p * (1 - p))) @ x / len(labels) + ridge * np.eye(2)
+        step = np.linalg.solve(hessian, gradient)
+        scale = 1.0
+        previous = objective(beta)
+        while scale > 1e-6 and objective(beta - scale * step) > previous:
+            scale *= 0.5
+        beta -= scale * step
+        if np.max(np.abs(scale * step)) < 1e-8:
+            break
+    return {"method": method, "slope": float(beta[0]), "intercept": float(beta[1])}
+
+
+def apply_binary_calibration(scores, calibrator):
+    scores = np.asarray(scores, dtype=float)
+    if calibrator["method"] == "none":
+        return scores.copy()
+    if calibrator["method"] == "isotonic":
+        return np.interp(scores, calibrator["x"], calibrator["y"])
+    clipped = np.clip(scores, 1e-8, 1 - 1e-8)
+    z = calibrator["slope"] * np.log(clipped / (1 - clipped)) + calibrator["intercept"]
+    return 1 / (1 + np.exp(-np.clip(z, -40, 40)))
+
+
+def combine_probabilities(p_move, p_side):
+    return np.column_stack([p_move * p_side, p_move * (1 - p_side), 1 - p_move])
+
+
+def train_two_stage(fit, valid, test, features, target, config, params, output, name):
+    """Materialise each feature matrix once; side datasets contain touched rows only."""
+    x_fit, x_valid, x_test = (part.select(features).to_numpy() for part in (fit, valid, test))
+    y_fit, y_valid = (part[f"label_{target}"].to_numpy() for part in (fit, valid))
+    touched_fit, touched_valid = y_fit != 0, y_valid != 0
+    if not touched_fit.any() or not touched_valid.any():
+        raise ValueError(f"Fold {name} requires touched fit and inner-validation rows")
+    best, calibrators, raw_valid, raw_test, calibrated_valid, calibrated_test = {}, {}, {}, {}, {}, {}
+    for stage in ("move", "side"):
+        side = stage == "side"
+        train_x, valid_x = (x_fit[touched_fit], x_valid[touched_valid]) if side else (x_fit, x_valid)
+        train_y = (y_fit[touched_fit] == 1) if side else touched_fit
+        valid_y = (y_valid[touched_valid] == 1) if side else touched_valid
+        training = lgb.Dataset(train_x, label=train_y, feature_name=features,
+                               categorical_feature=["f_coin_id"])
+        validation = lgb.Dataset(valid_x, label=valid_y, reference=training)
+        stage_params = dict(params)
+        stage_params.pop("num_class", None)
+        stage_params.update(config.get(f"{stage}_lightgbm", config["lightgbm"]))
+        stage_params.update(objective="binary", metric="binary_logloss")
+        model = lgb.train(stage_params, training, num_boost_round=int(config["num_boost_round"]),
+                          valid_sets=[validation], callbacks=[lgb.early_stopping(
+                              int(config["early_stopping_rounds"]), verbose=False)])
+        best[stage] = model.best_iteration or model.current_iteration()
+        model.save_model(str(output / f"{name}-{stage}.txt"), num_iteration=best[stage])
+        pl.DataFrame({"feature": features, "gain": model.feature_importance(
+            importance_type="gain", iteration=best[stage])}).write_csv(output / f"{name}-{stage}-importance.csv")
+        raw_valid[stage] = model.predict(x_valid, num_iteration=best[stage], num_threads=params["num_threads"])
+        raw_test[stage] = model.predict(x_test, num_iteration=best[stage], num_threads=params["num_threads"])
+        method = config.get("side_calibration", "isotonic") if side else "isotonic"
+        if not config.get("calibration", True):
+            method = "none"
+        calibration_scores = raw_valid[stage][touched_valid] if side else raw_valid[stage]
+        calibrators[stage] = fit_binary_calibration(calibration_scores, valid_y, method)
+        calibrated_valid[stage] = apply_binary_calibration(raw_valid[stage], calibrators[stage])
+        calibrated_test[stage] = apply_binary_calibration(raw_test[stage], calibrators[stage])
+    return (best, calibrators, raw_valid, raw_test, calibrated_valid, calibrated_test)
 
 
 def confidence(probabilities):
@@ -214,19 +308,26 @@ def train(data, work, version, target="a", coins=None, config=None, threads=None
         # Materialise one fold at a time: never retain 24 copies of the fit matrix.
         fit, valid, test = fold_split(frame, start, end, target, config)
         y_fit, y_valid = class_indices(fit[f"label_{target}"].to_numpy()), class_indices(valid[f"label_{target}"].to_numpy())
-        training = lgb.Dataset(fit.select(features).to_numpy(), label=y_fit,
-                               feature_name=features, categorical_feature=["f_coin_id"])
-        validation = lgb.Dataset(valid.select(features).to_numpy(), label=y_valid, reference=training)
-        model = lgb.train(params, training, num_boost_round=int(config["num_boost_round"]),
-                          valid_sets=[validation], callbacks=[lgb.early_stopping(
-                              int(config["early_stopping_rounds"]), verbose=False)])
-        best = model.best_iteration or model.current_iteration()
-        model.save_model(str(output / f"{name}.txt"), num_iteration=best)
-        raw_valid = model.predict(valid.select(features).to_numpy(), num_iteration=best, num_threads=params["num_threads"])
-        raw_test = model.predict(test.select(features).to_numpy(), num_iteration=best, num_threads=params["num_threads"])
-        calibrators = fit_calibration(raw_valid, y_valid) if config["calibration"] else None
-        p_valid = apply_calibration(raw_valid, calibrators) if calibrators else raw_valid
-        p_test = apply_calibration(raw_test, calibrators) if calibrators else raw_test
+        two_stage = config.get("model", "three_class") == "two_stage"
+        if two_stage:
+            best, calibrators, rv, rt, cv, ct = train_two_stage(
+                fit, valid, test, features, target, config, params, output, name)
+            raw_valid, raw_test = (combine_probabilities(p["move"], p["side"]) for p in (rv, rt))
+            p_valid, p_test = (combine_probabilities(p["move"], p["side"]) for p in (cv, ct))
+        else:
+            training = lgb.Dataset(fit.select(features).to_numpy(), label=y_fit,
+                                   feature_name=features, categorical_feature=["f_coin_id"])
+            validation = lgb.Dataset(valid.select(features).to_numpy(), label=y_valid, reference=training)
+            model = lgb.train(params, training, num_boost_round=int(config["num_boost_round"]),
+                              valid_sets=[validation], callbacks=[lgb.early_stopping(
+                                  int(config["early_stopping_rounds"]), verbose=False)])
+            best = model.best_iteration or model.current_iteration()
+            model.save_model(str(output / f"{name}.txt"), num_iteration=best)
+            raw_valid = model.predict(valid.select(features).to_numpy(), num_iteration=best, num_threads=params["num_threads"])
+            raw_test = model.predict(test.select(features).to_numpy(), num_iteration=best, num_threads=params["num_threads"])
+            calibrators = fit_calibration(raw_valid, y_valid) if config["calibration"] else None
+            p_valid = apply_calibration(raw_valid, calibrators) if calibrators else raw_valid
+            p_test = apply_calibration(raw_test, calibrators) if calibrators else raw_test
         prior = np.bincount(y_fit, minlength=3) / len(y_fit)
         def common(part):
             expressions = [pl.col(name) for name in ("ts_ms", "coin", "entry_ms", "last_funding_rate", "next_funding_ms", "funding_interval_ms")]
@@ -241,9 +342,12 @@ def train(data, work, version, target="a", coins=None, config=None, threads=None
             probabilities = p_valid if source == "model" else raw_valid if source == "raw" else baseline_probabilities(inner, source)
             eligible = np.isfinite(probabilities).all(axis=1)
             scores = confidence(probabilities[eligible])
+            if two_stage and source in ("model", "raw"):
+                side_scores = (cv if source == "model" else rv)["side"][eligible]
+                scores = np.maximum(side_scores, 1 - side_scores)
             for fraction in config["selective_fractions"]:
                 thresholds[threshold_name(source, fraction)] = float(np.quantile(scores, 1 - fraction)) if len(scores) else None
-        direction = np.sign(p_valid[:, 0] - p_valid[:, 1])
+        direction = np.sign(cv["side"] - 0.5) if two_stage else np.sign(p_valid[:, 0] - p_valid[:, 1])
         none = valid[f"label_{target}"].to_numpy() == 0
         timeout = {}
         for sign, side in ((1, "long"), (-1, "short")):
@@ -255,6 +359,10 @@ def train(data, work, version, target="a", coins=None, config=None, threads=None
             *[pl.Series(f"raw_p_{side}", raw_test[:, c]) for c, side in enumerate(("up", "down", "none"))],
             *[pl.lit(value, dtype=pl.Float64).alias(key) for key, value in (thresholds | timeout).items()],
             pl.lit(float(config["ev_threshold"])).alias("ev_threshold"))
+        if two_stage:
+            outer = outer.with_columns(
+                pl.Series("p_move", ct["move"]), pl.Series("p_side", ct["side"]),
+                pl.Series("raw_p_move", rt["move"]), pl.Series("raw_p_side", rt["side"]))
         oof.append(outer)
         fold = {"fold": name, "start_ms": start, "end_ms": end, "best_iteration": best,
                 "fit_rows": len(fit), "inner_rows": len(valid), "test_rows": len(test),
@@ -264,8 +372,11 @@ def train(data, work, version, target="a", coins=None, config=None, threads=None
                 "inner_max_label_end_ms": int(valid[f"label_end_ms_{target}"].max()),
                 "prior": prior.tolist(), "thresholds": thresholds, **timeout,
                 "ev_threshold": config["ev_threshold"], "calibrators": calibrators}
+        if two_stage:
+            fold.update(side_fit_rows=int((y_fit != 2).sum()), side_inner_rows=int((y_valid != 2).sum()))
+        else:
+            pl.DataFrame({"feature": features, "gain": model.feature_importance(importance_type="gain", iteration=best)}).write_csv(output / f"{name}-importance.csv")
         (output / f"{name}.json").write_text(json.dumps(fold, indent=2))
-        pl.DataFrame({"feature": features, "gain": model.feature_importance(importance_type="gain", iteration=best)}).write_csv(output / f"{name}-importance.csv")
         folds.append(fold)
     pl.concat(oof).sort(["ts_ms", "coin"]).write_parquet(output / "oof.parquet")
     sha = subprocess.run(["git", "rev-parse", "HEAD"], capture_output=True, text=True, check=True).stdout.strip()
@@ -286,9 +397,10 @@ def main():
     parser.add_argument("--coins", nargs="+")
     parser.add_argument("--config", default=str(DEFAULT_CONFIG))
     parser.add_argument("--threads", type=int)
+    parser.add_argument("--override", action="append", default=[], help="Merge a candidate YAML over --config")
     args = parser.parse_args()
     print(train(args.data, args.work, args.version, args.target, args.coins,
-                load_config(args.config), args.threads))
+                load_config(args.config, args.override), args.threads))
 
 
 if __name__ == "__main__":
