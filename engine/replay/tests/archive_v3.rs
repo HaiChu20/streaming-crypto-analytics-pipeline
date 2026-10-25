@@ -1,4 +1,4 @@
-//! V3 tests; historical fixtures/v2 remains on disk, unused.
+//! Native v3 archive replay and exact-decimal fixture tests.
 use engine_core::{Kind, Outcome, Side, StreamBook};
 use engine_replay::input::{Merge, StreamPath, discover_filtered};
 use serde_json::json;

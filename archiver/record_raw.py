@@ -1,4 +1,4 @@
-"""Raw recorder: Kafka raw.* topics -> v3 channel files per UTC day (plan.md §7).
+"""Raw recorder: Kafka raw.* topics -> v3 channel files per UTC day.
 
     uv run python -m archiver.record_raw
 

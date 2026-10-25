@@ -1,4 +1,4 @@
-"""Connection lifecycle shared by all exchanges (plan.md §5.1, §5.3, §5.4).
+"""Connection lifecycle shared by all exchanges.
 
 ConnRun     one WebSocket connection: connect, subscribe, receive, write in-band control events.
 Supervisor  keeps one logical connection alive: reconnect with backoff, and replace it

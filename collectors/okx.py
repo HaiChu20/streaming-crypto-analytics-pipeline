@@ -1,4 +1,4 @@
-"""OKX spot + swap collector (plan.md §4, §5.2).
+"""OKX spot + swap collector.
 
 Public connection: bbo-tbt, books, trades. Business connection: trades-all.
 `books` continuity: each update's prevSeqId must equal the previous seqId.

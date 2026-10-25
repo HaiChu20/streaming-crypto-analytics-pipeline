@@ -20,6 +20,9 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
+// Collected, not yet parsed by the engine.
+const UNPARSED_RAW_PREFIXES: [&str; 2] = ["raw.coinbase.", "raw.bybit."];
+
 static STOP: AtomicBool = AtomicBool::new(false);
 extern "C" fn stop(_: i32) {
     STOP.store(true, Ordering::Relaxed);
@@ -151,11 +154,12 @@ fn run() -> Result<()> {
     let metadata = consumer.fetch_metadata(None, Duration::from_secs(10))?;
     let mut assignment = TopicPartitionList::new();
     let mut processed = std::collections::BTreeMap::new();
-    for topic in metadata
-        .topics()
-        .iter()
-        .filter(|t| t.name().starts_with("raw."))
-    {
+    for topic in metadata.topics().iter().filter(|t| {
+        t.name().starts_with("raw.")
+            && !UNPARSED_RAW_PREFIXES
+                .iter()
+                .any(|prefix| t.name().starts_with(prefix))
+    }) {
         for partition in topic.partitions() {
             let (_, end) =
                 consumer.fetch_watermarks(topic.name(), partition.id(), Duration::from_secs(10))?;

@@ -1,4 +1,4 @@
-"""Collector session file used to detect a crashed previous run (plan.md §5.3)."""
+"""Collector session file used to detect a crashed previous run."""
 
 import asyncio
 import os

@@ -1,4 +1,4 @@
-# What we collect (plan.md §4). Topic = raw.<exchange>.<market>.<feed>.v1
+# What we collect. Topic = raw.<exchange>.<market>.<feed>.v1
 # Partition = asset via `partitions` (explicit, no hashing): one (topic, partition) = one stream.
 
 topic_version: v1
@@ -8,7 +8,7 @@ kafka:
   # Per-partition safety cap; tune after phase 1 volume measurement.
   retention_hours: 72
   retention_bytes_per_partition: 2147483648   # 2 GiB
-  # Producer memory ceiling during a Kafka outage (plan.md §5.3). Normally near-empty.
+  # Producer memory ceiling during a Kafka outage. Normally near-empty.
   producer_buffer_kbytes: 1048576             # 1 GiB
 
 rotation:

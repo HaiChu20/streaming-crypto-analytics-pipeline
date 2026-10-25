@@ -1,0 +1,134 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1400" height="840" viewBox="0 0 1400 840" role="img" aria-labelledby="title desc">
+  <title id="title">BTC and ETH analytics pipeline architecture</title>
+  <desc id="desc">Six exchanges feed Python collectors and Kafka. Daily recording and object storage support Rust replay and model training. The live Rust engine shares the feature core, streams features to inference and ClickHouse, and publishes predictions for Grafana monitoring.</desc>
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="#8290a5"/></marker>
+    <marker id="model-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="#7662b9"/></marker>
+    <style>
+      text{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Helvetica,Arial,sans-serif;fill:#18283f}
+      .lane{stroke:#e4eaf2;stroke-width:1}
+      .lane-label{font-size:12px;font-weight:700;letter-spacing:1.7px;fill:#53657c}
+      .node{stroke-width:1.2}
+      .heading{font-size:19px;font-weight:650}
+      .detail{font-size:13px;fill:#53657c}
+      .topic{font-size:18px;font-weight:650}
+      .edge{fill:none;stroke:#8290a5;stroke-width:1.8;marker-end:url(#arrow);stroke-linejoin:round}
+      .edge-label{font-size:12px;fill:#62718a}
+      .model-edge{fill:none;stroke:#7662b9;stroke-width:1.8;stroke-dasharray:6 5;marker-end:url(#model-arrow);stroke-linejoin:round}
+    </style>
+  </defs>
+
+  <rect x="8" y="8" width="1384" height="824" rx="26" fill="#fff" stroke="#dce3ed"/>
+  <text x="48" y="52" font-size="28" font-weight="700">From market messages to model predictions</text>
+  <text x="48" y="80" font-size="15" fill="#53657c">BTC / ETH · replayable raw data · shared Rust feature core · chronological model evaluation</text>
+  <rect x="1112" y="37" width="220" height="31" rx="15.5" fill="#f2effb"/>
+  <text x="1222" y="57" text-anchor="middle" font-size="13" font-weight="600" fill="#66509c">Strategy 1 · features-v7</text>
+
+  <rect class="lane" x="36" y="116" width="1308" height="168" rx="16" fill="#f9fbfd"/>
+  <rect class="lane" x="36" y="306" width="1308" height="148" rx="16" fill="#f7faff"/>
+  <rect class="lane" x="36" y="478" width="1308" height="142" rx="16" fill="#fbf9ff"/>
+  <rect class="lane" x="36" y="644" width="1308" height="133" rx="16" fill="#f5fbfa"/>
+  <text class="lane-label" x="54" y="145">REAL TIME</text>
+  <text class="lane-label" x="54" y="334">DAILY BATCH</text>
+  <text class="lane-label" x="54" y="504">RESEARCH</text>
+  <text class="lane-label" x="54" y="671">SERVING &amp; MONITORING</text>
+
+  <!-- Real-time acquisition and the live feature branch. -->
+  <rect class="node" x="54" y="174" width="190" height="84" rx="12" fill="#fff" stroke="#cbd7e5"/>
+  <text class="heading" x="70" y="199">Exchanges</text>
+  <text x="70" y="219" font-size="12.5">Kraken</text><text x="161" y="219" font-size="12.5">Binance</text>
+  <text x="70" y="235" font-size="12.5">OKX</text><text x="161" y="235" font-size="12.5">Coinbase</text>
+  <text x="70" y="251" font-size="12.5">Bybit</text><text x="161" y="251" font-size="12.5">Deribit</text>
+  <rect class="node" x="284" y="174" width="220" height="84" rx="12" fill="#eaf7f4" stroke="#a9d5c9"/>
+  <text class="heading" x="300" y="201">Python collectors</text>
+  <text class="detail" x="300" y="224">Gap checks · resync</text>
+  <text class="detail" x="300" y="244">Receive timestamps</text>
+  <rect class="node" x="544" y="174" width="190" height="84" rx="12" fill="#fff6e9" stroke="#e5cd9e"/>
+  <text class="heading" x="560" y="201">Kafka</text>
+  <text x="560" y="225" font-size="16">raw.* topics</text>
+  <text class="detail" x="560" y="245">33 topics · 2 assets</text>
+  <rect class="node" x="774" y="174" width="224" height="84" rx="12" fill="#f1edfb" stroke="#cbbfe5"/>
+  <text class="heading" x="790" y="201">Rust live engine</text>
+  <text class="detail" x="790" y="224">Shared book + feature core</text>
+  <text class="detail" x="790" y="244">1 s rows · supported venues</text>
+  <rect class="node" x="1038" y="174" width="294" height="84" rx="12" fill="#fff6e9" stroke="#e5cd9e"/>
+  <text class="topic" x="1056" y="207">features.1s.v1</text>
+  <text class="detail" x="1056" y="233">Kafka feature stream</text>
+  <path class="edge" d="M244 216 H284"/><text class="edge-label" x="249" y="205">feeds</text>
+  <path class="edge" d="M504 216 H544"/><text class="edge-label" x="518" y="205">v1</text>
+  <path class="edge" d="M734 216 H774"/><text class="edge-label" x="744" y="205">raw</text>
+  <path class="edge" d="M998 216 H1038"/><text class="edge-label" x="1011" y="205">1 s</text>
+
+  <!-- Kafka also feeds loss-visible daily recording and object archiving. -->
+  <path class="edge" d="M639 258 V294 H200 V354"/>
+  <text class="edge-label" x="354" y="289">record raw messages</text>
+  <rect class="node" x="54" y="354" width="190" height="76" rx="12" fill="#eaf2ff" stroke="#bdd0ed"/>
+  <text class="heading" x="70" y="384">Raw recorder</text>
+  <text class="detail" x="70" y="408">Kafka offsets + markers</text>
+  <rect class="node" x="284" y="354" width="220" height="76" rx="12" fill="#eaf2ff" stroke="#bdd0ed"/>
+  <text class="heading" x="300" y="384">Local daily files</text>
+  <text class="detail" x="300" y="408">Raw v3 · JSONL · UTC days</text>
+  <rect class="node" x="544" y="354" width="290" height="76" rx="12" fill="#eaf2ff" stroke="#bdd0ed"/>
+  <text class="heading" x="560" y="384">Daily archive job</text>
+  <text class="detail" x="560" y="408">Compress · checksum · upload</text>
+  <rect class="node" x="874" y="354" width="458" height="76" rx="12" fill="#eaf2ff" stroke="#bdd0ed"/>
+  <text class="heading" x="892" y="384">S3-compatible object storage</text>
+  <text class="detail" x="892" y="408">Closed raw days + manifests</text>
+  <path class="edge" d="M244 392 H284"/><text class="edge-label" x="257" y="381">v3</text>
+  <path class="edge" d="M504 392 H544"/><text class="edge-label" x="514" y="381">UTC</text>
+  <path class="edge" d="M834 392 H874"/><text class="edge-label" x="842" y="381">gzip</text>
+
+  <!-- Offline replay creates the training data and frozen model artifacts. -->
+  <path class="edge" d="M1103 430 V466 H181 V522"/>
+  <text class="edge-label" x="627" y="461">replay closed archive days</text>
+  <rect class="node" x="54" y="522" width="255" height="78" rx="12" fill="#f1edfb" stroke="#cbbfe5"/>
+  <text class="heading" x="70" y="552">Rust replay engine</text>
+  <text class="detail" x="70" y="576">Books + features · 1 s rows</text>
+  <rect class="node" x="349" y="522" width="190" height="78" rx="12" fill="#eaf2ff" stroke="#bdd0ed"/>
+  <text class="heading" x="365" y="552">Feature Parquet</text>
+  <text class="detail" x="365" y="576">Versioned day partitions</text>
+  <rect class="node" x="579" y="522" width="370" height="78" rx="12" fill="#f1edfb" stroke="#cbbfe5"/>
+  <text class="heading" x="597" y="547">Research / training</text>
+  <text class="detail" x="597" y="568">Labels · purged walk-forward folds</text>
+  <text class="detail" x="597" y="587">Embargo · inner validation · frozen lockbox</text>
+  <rect class="node" x="989" y="522" width="343" height="78" rx="12" fill="#f1edfb" stroke="#cbbfe5"/>
+  <text class="heading" x="1007" y="552">Model files</text>
+  <text class="detail" x="1007" y="576">LightGBM + feature order + metadata</text>
+  <path class="edge" d="M309 561 H349"/><text class="edge-label" x="316" y="550">rows</text>
+  <path class="edge" d="M539 561 H579"/><text class="edge-label" x="553" y="550">fit</text>
+  <path class="edge" d="M949 561 H989"/><text class="edge-label" x="954" y="550">save</text>
+
+  <!-- Streaming features and frozen model artifacts meet at inference. -->
+  <path class="model-edge" d="M1160 600 V632 H25 V733 H54"/>
+  <text x="580" y="627" font-size="12" fill="#7662b9">load frozen models</text>
+  <path class="edge" d="M1332 216 H1366 V687 H181 V700"/>
+  <text class="edge-label" x="1106" y="682">live features</text>
+  <path class="edge" d="M739 687 V700"/>
+  <rect class="node" x="54" y="700" width="255" height="65" rx="12" fill="#f1edfb" stroke="#cbbfe5"/>
+  <text class="heading" x="70" y="726">Inference service</text>
+  <text class="detail" x="70" y="749">Loads saved LightGBM models</text>
+  <rect class="node" x="349" y="700" width="200" height="65" rx="12" fill="#fff6e9" stroke="#e5cd9e"/>
+  <text class="topic" x="365" y="726">predictions.v1</text>
+  <text class="detail" x="365" y="749">Direction · return · risk</text>
+  <rect class="node" x="589" y="700" width="300" height="65" rx="12" fill="#eaf7f4" stroke="#a9d5c9"/>
+  <text class="heading" x="607" y="726">ClickHouse</text>
+  <text class="detail" x="607" y="749">Features + predictions</text>
+  <rect class="node" x="929" y="700" width="403" height="65" rx="12" fill="#eaf7f4" stroke="#a9d5c9"/>
+  <text class="heading" x="947" y="726">Grafana dashboard</text>
+  <text class="detail" x="947" y="749">Live markets · features · forecasts</text>
+  <path class="edge" d="M309 733 H349"/><text class="edge-label" x="313" y="722">score</text>
+  <path class="edge" d="M549 733 H589"/><text class="edge-label" x="556" y="722">JSON</text>
+  <path class="edge" d="M889 733 H929"/><text class="edge-label" x="898" y="722">SQL</text>
+
+  <rect x="54" y="803" width="12" height="12" rx="3" fill="#a9d5c9"/>
+  <text x="74" y="814" font-size="12" fill="#53657c">Ingestion / monitoring</text>
+  <rect x="255" y="803" width="12" height="12" rx="3" fill="#e5cd9e"/>
+  <text x="275" y="814" font-size="12" fill="#53657c">Kafka streams</text>
+  <rect x="410" y="803" width="12" height="12" rx="3" fill="#bdd0ed"/>
+  <text x="430" y="814" font-size="12" fill="#53657c">Archive / data</text>
+  <rect x="560" y="803" width="12" height="12" rx="3" fill="#cbbfe5"/>
+  <text x="580" y="814" font-size="12" fill="#53657c">Rust / modeling</text>
+  <path class="model-edge" d="M753 809 H788"/>
+  <text x="800" y="814" font-size="12" fill="#53657c">Model artifact</text>
+  <text x="1332" y="814" text-anchor="end" font-size="12" fill="#53657c">Coinbase / Bybit: collected; engine adapters pending</text>
+</svg>

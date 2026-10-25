@@ -1,4 +1,4 @@
-"""Envelope format for every record sent to Kafka (plan.md §5.1).
+"""Envelope format for every record sent to Kafka.
 
 `payload` is the raw frame text exactly as received; it is never parsed and re-serialized.
 Control records (start / stop / drop) carry no payload.

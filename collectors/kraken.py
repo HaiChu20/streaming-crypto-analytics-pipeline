@@ -1,6 +1,6 @@
 """Kraken spot (WS v2: book, trade, level3) + futures (WS v1: book, trade, ticker) collector.
 
-Spot L2/L3 books are kept in memory only to verify Kraken's CRC32 checksums (plan.md §5.2).
+Spot L2/L3 books are kept in memory only to verify Kraken's CRC32 checksums.
 Prices/quantities are parsed as Decimal, exactly as delivered, so checksums can be rebuilt.
 Futures books are checked with `seq` (+1 per message per product).
 """

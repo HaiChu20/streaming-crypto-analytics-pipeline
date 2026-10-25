@@ -1,364 +1,127 @@
-# BTC/ETH market data pipeline
+# BTC/ETH streaming analytics
 
-Collects BTC and ETH **spot + perpetual** market data from Kraken, Binance, OKX and Bybit, plus **Coinbase spot**. Every message passes through Kafka to a replayable raw archive on local disk: one JSONL file per channel per symbol per UTC day. Later phases add an S3 daily archive, a Rust feature engine, a dashboard, and 15/30-minute return models.
+Market messages become replayable archives, Rust features and evaluated LightGBM forecasts.
+The same feature core powers offline research, live inference and a ClickHouse/Grafana dashboard.
 
-- **Plan / architecture:** [plan.md](plan.md), the only plan.
-- **Progress:** [STATUS.md](STATUS.md).
+**Strategy 1 release** · Collection + replay + serving implemented · Independent short-model lockbox pending
 
-## What is collected
+## Architecture
 
-| | Kraken | Binance | OKX | Coinbase | Bybit |
-|---|---|---|---|---|---|
-| Spot | BTC/USD, ETH/USD: L2 `book`, L3 `level3`, `trade` | BTCUSDT, ETHUSDT: `bookTicker`, `depth@100ms` + REST snapshot, `trade` | BTC-USDT, ETH-USDT: `bbo-tbt`, `books`, `trades-all` | BTC-USD, ETH-USD: `level2`, `market_trades` | BTCUSDT, ETHUSDT: `orderbook.1`, `orderbook.200`, `publicTrade` |
-| Perp | PF_XBTUSD, PF_ETHUSD: `book`, `trade`, `ticker` | BTCUSDT, ETHUSDT: `bookTicker`, `depth@100ms` + REST snapshot, `trade`, `aggTrade`, `markPrice@1s`, `forceOrder` | -SWAP: `bbo-tbt`, `books`, `trades`, `trades-all` | — | BTCUSDT, ETHUSDT linear: `orderbook.1`, `orderbook.200`, `publicTrade`, `tickers`, `allLiquidation` |
+<img src="docs/img/architecture.svg" alt="End-to-end architecture: exchange collection, Kafka, daily archive, Rust replay, model training, live inference and monitoring" width="1400">
 
-Coinbase checks connection-wide `sequence_num` on all frames, including subscriptions and
-heartbeats; per-file checks require a snapshot and increasing sequence numbers because
-other products/channels leave expected holes. Bybit depth-200 deltas require `u = previous u + 1`
-(observed on spot and linear), with increasing cross-sequence `seq`; every snapshot resets
-state. L1 snapshots may repeat unchanged IDs. Gaps use the shared throttled reconnect path.
-Protocol references: [Coinbase public channels](https://docs.cdp.coinbase.com/coinbase-app/advanced-trade-apis/websocket/websocket-endpoints),
-[Coinbase subscription deadline](https://docs.cdp.coinbase.com/coinbase-app/advanced-trade-apis/websocket/websocket-overview),
-[Bybit orderbooks](https://bybit-exchange.github.io/docs/v5/websocket/public/orderbook) and
-[Bybit connection/keepalive limits](https://bybit-exchange.github.io/docs/v5/ws/connect).
-Both exchanges use public endpoints without keys. Coinbase subscribes to heartbeats;
-Bybit sends an application ping every 20 seconds. The linked public WebSocket docs specify no fixed
-connection lifetime, so the usual daily rotation applies.
+1. **Collect** — Python clients receive BTC/ETH feeds from six sources,
+   check gaps, resynchronise connections and attach local receive timestamps.
+2. **Stream** — Kafka raw topics buffer exchange messages and connection markers.
+3. **Record** — The recorder writes raw-v3 JSONL files per channel, symbol and UTC day.
+4. **Daily batch archive** — Closed files are compressed, checksummed and uploaded
+   to S3-compatible object storage with day manifests.
+5. **Replay features** — Rust reconstructs books and emits one-second feature rows
+   to Parquet, preserving the information available at each tick.
+6. **Train & evaluate** — Labels, purged walk-forward folds, paired comparisons
+   and a frozen lockbox separate model fitting from evaluation.
+7. **Live features** — The Rust live engine uses the same core and publishes `features.1s.v1`.
+8. **Predict** — Inference loads saved models and publishes direction, return
+   and adverse-move quantiles to `predictions.v1`.
+9. **Monitor** — ClickHouse stores features/predictions; Grafana displays market
+   conditions, book validity and forecasts.
 
-Each message is wrapped with our local receive time (`recv_ns`) and stored byte-for-byte. Connection `start` / `stop` / `drop` events are written in-band, next to the data they affect.
+## Data sources
 
-## Run it (macOS)
+BTC and ETH throughout. The [market configuration](config/markets.yaml) defines symbols and channels.
 
-Requires Docker Desktop and [uv](https://docs.astral.sh/uv/); uv installs Python 3.12 if needed.
+| Source | Markets | Feeds | Used by engine |
+| --- | --- | --- | --- |
+| Kraken | USD spot, perpetual | L2/L3 books, trades, ticker | Yes |
+| Binance | USDT spot, perpetual | Quotes, depth, trades, mark/funding, liquidations | Yes |
+| OKX | USDT spot, swaps | BBO, books, trades | Yes; swap scaling uses contract metadata |
+| Coinbase | USD spot | Level 2, trades | Collected; parser pending |
+| Bybit | USDT spot, linear perpetual | Depth 1/200, trades, ticker, liquidations | Collected; parser pending |
+| Deribit | BTC/ETH volatility index | One-minute DVOL candles | Yes; per-asset cross rows |
 
-```bash
-uv sync                                                  # dependencies
-cp .env.example .env                                     # add the Kraken key (only needed for L3)
-docker compose -f docker/kafka/docker-compose.yml up -d  # Kafka on localhost:9092, UI on :8080
-uv run python scripts/create_topics.py                   # 33 raw topics, 2 partitions each
-scripts/pipeline.sh start                                # 6 collectors + recorder
-scripts/pipeline.sh status                               # stop | rotate (make-before-break reconnect)
-uv run python scripts/check_raw.py                       # data-quality report on data/raw
-```
+Kraken L3 needs API credentials. Coinbase/Bybit are archived and excluded from engine assignment.
+The reported Strategy 1 experiments use Kraken, Binance and Deribit inputs.
 
-**Other commands:**
-- `uv run python scripts/probe_feeds.py --seconds 60 --fixtures .pytest-tmp/probe --summary .pytest-tmp/probe-summary.json`: subscribes without Kafka, refuses to overwrite existing fixtures, and prints steady rates and estimated GB/day (initial snapshots excluded; one daily rotation snapshot added). Gzip estimates use retained frame samples.
-- `uv run pytest`: unit tests.
+## Strategy 1 results
 
-Raw disk files use **v3**, matching the user's archive:
-`data/raw/<Exchange>/<Spot|Futures|Index>/<Pair>/<YYYYMMDD>_<channel>.jsonl`.
-Binance, OKX, Coinbase, Bybit and Kraken Futures wrap the native message in `data`; Kraken spot
-inserts metadata into the native message. Decimals are exact strings. Our files
-add `conn` and Kafka `offset`; readers also accept archive files without them and
-case-insensitive directory prefixes such as `KrakenRaw/Futurev6`.
-Binance l2 splits into `depth` and `snapshot` files (anchor on sync, periodic every
-7 minutes); recovery uses the maximum offset across both. Invalid JSON or metadata
-collisions retain exact text in `raw`. Connection markers delimit epochs, closed
-files end with a rollover, and `.jsonl.open` files are still being written.
+Kraken spot mid-price direction over 60/120 seconds; LightGBM, features-v7,
+12 weekly out-of-fold development tests, one-second entry delay. Accuracy excludes flat outcomes.
 
-Convert v1 or v2 into a new tree (exclusive-create; originals stay untouched):
+| Target | Model | Reversal | Momentum | Top 5% confidence |
+| --- | ---: | ---: | ---: | ---: |
+| BTC · 60 s | 57.25% | 41.77% | 48.19% | 82.5% |
+| BTC · 120 s | 56.63% | 46.02% | 48.76% | 76.1% |
+| ETH · 60 s | 53.75% | 46.41% | 48.93% | 73.4% |
+| ETH · 120 s | 53.61% | 48.76% | 48.70% | 67.2% |
 
-```bash
-PYTHON_DOTENV_DISABLED=1 uv run python scripts/convert_raw.py data/raw --output-root /path/to/new-raw
-PYTHON_DOTENV_DISABLED=1 uv run python scripts/check_raw.py --root /path/to/new-raw --present-only
-```
+Top-confidence signals average about 1.8 bps before costs; spread/slippage are excluded, and typical taker fees dwarf the move.
+These are development results, not a standalone trading strategy; lockbox #2 is pending. [Methods, calibration and reproduction →](docs/strategy-1.md)
 
-The user's v3 archive needs no conversion. Gzip inputs stay gzip; incomplete tails
-are skipped only for `.open` files. Kafka envelopes and probe fixtures remain v1.
-`check_raw --json` includes per-file line/CRC counts, connection counts, and trade ID
-duplicates and observed gaps. Trade ID gaps are informational. Use
-`scripts/pipeline.sh restart <name>` to restart just one service.
+### Next: Strategy 2
 
-## AWS archive setup (S3 + Terraform)
+In development, outside this release: first-touch ±0.5%/1 h and ±1%/4 h targets.
+Needs longer-memory/positioning features, new-venue integration and lockbox #2 from new days ≥2026-10-21.
 
-Run from the repo root. Prerequisites: [uv](https://docs.astral.sh/uv/),
-Terraform >=1.13.4 and <2.0, and the AWS CLI (`brew install terraform awscli`).
-Run `uv sync` to create `.venv`. Configure an admin profile with permissions to
-manage S3, IAM users/policies/access keys, and AWS Budgets, for example
-`aws configure --profile archive-admin` (enter the admin access key ID, secret
-access key, and default region). An existing configured admin profile also works.
+## UI
 
-Copy `.env.example` to `.env` if you have not already. Fill in only:
+<img src="docs/img/research-report.png" alt="Real BTC 60-second research report with model and baseline metrics, selective direction evaluation and paired day-block bootstrap comparisons" width="1400">
 
-- `AWS_ADMIN_PROFILE`: the configured admin profile name, e.g. `archive-admin`.
-- `S3_BUCKET`: a globally unique S3 bucket name, at most 55 characters so the
-  generated IAM user name fits AWS's limit.
-- `TF_VAR_budget_email`: the address that should receive budget alerts.
+*BTC 60 s model/baseline metrics, selective direction evaluation and paired day-block bootstrap from `v7-kraken-all-d1`.*
+*This is the earlier 829-input run; the results table above uses the 415-input release run.*
 
-Keep `AWS_PROFILE=crypto-archiver` different from the admin profile. The supplied
-`AWS_REGION=eu-north-1` and `TF_VAR_budget_usd=10` can stay as they are;
-`TF_VAR_bucket_name` and `TF_VAR_region` derive from the bucket and region.
-Then run this one setup command and approve Terraform's proposed changes when prompted:
+A [live Grafana dashboard](docker/dashboard/README.md) also exists; its screenshot will be added.
+
+## Quickstart
+
+Requires Python 3.12, uv, Rust and Docker. Run from the repository root; the process helper uses macOS `caffeinate`.
+
+**Collect locally**
 
 ```bash
-scripts/aws_setup.sh
+uv sync
+docker compose --env-file /dev/null -f docker/kafka/docker-compose.yml up -d
+uv run python scripts/create_topics.py
+scripts/pipeline.sh start
 ```
 
-It creates a bucket with public access blocked, AES256 encryption, enforced bucket
-ownership, and cleanup of incomplete multipart uploads after seven days. It also
-creates `<bucket>-archiver` with only bucket listing and object read/write permissions,
-and a monthly USD budget (default $10) with 80% actual and 100% forecast email alerts.
-The script creates an access key if the archive profile has none and stores it in
-that local AWS CLI profile. Terraform state stays in `infra/terraform/`; retain it.
-
-Run one past UTC day's archive manually; the module loads `.env` itself:
+**Replay + train a minimal CPU baseline** — `ARCHIVE` and `WORK` are your input/output paths.
+Use the [release recipe](docs/strategy-1.md#how-to-reproduce) for the final model parameters.
 
 ```bash
-.venv/bin/python -m archiver.archive_daily --date 2026-10-17
-.venv/bin/python -m archiver.archive_daily --verify 2026-10-17
+scripts/train_offline.sh ARCHIVE WORK --jobs 2 --replay-only
+PYTHON_DOTENV_DISABLED=1 uv run python -m research.train WORK \
+  --label-spec research/targets_kraken_short.yaml --version quickstart \
+  --target BTC_spot --horizon-s 60 --lockbox-from 2026-09-27
 ```
 
-Closed files are compressed and verified; open/missing streams keep the manifest
-provisional. Leave `ARCHIVE_DELETE_LOCAL_AFTER_H` empty to retain local raw files.
-Optional scheduling is available in `scripts/install_launchd.sh`.
-
-Credential-free infrastructure checks (tests use a mocked AWS provider and plans only):
+**Tests**
 
 ```bash
-terraform -chdir=infra/terraform init -backend=false # once, to install providers
-terraform -chdir=infra/terraform fmt -check -recursive
-terraform -chdir=infra/terraform validate
-terraform -chdir=infra/terraform test
+PYTHON_DOTENV_DISABLED=1 uv run pytest -q
+(cd engine && cargo test --release --locked)
+(cd engine && cargo clippy --release --locked --all-targets -- -D warnings)
 ```
 
-## Layout
+Stop/status commands, object archiving, full training/comparison commands, DVOL and live-service setup are in [operations](docs/operations.md).
+
+## Repository layout
 
 ```text
-collectors/        exchange collectors: binance.py, okx.py, kraken.py, coinbase.py, bybit.py, deribit.py; common/ (config, envelope, sinks, runner)
-archiver/          record_raw.py + rawfmt.py: Kafka → data/raw/<Exchange>/<Market>/<Pair>/<YYYYMMDD>_<channel>.jsonl
-config/            markets.yaml: exchanges, symbols, feeds, partitions, rotation
-scripts/           create_topics.py, probe_feeds.py, convert_raw.py, check_raw.py, pipeline.sh
-docker/kafka/      single KRaft broker + kafka-ui
-tests/             unit tests + fixtures (live captures, Kraken checksum examples)
+archiver/     Raw recording, v3 format, daily object archive
+collectors/   Exchange clients and shared connection lifecycle
+config/       Markets, topic routing, event calendar
+dashboards/   Grafana market dashboard
+docs/         Strategy, operations, architecture and historical notes
+docker/       Kafka, ClickHouse and Grafana configuration
+engine/       Rust core, replay and live engine
+inference/    Saved-model streaming prediction service
+ops/          Optional macOS archive scheduling
+research/     Labels, matrices, training and evaluation
+scripts/      Operations, audits and offline launcher
+tests/        Python tests and recorded/synthetic fixtures
 ```
 
-## Dashboard (phase 4)
+## Documentation
 
-With Kafka running on `crypto-net`:
+[Strategy 1](docs/strategy-1.md) · [Operations](docs/operations.md) · [Documentation index](docs/README.md)
 
-```bash
-# Optional before first start: export GRAFANA_ADMIN_PASSWORD='your-local-password'
-docker compose --env-file /dev/null -f docker/dashboard/docker-compose.yml up -d
-```
-
-Open [Grafana](http://127.0.0.1:3000/d/crypto-market): `admin` /
-`local-dashboard-admin` by default; anonymous access is off.
-[ClickHouse HTTP](http://127.0.0.1:8123/ping) is also loopback-only.
-ClickHouse consumes `features.1s.v1` and, in phase 6, `predictions.v1` via
-`kafka:29092`; missing topics are retried without creation. The BTC/ETH dashboard
-refreshes every 5s and uses `FINAL` to collapse duplicate identities. Data persists
-in named volumes with a 30-day TTL. See [dashboard operations](docker/dashboard/README.md)
-for pinned versions, accounts, ingestion behavior, memory caps, and verification.
-
-## Live inference
-
-Set `INFERENCE_MODELS_ROOT=data` and `INFERENCE_MODEL_VERSION=<version>` in `.env`
-to enable inference with `scripts/pipeline.sh start`; an empty version disables it.
-The root contains `models/<target>/<horizon_s>/<version>/` from `research.train`.
-`status` and `stop` include inference when enabled. Models load locally by default.
-
-```bash
-PYTHON_DOTENV_DISABLED=1 uv run python -m inference.service --models-root data --version baseline-v1
-# Optional filters: --target BTC_spot --horizon-s 900
-# Explicit opt-in S3 download: --download (requires S3_BUCKET)
-```
-
-Inference starts at the latest `features.1s.v1` offsets in its own consumer group,
-uses completed ticks at the model stride, and emits keyed `predictions.v1` rows:
-model version, target, horizon, tick/production timestamps, percent return and
-direction (-1/0/+1). Missing momentum endpoints remain NaN; missing, invalid or
-warming reference books skip prediction. Stats every 60s include skips, malformed
-rows, wall-clock latency and per-tick build/predict compute latency. Shutdown
-flushes the producer and leaves the final incomplete tick unpredicted.
-
-Grafana compares predictions with exact `mid_e9` endpoints on the versioned
-Binance reference and shows directional hit rate for matured, non-flat outcomes
-in the visible range. Roughly nine-hour models verify plumbing only; several
-weeks are needed for meaningful evaluation.
-
-### Event calendar
-
-`config/events.csv` is the shared source for training and live inference. It adds
-UTC hour/weekday clocks, weekday NYSE regular hours (holidays are not modeled),
-minutes to/since CPI, Employment Situation (NFP) and FOMC statements, Deribit
-08:00 UTC expiries, and a provisional 00:00/08:00/16:00 UTC funding clock for
-Binance/OKX BTC/ETH perps. Feed-derived funding times will replace that clock.
-Sources are the [BLS archives and schedule](https://www.bls.gov/schedule/news_release/bls.ics)
-and [Fed meeting calendar](https://www.federalreserve.gov/monetarypolicy/fomccalendars.htm).
-
-Update from the repo root with
-`PYTHON_DOTENV_DISABLED=1 uv run python -m scripts.update_events` (`--dry-run`
-prints the diff). Past release corrections/removals and reduced coverage require
-`--accept-changes`; blocked sources abort without changing the file. The initial
-BLS fetch returned HTTP 403, so the supplied actual dates are complete through
-2026-10-31; future BLS schedules must be refreshed before extending coverage.
-Macro features require seven complete days of schedule on both sides of each
-tick; they are null outside that window. Live predictions use the same margin,
-so `covers_through` must be at least seven days ahead. With the current coverage,
-the final eligible tick is 2026-10-25T00:00:00Z; run `scripts/update_events.py` to
-extend it. Clock, expiry and funding features always compute. Training stores
-the file SHA256, coverage and releases through seven days after training ends.
-Live inference checks these, accepts changes beyond that training lookahead,
-and skips ticks without the required coverage.
-
-## Daily report
-
-```bash
-PYTHON_DOTENV_DISABLED=1 uv run python scripts/report_daily.py --date 2026-10-17 --allow-open
-```
-
-Writes new `data/reports/YYYYMMDD.md` and `.json` files (existing reports are refused).
-Use `--root` for another data directory; omit `--allow-open` to require closed inputs.
-The scan is read-only, bounds live-file reads at their captured sizes, and parses native
-payloads only for a deterministic freshness sample. Reports include coverage, per-stream
-drops and deduplicated connection incidents, minute rates, offset gaps, freshness, gzip
-estimates, disk runway and S3 projections. Closed metadata supplies verified counts;
-open-file metadata is ignored. Gzip estimates use up to 64 MiB per stream; freshness
-uses up to 8,192 byte-spaced frames per stream, with missing clocks excluded.
-Prices come from exported `S3_PRICE_GB_MONTH` / `S3_PRICE_PUT_PER_1000` or the defaults
-in `.env.example`; the report never loads `.env` or contacts AWS/Kafka. Local archive
-retention does not expire S3 objects, so the report shows growing S3 monthly run-rate.
-
-## Train on another machine (GPU server)
-
-`--threads N` configures every offline LightGBM fit, prediction, and importance
-calculation. It defaults to the CPUs available to the process and is recorded as `num_threads` in
-model metadata. `deterministic=True` remains enabled; results can differ slightly
-across thread counts. Inference uses its own setting.
-
-Training loads only the target assets, configured context assets, and their
-cross rows. Lazy Parquet scans apply this instrument filter before materializing
-the data. The development/embargo/lockbox date split comes from the input
-`features/date=D/` paths, so it stays the same when requested targets change.
-`--replay-only` lets `train_offline.sh` replay on one machine and leave training
-for another machine with the generated feature files.
-
-The current engine version is `0.1.0-features-v6`: zero-quantity trades seed
-deduplication IDs without contributing features, and Kraken funding uses the
-relative fraction per hourly period (Binance retains its 8-hourly period).
-Earlier checkpoints are rejected; see the [engine field contract](engine/replay/README.md).
-
-Clone this repository, install [uv](https://docs.astral.sh/uv/getting-started/installation/)
-and [Rust via rustup](https://rustup.rs), then run:
-
-```bash
-git clone <repository-url>
-cd streaming-crypto-analytics-pipeline
-uv sync
-# 1. Inventory without opening archive payloads.
-uv run python scripts/archive_inventory.py /path/to/archive --json /path/to/inventory.json
-# 2. Optional: DVOL backfill (see the Deribit DVOL section below).
-# 3. Replay and train on development dates only.
-scripts/train_offline.sh /path/to/archive /path/to/work --jobs 2 --version btc-spot-v1 --shuffle-test
-# 4. Read /path/to/work/report_btc-spot-v1.html locally.
-# 5. Only after all model choices are final, open the lockbox ONCE (no refit).
-PYTHON_DOTENV_DISABLED=1 uv run python -m research.train /path/to/work --version btc-spot-v1 --open-lockbox
-```
-
-The split uses UTC dates present across all feature instruments. By default the
-last 20% (rounded up) are a closed lockbox; the preceding calendar day is an
-embargo used by neither split. `--lockbox-pct` or `--lockbox-from YYYY-MM-DD`
-and `--embargo-days` control this split (embargo must cover the longest horizon).
-Neither labels nor metrics are computed from lockbox rows during development.
-Weekly expanding tests start after 14 days; `--fold-days`, `--min-train-days`,
-`--fold-embargo-s` (default one horizon in addition to the horizon purge), and
-`--max-folds` (latest 12) bound evaluation. Final models fit development rows only.
-
-Reports include direction, stop calibration, regimes, shuffle diagnostics and
-LightGBM gain / mean absolute SHAP importance. Each model also has an HTML page
-beside its version directory. Regenerate pages with
-`uv run python -m research.report /path/to/work --version btc-spot-v1`.
-Opening uses the saved split, models and development-only baseline calibration;
-`lockbox_ledger.jsonl` records the range, timestamp and metrics digest. Reuse of a
-range across versions warns and requires `--i-understand-lockbox-reuse`.
-The launcher passes these flags through and skips replay when opening a lockbox.
-
-X is float64 in both training and inference through the same conversion helper;
-labels stay float64. Before allocating X, training prints rows × features × 8 bytes.
-`--max-memory-gb` defaults to 70% of physical RAM; exceed it and training stops
-with advice to raise `--stride-s` or use fewer days. This is an X allocation guard,
-not an upper bound on total RAM: input frames, labels and LightGBM need more.
-No new plotting or SHAP dependency is required; HTML uses inline SVG.
-
-The command builds release replay, discovers closed v3 days, and publishes
-`work/features/date=D/features.parquet` atomically. It resumes completed days;
-interrupted staging stays unpublished and is redone. Per-day logs/JSON reports
-are in `work/logs/`; models are in `work/models/`. `--jobs` defaults to half the
-CPU count; `--from YYYY-MM-DD` / `--to YYYY-MM-DD` filter discovered dates.
-Failed replay days stop training unless explicitly allowed with
-`--allow-missing-days`. Training uses all completed days in the work directory;
-use a separate work directory for a separate date selection, and a new version
-for each training run.
-Completed days are reused only when their Parquet `engine_version` matches the
-current engine; stale days require a new work directory or `--rebuild-stale`, which
-replays them and atomically replaces each file only after successful completion.
-
-`BTC_spot` keeps Binance BTCUSDT spot as its reference. Missing Binance/OKX perps
-or ETH do not cause fallback to another instrument: absent references are reported
-as skipped. `context_assets: [USDT]` in `research/targets.yaml` adds same-tick,
-`ctx_usdt_<exchange>_<market>_*` predictors, including USDT/USD `premium_bps =
-10000*(mid-1)`. Missing context is null; its emission time participates in every
-availability and purge check. No labeled history (including these two-minute
-excerpts) yields an explicit “not enough labeled rows” report, no models, and exit
-0; invalid inputs/configuration still fail. LightGBM uses two CPU threads for this
-baseline; a GPU is not required.
-
-Local Mac measurements on the two-minute excerpts, **not full-day input**, were
-33,511 spot/L3 records → 691,160 full-day output rows in 0.657 s (51,016 records/s,
-29.9 MiB peak RSS), and 75,235 futures records → 172,794 rows in 0.243 s (310,109
-records/s, 21.1 MiB RSS). These are release replay's JSON timings plus
-`/usr/bin/time -l` RSS, excluding build and Python training. Ingestion-only warm
-medians were 286,586 and 656,071 records/s respectively (see
-[replay measurement method](engine/replay/README.md#v3-fixture-checks-and-throughput)).
-Estimate a full day's ingestion time as its record count divided by the applicable
-measured ingestion rate, then add tick/Parquet work; full days will take longer
-and depend on L3 activity, storage and server speed. Replay streams input, so RAM
-is driven by books and pending buffers rather than day length; parallel jobs
-multiply worker memory. Measure representative full days before choosing job
-counts. Python training additionally holds all input features and wide matrices
-in RAM; the replay RSS figures do not estimate training memory.
-
-## Deribit DVOL (P22, features v5)
-
-`uv run python -m collectors deribit` runs a REST poller through the same Kafka
-sink and session/crash tracking as the WebSocket collectors; `pipeline.sh` includes
-it. After an initial catch-up poll it polls BTC and ETH each minute about five
-seconds after the boundary, fetching a five-minute overlap. Only closed candles
-are emitted, once per currency/timestamp per process, in ascending candle order.
-HTTP errors emit in-band drop/start events with exponential backoff and jitter;
-Kafka loss triggers drop/start and re-fetches the overlap. Restarts can repeat
-closed candles; the engine keeps the first observation of each timestamp.
-
-The envelope is `deribit/index/dvol`, symbol BTC or ETH, kind `update`, topic
-`raw.deribit.index.dvol.v1` (BTC partition 0, ETH partition 1). Payload is the
-single `[ts_ms,open,high,low,close]` row. A token-preserving JSON decoder retains
-all number spellings, and joins the five tokens into a row array without float
-conversion. Only JSON whitespace is normalized. The v3 archive is
-`Deribit/Index/<BTC|ETH>/YYYYMMDD_dvol.jsonl`, with `channel=dvol`, metadata and
-`data` containing the row; decimal/exponent tokens become exact strings.
-Readers accept `deribit*` and `index*` directory prefixes case-insensitively.
-
-Backfill runs **only on the server**. Stop writers for the target dates first:
-
-```sh
-PYTHON_DOTENV_DISABLED=1 uv run python scripts/backfill_dvol.py \
-  --archive-root /server/archive/raw --from 2026-10-01 --to 2026-10-17 --currency BTC ETH
-```
-
-Both dates are inclusive, completed UTC **receive days**. Backfill pages backwards
-using `continuation` as the next `end_timestamp`, sleeps between requests and
-backs off on 429/5xx or transport errors. Synthetic receive time is candle start
-plus 70 seconds (60 seconds to close plus 10 seconds fixed lag). Thus the prior
-day's 23:59 candle is this day's first record at 00:00:10; this day's 23:59 candle
-belongs to the next file. Files have connection `backfill`, offsets from zero,
-a deterministic final rollover and recorder-compatible `.meta.json` with
-`synthetic_offsets=true`. Identical existing content is skipped; differing files,
-metadata checksum mismatches and existing open/gzip counterparts are refused.
-Writes use exclusive creation and fsync; interrupted partial files are preserved
-and cause a later run to refuse, for operator review.
-
-Features v5 introduced five nullable float columns on each asset's `cross` row:
-`dvol`, `dvol_chg_300s`, `dvol_chg_900s`, `dvol_chg_3600s`, `dvol_rv_gap`.
-See the [engine field contract](engine/replay/README.md#deribit-dvol-features-v5)
-for timing and units. Existing market row values are unchanged; their DVOL
-columns are null. No Deribit market row is emitted.
+[Engine](engine/README.md) · [Research](research/README.md) · [Dashboard](docker/dashboard/README.md) · [Historical notes](docs/archive/README.md)

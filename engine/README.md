@@ -1,11 +1,20 @@
-# Engine core
+# Rust engine: books, features, replay and live ingestion
 
 `engine_core` is synchronous and performs no I/O. Construct one `StreamBook` per
 (exchange, market, feed, symbol), parse Kafka v1 envelopes with `Record::parse`, and
-call `consume_at_tick` in partition offset order. Replay reads only native v2 raw
-files through its small path/line adapter; the Kafka envelope path is unchanged.
-Pure feature state is shared in `engine_core::features`. The [ideal replay CLI](replay/README.md)
-handles file ordering, ticks and Parquet; live ingestion is a later phase.
+call `consume_at_tick` in partition offset order. Replay reads native v3 raw files
+through a path/line adapter, with an explicit exchange-clock option for older
+Kraken spot archives missing receive timestamps.
+The Kafka envelope path is unchanged. Pure feature state is shared in
+`engine_core::features`. The [replay CLI](replay/README.md) handles archive ordering,
+ticks and Parquet; `engine-live` handles Kafka ingestion, checkpoints and cutoffs.
+The engine version is `0.1.0-features-v7`.
+
+Kraken and Binance spot/perpetual books and flows, OKX spot/swap books and trades,
+and Deribit BTC/ETH DVOL are supported. OKX swaps require contract metadata for
+base-quantity scaling. Coinbase and Bybit are collected and archived but have no
+engine adapters yet; live assignment skips their raw topics. The
+[Strategy 1 results](../docs/strategy-1.md) use Kraken/Binance/Deribit inputs.
 
 `Fixed` uses signed i64 units of 10^-8; parsing rejects excess precision and
 overflow. `Book::mid` returns `Mid` in i128 units of 10^-9 so half an atom is exact.
@@ -22,8 +31,10 @@ retain priority, while increases receive a newer timestamp and move back.
 books can retain levels for diagnostics; ended connections release their books
 and buffered deltas. `connection_count()` reports retained live/pending states.
 `Outcome`, `last_break()`, and `counters()` expose continuity, checksum results,
-applied updates, and breaks. Normal drops or detected breaks retire the connection
-ID permanently; recovery uses a new connection start plus a snapshot.
+applied updates, and breaks. Ended connections retire permanently. Binance depth
+sequence breaks reset synchronization within the same epoch, permitting buffered
+deltas and a later REST anchor to resynchronize. Other book breaks require a new
+connection start and snapshot.
 `drop(reason=collector_crash)` is carried by the restarted collector's new
 connection: it retires the previous active source, preserving the carrying ID for
 its following start and snapshot. Stale Binance
@@ -34,26 +45,23 @@ From `engine/`:
 
 ```sh
 $HOME/.cargo/bin/cargo test --release --locked
-$HOME/.cargo/bin/cargo clippy --locked --all-targets -- -D warnings
+$HOME/.cargo/bin/cargo clippy --release --locked --all-targets -- -D warnings
 $HOME/.cargo/bin/cargo fmt --check
 ENGINE_BENCH_N=100 $HOME/.cargo/bin/cargo test --release timing -- --ignored --nocapture
 ```
 
-The root toolchain file uses the installed `stable` alias, currently rustc 1.99.1
-(58cf8f9c3 2026-10-13), because a separate `1.99.1` alias is not installed and
-would trigger a rustup download. `ENGINE_BENCH_EXCHANGE=binance` (or `kraken`,
+The root toolchain file selects `stable` with Clippy and rustfmt; the crates
+require Rust 1.99 or newer. `ENGINE_BENCH_EXCHANGE=binance` (or `kraken`,
 `okx`) selects one exchange. Timing includes envelope parsing, payload parsing,
 reconstruction and available checksum verification; fixture reads are outside the
 timer. Each iteration creates fresh stream states.
 
 ## OKX checksum availability
 
-On 2026-10-17 all 192,432 OKX spot BTC book messages checked in the live archive
-had checksum zero (supervisor observation). The supplied fixtures likewise have
-zero in all 564 spot and 598 perp messages. As explicitly agreed, zero means
-"not provided": it increments `okx_checksum_absent` without verification.
-Nonzero checksums remain strictly verified; sequence continuity is always checked.
-`checksums_verified` counts only actual successful checksum comparisons.
+A checksum of zero means "not provided": it increments `okx_checksum_absent`
+without verification. Nonzero checksums are strictly verified, and sequence
+continuity is always checked. `checksums_verified` counts only successful
+checksum comparisons.
 
 The CRC32 algorithm interleaves descending bids and ascending asks, up to 25
 levels per side, joins native price and size text with colons, and returns a
@@ -61,19 +69,12 @@ signed i32. Synthetic tests use independently Python-zlib-checked constants,
 including signed checksums, unequal side lengths, updates, deletes, the top-25
 boundary, and retained decimal text. The fixtures remain unchanged.
 
-## Timing (release, 100 iterations, 2026-10-17)
+<a id="timing-release-100-iterations-2026-10-17"></a>
+## Validation history
 
-| Exchange | Messages | Messages/s | ns/message | Spot ns/message | Perp ns/message |
-|---|---:|---:|---:|---:|---:|
-| Binance | 120000 | 73410 | 13622 | 12454 | 14788 |
-| Kraken | 120000 | 258581 | 3867 | 3921 | 3812 |
-| OKX | 116800 | 149394 | 6694 | 4443 | 8823 |
-
-These include fresh snapshot reconstruction each iteration and optional envelope
-fields. OKX fixtures exercise continuity and count absent checksums; they do not
-measure nonzero CRC verification. Kraken spot L2 at 3.92 us/message is about 3.8x
-faster than the supplied Python reference of approximately 15 us/message (that
-baseline was not remeasured here).
+Dated acceptance checks, archive audits and fixture throughput measurements are
+kept in the [engine validation log](../docs/archive/engine-validation-log.md).
+Use the commands above to check the current checkout.
 
 ## Live ingestion and reproducible replay
 
@@ -88,8 +89,12 @@ engine/target/release/engine-replay --root data --date YYYY-MM-DD \
   --mode as_live --allow-open --from-state data/engine/date=YYYY-MM-DD/start_state_<tick>.json
 ```
 
-Live connects only to `localhost:9092`, assigns the 44 `raw.*` partitions at their
-current high watermarks, and never commits consumer offsets. It produces only to
+Live connects only to `localhost:9092`, assigns the 46 supported `raw.*` partitions
+at their current high watermarks, and never commits consumer offsets. Topics
+starting with `raw.coinbase.` and `raw.bybit.` are skipped because those exchanges
+are collected but not yet parsed. The exact 46-partition check remains in force
+for the configured Kraken/Binance/OKX/Deribit streams; other topic-layout changes
+require a corresponding engine update. It produces only to
 `features.1s.v1` and `engine.cutoffs.v1` (one partition, 72-hour retention). No
 collector or pipeline process is started or changed by this command. SIGINT and
 SIGTERM finish the current tick, flush acknowledged output, and fsync the journals.
@@ -97,13 +102,12 @@ A later invocation starts a new session at latest; automatic crash recovery is n
 implemented. A mid-session restart leaves a gap that `as_live` reports rather than
 inventing ticks across it.
 
-Tick T runs at T + 250 ms. Each partition queue is in offset order: extraction
-stops at its first `recv_ns > T`, even if subsequent offsets have earlier timestamps.
-After selecting these prefixes, the entire selected batch is sorted by
-`(recv_ns, topic, partition, offset)`. This is also the order used by `as_live`;
-within a selected prefix a clock step can therefore change application order.
-Ideal replay retains its original one-head-per-file merge behavior. Live rows
-use actual wall-clock emission times for `available_ns`; replay uses T + 250 ms.
+Tick T runs at T + 250 ms. Each partition queue stays in offset order. The merge
+chooses among partition heads by `(recv_ns, topic, partition, offset)` and stops
+when no head is eligible at T. A future head blocks older timestamps behind it;
+backward clock steps never reorder a partition. `as_live` uses the same merge.
+Ideal replay likewise merges one head per input file. Live rows use actual
+wall-clock emission times for `available_ns`; replay uses T + 250 ms.
 
 Before the startup tick, live atomically saves
 `data/engine/date=D/start_state_<tick>.json`. At UTC midnight, before that day's
@@ -148,7 +152,7 @@ current cutoff.
 The replay report also lists L2 connection switches, their tick, and the source
 validity on each side of the switch for overlap audits.
 
-## Replay ordering and late flow (P10)
+## Replay ordering and late flow
 
 All modes merge only each partition's next record by
 `(recv_ns, topic, partition, offset)`. Offset order survives backward receive-clock
@@ -158,12 +162,15 @@ Flow buckets use `max(window_tick(recv_ns), current_tick)` in the shared core, s
 late trade, liquidation and L3 flow reaches an emitted row. Freshness still uses
 the original receive timestamp. No-step ordering equals the former global sort.
 
-Raw v2 paths are `raw/<exchange>/<market>/<SYMBOL>/YYYYMMDD_<feed>.jsonl[.gz|.open]`.
-The adapter derives stream coordinates from the path, requires connection/offset/
-receive metadata, maps markers to controls, and retains the original native line
-as payload. JSON decimal strings and number tokens both use exact fixed point;
+Raw v3 paths are `raw/<Exchange>/<Market>/<Pair>/YYYYMMDD_<channel>.jsonl[.gz|.open]`.
+The root may be the raw tree or its parent. The adapter derives stream coordinates
+from the path, maps markers to controls and retains native decimal text. Missing
+offsets use physical line indices; missing connection IDs use per-file epochs.
+Receive time is required for data unless the explicit Kraken spot
+`--exchange-clock-ms` option is used. Open files require `--allow-open`.
+JSON decimal strings and number tokens both use exact fixed point;
 Kraken CRC32 uses their original decimal characters. See
-[replay usage](replay/README.md) and [validation](replay/VALIDATION.md).
+[replay usage](replay/README.md) and [historical validation](../docs/archive/engine-validation-log.md).
 
 ## Fast cross-venue lead features (features-v7)
 

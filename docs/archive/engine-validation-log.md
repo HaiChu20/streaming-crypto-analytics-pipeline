@@ -1,4 +1,12 @@
-# P5b validation — 2026-10-17 (collector-crash correction)
+# Engine validation log
+
+Historical validation and benchmark records, retained for context. Counts, engine
+versions, acceptance thresholds and local artifact paths describe the original
+runs; they are not current release guarantees. No measurements were rerun for
+this documentation move. Use the [engine guide](../../engine/README.md) and
+[replay guide](../../engine/replay/README.md) for current operation.
+
+## P5b validation — 2026-10-17 (collector-crash correction)
 
 Schema keeps exact **mid_e9** and nullable DOUBLE **book_age_ms**. Shared
 `STALE_S = 60` expires silent books/extras after 60 seconds, preserving zero-flow
@@ -9,7 +17,7 @@ Normal drops/stops and later continuity failures still retire their carrier.
 `check_raw.check_stream` preserves the crash carrier's check state, event count
 and UNCERTAIN annotation instead of marking that new connection broken.
 
-## Acceptance
+### Acceptance
 
 - `cargo test --release --locked`: **51 passed, 0 failed, 1 ignored** (32 book
   integration tests, 1 core bounded-ID unit, 18 replay tests; ignored test is timing).
@@ -27,10 +35,10 @@ and UNCERTAIN annotation instead of marking that new connection broken.
 - Independent Parquet read-back verifies strict ordering, metadata and frozen-tail
   nullability across all output rows.
 
-## Real-day replay after FIX2
+### Real-day replay after FIX2
 
 ```sh
-/usr/bin/time -l engine/target/release/engine-replay --root data --date 2026-10-17 --allow-open --out /private/tmp/claude-502/-Users-bfhach-Projects-streaming-crypto-analytics-pipeline/60166cad-1579-46c0-bd19-31bf3993d4db/scratchpad/features
+/usr/bin/time -l engine/target/release/engine-replay --root data --date 2026-10-17 --allow-open --out "<scratch>/features"
 ```
 
 - Input: 42 streams; 16,054,399,210 capped bytes;
@@ -46,7 +54,7 @@ and UNCERTAIN annotation instead of marking that new connection broken.
   64 disconnect drops + 4 collector-crash drops, with zero newly detected sequence
   gaps/checksum mismatches. Freshness expiry is counted independently.
 
-## Corrected observed stale counts
+### Corrected observed stale counts
 
 **All 12 instruments now have zero stale observed ticks.** Each OKX stream's
 previous artificial 93-tick interval (0.304369%) is gone. Its startup crash carrier
@@ -74,7 +82,7 @@ range, excluding the future tail.
 `observed_stale_ranges` is empty. The former OKX spot interval
 02:01:28–02:03:00 UTC and perp interval 02:01:29–02:03:01 UTC no longer appear.
 
-## Frozen-tail proof remains intact
+### Frozen-tail proof remains intact
 
 For each instrument, all **47,982 ticks** later than final captured receive time
 plus 60 seconds are stale and **book_valid=false**, with zero valid books:
@@ -89,7 +97,7 @@ Maximum absolute cross values (bps):
 | BTC | 7.449978 | 6.290082 | 4.045101 | 3.910095 | 17.171358 |
 | ETH | 10.411630 | 7.640063 | 3.315288 | 6.972943 | 17.613350 |
 
-## Independent Kraken BTC reference
+### Independent Kraken BTC reference
 
 The new Parquet read-back selected the same five observed Kraken BTC ticks; all
 five were compared again with the independent stdin Python/Decimal reconstruction
@@ -104,18 +112,18 @@ That independent replay's sampled prefix is unchanged; it was not rerun for FIX2
 | 2026-10-17T06:50:36+00:00 | 81477.15 | 81477150000000 | 81477150000000 |
 | 2026-10-17T09:09:26+00:00 | 81606.95 | 81606950000000 | 81606950000000 |
 
-## Artifacts
+### Artifacts
 
-- Parquet: `/private/tmp/claude-502/-Users-bfhach-Projects-streaming-crypto-analytics-pipeline/60166cad-1579-46c0-bd19-31bf3993d4db/scratchpad/features/date=2026-10-17/features.parquet`
-- Input caps/metrics: `/private/tmp/claude-502/-Users-bfhach-Projects-streaming-crypto-analytics-pipeline/60166cad-1579-46c0-bd19-31bf3993d4db/scratchpad/p5b-fix2-report.json`
-- Timing/RSS: `/private/tmp/claude-502/-Users-bfhach-Projects-streaming-crypto-analytics-pipeline/60166cad-1579-46c0-bd19-31bf3993d4db/scratchpad/p5b-fix2-time.txt`
-- Ordering/staleness/tail audit: `/private/tmp/claude-502/-Users-bfhach-Projects-streaming-crypto-analytics-pipeline/60166cad-1579-46c0-bd19-31bf3993d4db/scratchpad/p5b-fix2-audit.json`
-- Independent Python reference: `/private/tmp/claude-502/-Users-bfhach-Projects-streaming-crypto-analytics-pipeline/60166cad-1579-46c0-bd19-31bf3993d4db/scratchpad/p5b-fix-crosscheck.json`
+- Parquet: `<scratch>/features/date=2026-10-17/features.parquet`
+- Input caps/metrics: `<scratch>/p5b-fix2-report.json`
+- Timing/RSS: `<scratch>/p5b-fix2-time.txt`
+- Ordering/staleness/tail audit: `<scratch>/p5b-fix2-audit.json`
+- Independent Python reference: `<scratch>/p5b-fix-crosscheck.json`
 
 Feature contract and official exchange field-semantic citations remain in
-[README.md](README.md). Raw data and the running pipeline were not modified.
+[replay guide](../../engine/replay/README.md). Raw data and the running pipeline were not modified.
 
-# P10 validation — v2 raw replay and partition ordering
+## P10 validation — v2 raw replay and partition ordering
 
 Ideal, as_live, and live checkpoints now merge only per-partition heads. A
 backward `recv_ns` cannot reorder a later offset ahead of an earlier one; flow
@@ -195,3 +203,92 @@ P10 artifacts are under `scratchpad/p10/`: `legacy-ts-features`,
 `ours-features` and `ours-report.json`,
 `v2-aslive-rows.jsonl`, `reference-live-rows.jsonl`, and the row-diff JSONs.
 All raw inputs were read only.
+
+## OKX checksum observations — 2026-10-17
+
+On 2026-10-17 all 192,432 OKX spot BTC book messages checked in the live archive
+had checksum zero (supervisor observation). The supplied fixtures likewise have
+zero in all 564 spot and 598 perp messages. As explicitly agreed, zero means
+"not provided": it increments `okx_checksum_absent` without verification.
+Nonzero checksums remain strictly verified; sequence continuity is always checked.
+`checksums_verified` counts only actual successful checksum comparisons.
+
+## Timing (release, 100 iterations, 2026-10-17)
+
+| Exchange | Messages | Messages/s | ns/message | Spot ns/message | Perp ns/message |
+|---|---:|---:|---:|---:|---:|
+| Binance | 120000 | 73410 | 13622 | 12454 | 14788 |
+| Kraken | 120000 | 258581 | 3867 | 3921 | 3812 |
+| OKX | 116800 | 149394 | 6694 | 4443 | 8823 |
+
+These include fresh snapshot reconstruction each iteration and optional envelope
+fields. OKX fixtures exercise continuity and count absent checksums; they do not
+measure nonzero CRC verification. Kraken spot L2 at 3.92 us/message is about 3.8x
+faster than the supplied Python reference of approximately 15 us/message (that
+baseline was not remeasured here).
+
+## V3 fixture benchmark (P16)
+
+Original
+`tests/fixtures/v2` files remain on disk, unused; `fixtures/v3` replaces them.
+
+The fixture benchmark command for the records below runs from `engine/`:
+
+```sh
+cargo run --release -p engine-replay --example benchmark_archive -- ../tests/fixtures/archive
+```
+
+It measures archive reading, parsing and ingestion; it excludes full-day empty
+ticks and Parquet output. Run 0 warms the cache, and runs 1–3 supply the samples.
+
+P16 fixture measurement (release, local machine, three warm samples): spot/L3
+33,511 records at 279,346 / 286,586 / 288,175 records/s (median 286,586);
+Kraken futures 75,235 records at 670,425 / 656,071 / 639,964 records/s
+(median 656,071). Both ingestion medians exceed the ~255k records/s reference.
+This is a fixture ingestion comparison, not a paired full-day benchmark. Full-day
+CLI output on these sparse excerpts produced 691,160 rows in 0.674 s for spot
+(49,730 records/s) and 172,794 rows in 0.251 s for futures (300,133 records/s).
+Most spot output rows follow the excerpt's end and contain stale/null values.
+
+## Features v4 fixture validation (P21)
+
+Required checks: `cargo test --release --locked` (109 passed, one pre-existing
+ignored timing test), `cargo clippy --locked --all-targets -- -D warnings`,
+`cargo fmt --check`, and root `PYTHON_DOTENV_DISABLED=1 uv run pytest -q`
+(336 passed). Tests include archive replay, live/as_live/from_state parity,
+a full hour of liquidation and OI history, and a pending liquidation at restart.
+
+The benchmark command above ran before edits and after all checks. Warm samples
+are records/s (run 0 excluded). Three unchanged post-change batches were retained
+because individual batches varied; the reported after median includes **all nine**
+warm samples, rather than selecting one batch. This measures ingestion only,
+not the new once-per-second band calculations or Parquet output.
+
+| Fixture | Before warm samples | After warm samples, in three batches | Before median | After median | Regression |
+| --- | --- | --- | ---: | ---: | ---: |
+| Spot, 33,511 records | 330409, 342982, 340212 | 322473, 321620, 322394; 322130, 329200, 329955; 305944, 305476, 311901 | 340212 | 322130 | 5.3% |
+| Futures, 75,235 records | 641786, 646099, 644572 | 551758, 538423, 540489; 607191, 615092, 609306; 607110, 598264, 604099 | 644572 | 604099 | 6.3% |
+
+All benchmark runs reported no data anomalies. Individual batch regressions
+reached 10.1% (spot) and 16.1% (futures); aggregate medians meet the 10% threshold.
+
+## Deribit DVOL validation (P22)
+
+P22 validation: `cargo test --release --locked` passed 114 tests (one existing
+ignored timing test); Clippy with `--locked --all-targets -- -D warnings` and
+`cargo fmt --check` passed. Root `PYTHON_DOTENV_DISABLED=1 uv run pytest -q`
+passed 383 tests. New offline fixtures cover exact response number tokens,
+recorder/reader round trips, poll retries/dedupe/closed candles, Kafka recovery,
+server backfill pagination/receive days/no-clobber behavior, all DVOL windows,
+RV units, Parquet and checkpoint/from-state parity with a pending candle.
+
+`benchmark_archive` before/after warm records/s (run 0 excluded):
+
+| Fixture | Before samples | After samples | Before median | After median | Regression |
+| --- | --- | --- | ---: | ---: | ---: |
+| Spot, 33,511 records | 288323, 274507, 276290 | 321458, 322784, 325630 | 276290 | 322784 | none (−16.8%) |
+| Futures, 75,235 records | 491008, 460519, 454109 | 586371, 586325, 612476 | 460519 | 586371 | none (−27.3%) |
+
+Both measured regressions are below 5%, with zero data anomalies. These short
+fixture ingestion runs vary with local load; the increases are not evidence of
+an algorithmic speedup. They exclude ticks and Parquet, as described above.

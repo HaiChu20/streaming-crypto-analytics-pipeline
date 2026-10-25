@@ -1,4 +1,4 @@
-"""Recorder day-close and crash-recovery rules (plan.md §5.4, §7), driven without Kafka."""
+"""Recorder day-close and crash-recovery rules, driven without Kafka."""
 
 import hashlib
 import logging

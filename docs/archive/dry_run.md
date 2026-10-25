@@ -2,9 +2,9 @@
 
 Run: 2026-10-17; 10-second stride, 3 expanding folds, 100 boosting rounds, two LightGBM threads.
 
-**Roughly nine hours of valid data is far too little for meaningful results. Plan §10–11 requires several weeks. This run verifies the offline pipeline and leakage guards only.**
+**Roughly nine hours of valid data is far too little for meaningful results. Meaningful evaluation requires several weeks. This run verifies the offline pipeline and leakage guards only.**
 
-Input: `/private/tmp/claude-502/-Users-bfhach-Projects-streaming-crypto-analytics-pipeline/60166cad-1579-46c0-bd19-31bf3993d4db/scratchpad/features/date=2026-10-17/features.parquet` (read-only).
+Input: `<scratch>/features/date=2026-10-17/features.parquet` (read-only).
 
 Input rows: 1,112,572, 14 instrument/cross streams. The file spans about 22 hours, including the invalid trailing period; about 9 hours have valid reference books. Replay mode: `ideal`; engine: `0.1.0-ideal-v1`.
 
@@ -64,8 +64,8 @@ Held-out metrics concatenate the three test folds. MAE/RMSE are percentage point
 
 The zero-return baseline has lower MAE than both learned models in all eight combinations on this sample. No claim about predictive usefulness follows from these few overlapping hours.
 
-Full JSON (includes per-fold metrics, windows, purge evidence, feature lists and metadata): `/private/tmp/claude-502/-Users-bfhach-Projects-streaming-crypto-analytics-pipeline/60166cad-1579-46c0-bd19-31bf3993d4db/scratchpad/p7/research_report_dry-run-final.json`.
+Full JSON (includes per-fold metrics, windows, purge evidence, feature lists and metadata): `<scratch>/p7/research_report_dry-run-final.json`.
 
-Final models, metadata and per-training-row provenance: `/private/tmp/claude-502/-Users-bfhach-Projects-streaming-crypto-analytics-pipeline/60166cad-1579-46c0-bd19-31bf3993d4db/scratchpad/p7/models/<target>/<900|1800>/dry-run-final`.
+Final models, metadata and per-training-row provenance: `<scratch>/p7/models/<target>/<900|1800>/dry-run-final`.
 
 All 24 folds passed the recorded endpoint, label-emission and feature-emission checks against test start. Model save/load is covered by the synthetic end-to-end test. Upload was tested with a stub client only; no AWS call was made. No live-pipeline/Docker/Kafka operation or git write was performed.
