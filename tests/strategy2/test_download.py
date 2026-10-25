@@ -5,6 +5,8 @@ from datetime import date
 import hashlib
 from io import StringIO
 from pathlib import Path
+import subprocess
+import sys
 
 import httpx
 import pytest
@@ -49,7 +51,7 @@ def test_monthly_daily_split_and_exact_urls():
         subset = [item for item in items if item.dataset == dataset]
         assert [item.period for item in subset] == ["2026-09", "2026-10-01", "2026-10-02"]
         assert all("/daily/" in item.url for item in subset[1:])
-    assert [item.period for item in items if item.dataset == "funding_rate"] == ["2026-09", "2026-10"]
+    assert [item.period for item in items if item.dataset == "funding_rate"] == ["2026-09", "2026-10-01_2026-10-02"]
 
 
 @pytest.mark.parametrize("start,end,periods", [
@@ -114,7 +116,7 @@ def test_checksum_pass_resume_and_coverage(tmp_path):
     assert path.stat().st_mtime_ns == before
     assert requests == [item.url + ".CHECKSUM", item.url, item.url + ".CHECKSUM"]
     rows = list(csv.DictReader((tmp_path / "coverage.csv").open()))
-    assert rows == [{**second[0], "bytes": str(len(content))}]
+    assert rows == [{**second[0], "bytes": str(len(content)), "missing_hours": "0"}]
     assert not list(tmp_path.rglob("*.part"))
 
 
@@ -261,8 +263,8 @@ def test_dvol_paging_sorted_csv_and_verified_resume(tmp_path):
     assert Path(str(path) + ".CHECKSUM").read_text().startswith(hashlib.sha256(path.read_bytes()).hexdigest())
 
 
-@pytest.mark.parametrize("kind", ["empty", "gap", "404"])
-def test_dvol_incomplete_history_is_missing(tmp_path, kind):
+@pytest.mark.parametrize("kind", ["empty", "404"])
+def test_dvol_absent_history_is_missing(tmp_path, kind):
     item = plan("2026-09-30", "2026-09-30", ("dvol",))[0]
     points = [] if kind == "empty" else dvol_points(item)[1:]
     with client_for(lambda request: httpx.Response(404) if kind == "404" else
@@ -326,3 +328,243 @@ def test_cli_summarizes_coverage_and_fails_on_integrity_errors(tmp_path, monkeyp
 def test_invalid_job_count_rejected_before_work(tmp_path, jobs):
     with pytest.raises(ValueError, match="positive"):
         run_downloads([], tmp_path, jobs=jobs)
+
+
+def test_errors_are_isolated_coverage_is_written_and_rerun_retries(tmp_path, monkeypatch):
+    items = plan("2026-09-28", "2026-09-28", ("perp_klines", "metrics", "dvol"))
+    monkeypatch.setattr(module.time, "sleep", lambda delay: None)
+    calls = []
+
+    def failing(request):
+        calls.append(str(request.url))
+        if request.url.host == "www.deribit.com":
+            raise httpx.ReadTimeout("slow server\nplease retry", request=request)
+        if "/metrics/" in str(request.url):
+            return httpx.Response(404)
+        return httpx.Response(200, content=checksum(b"ok") if str(request.url).endswith(".CHECKSUM") else b"ok")
+
+    with client_for(failing) as client:
+        rows = run_downloads(items, tmp_path, client=client)
+    assert [row["status"] for row in rows] == ["downloaded", "missing", "error"]
+    assert rows[0]["error"] == rows[1]["error"] == ""
+    assert rows[2]["error"] == "ReadTimeout: slow server please retry"
+    assert calls.count(items[2].url) == 4
+    with (tmp_path / "coverage.csv").open() as source:
+        coverage = list(csv.DictReader(source))
+    assert len(coverage) == 3
+    assert coverage[2]["status"] == "error" and coverage[2]["error"] == rows[2]["error"]
+    retry_calls = []
+
+    def recovered(request):
+        retry_calls.append(str(request.url))
+        if request.url.host == "www.deribit.com":
+            return httpx.Response(200, json={"result": {"data": dvol_points(items[2]), "continuation": None}})
+        return httpx.Response(200, content=checksum(b"ok") if str(request.url).endswith(".CHECKSUM") else b"ok")
+
+    with client_for(recovered) as client:
+        rows = run_downloads(items, tmp_path, client=client)
+    assert [row["status"] for row in rows] == ["present", "downloaded", "downloaded"]
+    assert items[0].url not in retry_calls
+    assert items[1].url in retry_calls and items[2].url in retry_calls
+    assert all(row["error"] == "" for row in rows)
+
+
+def test_unexpected_item_errors_are_short_and_do_not_stop_other_items(tmp_path, monkeypatch):
+    items = plan("2026-09-28", "2026-09-29", ("metrics",))
+
+    def handler(item, root, client):
+        if item == items[0]:
+            raise RuntimeError("x" * 1000)
+        return module._row(item, "missing")
+
+    monkeypatch.setattr(module, "download", handler)
+    with client_for(lambda request: pytest.fail("unexpected HTTP")) as client:
+        rows = run_downloads(items, tmp_path, client=client)
+    assert [row["status"] for row in rows] == ["error", "missing"]
+    assert len(rows[0]["error"]) == 240
+    assert (tmp_path / "coverage.csv").exists()
+
+
+def test_dvol_gap_is_published_with_missing_hour_count(tmp_path):
+    item = plan("2026-09-30", "2026-09-30", ("dvol",))[0]
+    points = dvol_points(item)[1:]
+    with client_for(lambda request: httpx.Response(200, json={
+            "result": {"data": points, "continuation": None}})) as client:
+        row = run_downloads([item], tmp_path, client=client)[0]
+    assert row["status"] == "partial" and row["missing_hours"] == 1
+    path = tmp_path / item.path
+    assert len(list(csv.DictReader(StringIO(path.read_text())))) == 23
+    sidecar = Path(str(path) + ".CHECKSUM").read_text().splitlines()
+    assert sidecar[0].split()[0] == hashlib.sha256(path.read_bytes()).hexdigest()
+    assert sidecar[1] == f"{item.start_ms} {item.end_ms}"
+    with (tmp_path / "coverage.csv").open() as source:
+        coverage = next(csv.DictReader(source))
+    assert coverage["missing_hours"] == "1" and coverage["error"] == ""
+
+
+@pytest.mark.parametrize("kind", ["complete", "partial", "changed", "subset", "same"])
+def test_dvol_upgrade_requires_strict_superset_and_identical_overlap(tmp_path, kind):
+    item = plan("2026-09-30", "2026-09-30", ("dvol",))[0]
+    points = dvol_points(item)
+    old = points[2:]
+    new = points if kind != "partial" else points[1:]
+    if kind == "changed":
+        new = [point.copy() for point in new]
+        new[2][4] += 1
+    elif kind == "subset":
+        new = points[3:]
+    elif kind == "same":
+        new = old
+    path = tmp_path / item.path
+
+    def fetch(values):
+        with client_for(lambda request: httpx.Response(200, json={
+                "result": {"data": values, "continuation": None}})) as client:
+            return download(item, tmp_path, client)
+
+    assert fetch(old)["status"] == "partial"
+    before = path.read_bytes()
+    checksum_path = Path(str(path) + ".CHECKSUM")
+    before_checksum = checksum_path.read_bytes()
+    result = fetch(new)
+    if kind in ("changed", "subset", "same"):
+        assert result["status"] == "conflict"
+        assert path.read_bytes() == before and checksum_path.read_bytes() == before_checksum
+    else:
+        assert result["status"] == ("downloaded" if kind == "complete" else "partial")
+        assert result["missing_hours"] == (0 if kind == "complete" else 1)
+        rows = list(csv.DictReader(StringIO(path.read_text())))
+        assert len(rows) == len(new)
+        assert checksum_path.read_text().split()[0] == hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def test_funding_partial_final_month_uses_rest_and_full_months_use_archives():
+    items = plan(datasets=("funding_rate",))
+    assert len(items) == 2
+    assert "/monthly/fundingRate/" in items[0].url
+    item = items[1]
+    assert item.path == ("binance/futures/um/rest/fundingRate/BTCUSDT/"
+                         "BTCUSDT-fundingRate-2026-10-01_2026-10-02.csv")
+    params = httpx.URL(item.url).params
+    assert httpx.URL(item.url).host == "fapi.binance.com"
+    assert dict(params) == {"symbol": "BTCUSDT", "startTime": str(item.start_ms),
+                            "endTime": str(item.end_ms - 1), "limit": "1000"}
+    assert item.end_ms - item.start_ms == 48 * HOUR_MS
+    assert plan("2026-09-28", "2026-09-30", ("funding_rate",))[0].path.endswith("2026-09.zip")
+    assert plan("2026-09-28", "2026-09-29", ("funding_rate",))[0].period == "2026-09-28_2026-09-29"
+
+
+def funding_points(item, count=2):
+    return [{"symbol": "BTCUSDT", "fundingTime": item.start_ms + i,
+             "fundingRate": "-0.00001000", "markPrice": "00065000.12000000"}
+            for i in range(count)]
+
+
+def test_funding_paging_decimal_strings_checksum_and_present(tmp_path):
+    item = plan("2026-10-01", "2026-10-02", ("funding_rate",))[0]
+    points = funding_points(item, 1001)
+    starts = []
+
+    def handler(request):
+        assert request.url.params["limit"] == "1000"
+        assert int(request.url.params["endTime"]) == item.end_ms - 1
+        start = int(request.url.params["startTime"])
+        starts.append(start)
+        page = points[:1000][::-1] if start == item.start_ms else points[1000:]
+        return httpx.Response(200, json=page)
+
+    with client_for(handler) as client:
+        assert download(item, tmp_path, client)["status"] == "downloaded"
+        path = tmp_path / item.path
+        content = path.read_bytes()
+        before = path.stat().st_mtime_ns
+        assert download(item, tmp_path, client)["status"] == "present"
+    assert starts == [item.start_ms, item.start_ms + 1000] * 2
+    rows = list(csv.DictReader(StringIO(content.decode())))
+    assert list(rows[0]) == ["funding_time_ms", "funding_rate", "mark_price"]
+    assert len(rows) == 1001
+    assert [int(row["funding_time_ms"]) for row in rows] == [point["fundingTime"] for point in points]
+    assert all(row["funding_rate"] == "-0.00001000" and row["mark_price"] == "00065000.12000000" for row in rows)
+    assert path.stat().st_mtime_ns == before
+    sidecar = Path(str(path) + ".CHECKSUM").read_text().splitlines()
+    assert sidecar[0].split()[0] == hashlib.sha256(content).hexdigest()
+    assert sidecar[1] == f"{item.start_ms} {item.end_ms}"
+
+
+@pytest.mark.parametrize("kind", ["rate", "price", "removed", "added", "empty", "corrupt"])
+def test_changed_funding_snapshot_is_conflict_and_preserved(tmp_path, kind):
+    item = plan("2026-10-01", "2026-10-02", ("funding_rate",))[0]
+    points = funding_points(item)
+    with client_for(lambda request: httpx.Response(200, json=points)) as client:
+        assert download(item, tmp_path, client)["status"] == "downloaded"
+    path = tmp_path / item.path
+    if kind == "corrupt":
+        path.write_bytes(b"corrupt file")
+    before = path.read_bytes()
+    before_checksum = Path(str(path) + ".CHECKSUM").read_bytes()
+    if kind == "rate":
+        points[0]["fundingRate"] = "0.00002000"
+    elif kind == "price":
+        points[0]["markPrice"] = "65000.13"
+    elif kind == "removed":
+        points = points[1:]
+    elif kind == "added":
+        points = funding_points(item, 3)
+    elif kind == "empty":
+        points = []
+    with client_for(lambda request: httpx.Response(200, json=points)) as client:
+        assert download(item, tmp_path, client)["status"] == "conflict"
+    assert path.read_bytes() == before
+    assert Path(str(path) + ".CHECKSUM").read_bytes() == before_checksum
+
+
+@pytest.mark.parametrize("status", ["error", "conflict", "checksum_failed", "partial", "missing"])
+def test_cli_exit_status_for_each_coverage_outcome(tmp_path, monkeypatch, capsys, status):
+    item = archive()
+    monkeypatch.setattr(module, "run_downloads", lambda *args, **kwargs: [module._row(item, status)])
+    result = main(["--root", str(tmp_path), "--from", "2026-09-28", "--to", "2026-10-02"])
+    assert result == int(status in ("error", "conflict", "checksum_failed"))
+    assert status in capsys.readouterr().out
+
+
+def test_dry_run_broken_pipe_exits_cleanly(tmp_path):
+    process = subprocess.Popen([sys.executable, "-m", "strategy2.download", "--root", str(tmp_path),
+                                "--from", "2023-01-01", "--to", "2026-10-20", "--dry-run"],
+                               stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    try:
+        assert b"files planned" in process.stdout.readline()
+        process.stdout.close()
+        assert process.wait(timeout=15) == 0
+        assert process.stderr.read() == b""
+    finally:
+        process.stderr.close()
+    assert not list(tmp_path.iterdir())
+
+
+@pytest.mark.parametrize("start,end,hours", [
+    ("2023-01-01", "2023-01-31", 744),
+    ("2023-06-01", "2023-06-30", 720),
+])
+def test_complete_dvol_month_hour_counts(tmp_path, start, end, hours):
+    item = plan(start, end, ("dvol",))[0]
+    points = dvol_points(item)
+    assert len(points) == hours
+    with client_for(lambda request: httpx.Response(200, json={
+            "result": {"data": points, "continuation": None}})) as client:
+        row = download(item, tmp_path, client)
+    assert row["status"] == "downloaded" and row["missing_hours"] == 0
+    with (tmp_path / item.path).open() as source:
+        assert len(list(csv.DictReader(source))) == hours
+
+
+def test_dvol_does_not_replace_unverified_file_created_during_fetch(tmp_path):
+    item = plan("2026-09-30", "2026-09-30", ("dvol",))[0]
+    path = tmp_path / item.path
+
+    def handler(request):
+        path.write_bytes(b"another writer's snapshot")
+        return httpx.Response(200, json={"result": {"data": dvol_points(item), "continuation": None}})
+
+    with client_for(handler) as client:
+        assert download(item, tmp_path, client)["status"] == "conflict"
+    assert path.read_bytes() == b"another writer's snapshot"
