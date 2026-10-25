@@ -309,6 +309,52 @@ volatility-scaled barriers; we don't loosen the criteria.
 | **5. Lockbox** | One run on 2026-04-01 → 2026-10-20 | Result recorded either way |
 | **6. Live (paper)** | 5-minute REST pollers (OI, long/short ratios), live 1-minute bars, Polymarket and Deribit pollers, signal publisher, dashboard panel | Live features equal replayed features on the same hours; signals logged with outcomes |
 
+### Stage details
+
+**Data layout.** The downloader mirrors each source's own paths under one
+root, so every file can be traced back to its URL:
+
+```text
+ROOT/binance/futures/um/monthly/klines/BTCUSDT/1m/BTCUSDT-1m-2026-09.zip   (+ .CHECKSUM)
+ROOT/binance/futures/um/daily/metrics/BTCUSDT/BTCUSDT-metrics-2026-09-15.zip
+ROOT/binance/spot/monthly/klines/BTCUSDT/1m/BTCUSDT-1m-2026-09.zip
+ROOT/deribit/dvol/BTC/1h/2026-09.csv
+ROOT/coverage.csv          one row per expected file: present / missing / bytes
+```
+
+**Tier-1 download** (phase 1, about 4.7 GB zipped for 2023-01 → 2026-10 and
+five coins):
+
+| Dataset | Files | Approximate size |
+| --- | --- | ---: |
+| Perp 1m klines | Monthly + daily for the current month | 0.4 GB |
+| Spot 1m klines | Monthly + daily | 0.5 GB |
+| Perp 1m premium index | Monthly + daily | 0.2 GB |
+| Funding rate | Monthly | <0.01 GB |
+| Metrics (5 min) | Daily | 0.08 GB |
+| Book depth (30 s) | Daily | 3.5 GB |
+| Deribit DVOL, BTC/ETH | Hourly via API; 1-minute history only reaches back about two months | <0.01 GB |
+
+Tier 2 (phase 4) adds Coinbase 1m candles, Polymarket hourly markets, Deribit
+option trades, liquidations from our own archive, and perp aggTrades. The
+aggTrades alone are about 20 GB a year for BTC, so they are downloaded only if a
+tier-2 test needs them.
+
+**Format quirks to handle:**
+- Older Binance CSVs have no header row.
+- Spot timestamps are in microseconds from 2025-01-01.
+- `metrics` rows are not sorted.
+- Some `bookDepth` days are partial (2023-01-15 is almost empty).
+
+These cases are reported in the coverage file, never filled in silently.
+
+| Stage | Main files | Tests |
+| --- | --- | --- |
+| 0 | `strategy2/labels_1s.py` (self-contained copy of the 1-second barrier code), `strategy2/config/kraken_barrier_1s.yaml` | Moved barrier tests pass; `research/` equals `main` |
+| 1 | `strategy2/download.py` | Offline tests with a fake HTTP server: checksum failure, 404, resume, no overwrite |
+| 2 | `strategy2/bars.py`, `strategy2/labels.py`, `strategy2/baselines.py`, `strategy2/base_rates.py` | Synthetic bars: up, down, none, same-minute tie, incomplete window; no-lookahead tests; header and timestamp quirks |
+| 3 | `strategy2/features.py`, `train.py`, `evaluate.py`, `signal.py` | Every feature shifted-data test (no future values); simulator hand-computed cases |
+
 ## 12. Risks and open questions
 
 - **Live parity for `bookDepth`.** Binance's ±5% depth may need more book
