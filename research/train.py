@@ -577,8 +577,7 @@ def train_target(rows: pl.DataFrame, target: str, horizon_s: int, output_root: s
                         "from its metrics (see n). Zero predicts flat, scoring 0 on non-flat directions.",
         "availability": "Prediction time is max available_ns of same-tick inputs. "
                         "No later tick enters X. Train labels must be emitted before test tick.",
-        "warning": "Several weeks are required for meaningful walk-forward results. "
-                   "A roughly 9-hour sample only verifies that the pipeline runs without leakage. "
+        "warning": "Development-fold results; confirm on an untouched lockbox before relying on them. "
                    "These metrics are not trading P&L; no fees/spread/funding execution backtest.",
         "model_dir": str(directory.resolve()),
     }

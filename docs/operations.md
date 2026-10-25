@@ -47,11 +47,29 @@ when `INFERENCE_MODEL_VERSION` is set. Configure `DATA_DIR` and other settings
 through exported variables or a local environment file. Closed days have metadata
 sidecars; files still being written end in `.open`.
 
-For remote archiving, configure `S3_BUCKET` and the SDK's access/endpoint settings,
-then run `uv run python -m archiver.archive_daily --date YYYY-MM-DD`.
-`--verify YYYY-MM-DD` downloads and verifies a completed day. The code uses the S3
-API; [infra/terraform](../infra/terraform/) contains the AWS deployment configuration.
-The normal local collection quickstart does not require object storage.
+For remote archiving, `archiver/archive_daily.py` uploads to any S3-compatible
+store through the standard SDK. Configure its environment for your existing store:
+
+| Setting | Purpose |
+| --- | --- |
+| `S3_BUCKET` | Required destination bucket |
+| `AWS_ENDPOINT_URL_S3` | Custom S3 endpoint; `AWS_ENDPOINT_URL` is the SDK-wide fallback |
+| `AWS_REGION` | Region expected by the endpoint (also shown in the daily report's cost estimate) |
+| `AWS_PROFILE` | SDK profile to use; the archiver defaults to `crypto-archiver` |
+| `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, optional `AWS_SESSION_TOKEN` | Environment credentials, if used instead of another standard SDK credential provider |
+
+Credentials resolve through the standard SDK chain, including environment,
+existing profiles and available role providers. Use an existing profile when
+selecting one; no credential setup or infrastructure provisioning runs here.
+
+```bash
+uv run python -m archiver.archive_daily --date YYYY-MM-DD
+uv run python -m archiver.archive_daily --verify YYYY-MM-DD
+```
+
+`--verify` downloads and verifies a completed day. Local collection does not
+require object storage. Engine journals/checkpoints are not included in the raw
+daily archive.
 
 ## Replay and train offline
 

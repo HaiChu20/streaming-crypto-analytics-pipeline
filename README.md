@@ -63,9 +63,10 @@ Needs longer-memory/positioning features, new-venue integration and lockbox #2 f
 
 ## UI
 
-<img src="docs/img/research-report.png" alt="Real BTC 60-second research report showing development and lockbox dates, matrix size and walk-forward folds" width="1400">
+<img src="docs/img/research-report.png" alt="Real BTC 60-second research report with model and baseline metrics, selective direction evaluation and paired day-block bootstrap comparisons" width="1400">
 
-*Real `v7-kraken-all-d1` report: the earlier 829-input run, before constant-column removal; the results table uses the 415-input release run.*
+*BTC 60 s model/baseline metrics, selective direction evaluation and paired day-block bootstrap from `v7-kraken-all-d1`.*
+*This is the earlier 829-input run; the results table above uses the 415-input release run.*
 
 A [live Grafana dashboard](docker/dashboard/README.md) also exists; its screenshot will be added.
 
@@ -113,7 +114,6 @@ docs/         Strategy, operations, architecture and historical notes
 docker/       Kafka, ClickHouse and Grafana configuration
 engine/       Rust core, replay and live engine
 inference/    Saved-model streaming prediction service
-infra/        Optional AWS Terraform deployment
 ops/          Optional macOS archive scheduling
 research/     Labels, matrices, training and evaluation
 scripts/      Operations, audits and offline launcher
