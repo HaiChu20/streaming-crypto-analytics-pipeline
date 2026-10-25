@@ -3,7 +3,7 @@
     uv run python scripts/create_topics.py
 
 One partition per asset (BTC -> 0, ETH -> 1), replication 1, 72h retention plus a per-partition size cap.
-Never delete and recreate a topic: archived offsets refer to it (plan.md §6).
+Never delete and recreate a topic: archived offsets refer to it.
 """
 
 import argparse

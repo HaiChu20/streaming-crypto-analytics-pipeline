@@ -1,4 +1,4 @@
-"""Continuity and checksum rules (plan.md §5.2): synthetic cases, Kraken's documented examples,
+"""Continuity and checksum rules: synthetic cases, Kraken's documented examples,
 and replays of live fixtures captured by scripts/probe_feeds.py."""
 
 from copy import deepcopy

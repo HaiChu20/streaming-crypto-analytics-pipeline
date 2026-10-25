@@ -1,7 +1,7 @@
 [project]
 name = "streaming-crypto-analytics-pipeline"
 version = "0.1.0"
-description = "BTC/ETH spot + perp market data from Kraken, Binance and OKX via Kafka into a replayable raw archive"
+description = "BTC/ETH market data from Kraken, Binance, OKX, Coinbase, Bybit and Deribit via Kafka into a replayable raw archive"
 readme = "README.md"
 requires-python = ">=3.12,<3.13"
 dependencies = [

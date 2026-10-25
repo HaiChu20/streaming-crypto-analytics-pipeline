@@ -2,7 +2,7 @@
 
 Run: 2026-10-17; 10-second stride, 3 expanding folds, 100 boosting rounds, two LightGBM threads.
 
-**Roughly nine hours of valid data is far too little for meaningful results. Plan §10–11 requires several weeks. This run verifies the offline pipeline and leakage guards only.**
+**Roughly nine hours of valid data is far too little for meaningful results. Meaningful evaluation requires several weeks. This run verifies the offline pipeline and leakage guards only.**
 
 Input: `/private/tmp/claude-502/-Users-bfhach-Projects-streaming-crypto-analytics-pipeline/60166cad-1579-46c0-bd19-31bf3993d4db/scratchpad/features/date=2026-10-17/features.parquet` (read-only).
 

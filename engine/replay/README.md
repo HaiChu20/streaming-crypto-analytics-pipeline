@@ -76,8 +76,9 @@ until a usable anchor arrives. Snapshot `lastUpdateId` filters obsolete deltas.
 ## Feature contract
 
 All pure state and row definitions live in `engine_core::{features,row}`, with no
-I/O. Replay handles discovery, merging, ticking and Parquet only. The shared core
-can therefore be used by the future live engine without Parquet dependencies.
+I/O. Replay handles discovery, merging, ticking and Parquet only. The live engine
+uses the same core for books and features; its Kafka transport and
+checkpoint/cutoff handling are described in the [engine guide](../README.md).
 
 Ticks are every whole UTC second in `[D 00:00:00, D+1 00:00:00)`. At T, all visible
 heads with `recv_ns <= T` are applied before emitting rows. Records before D are
@@ -97,9 +98,8 @@ L3 event flow keep their existing zero-activity semantics. Reported coverage cou
 emitted instrument ticks. The audit separately reports observed stale percentages
 and asserts all book/extras/cross fields are null in the tail after the grace period.
 
-The schema appends required UTF8 `asset`; existing columns, types and order are
-unchanged. JSON rows also expose `asset` (old row JSON can omit it). The base is
-parsed from Binance's quote suffix (FDUSD, USDT, USDC, USD, BTC, ETH, EUR), OKX's
+Rows include a required UTF8 `asset` column. JSON rows also expose `asset`
+(old row JSON can omit it). The base is parsed from Binance's quote suffix (FDUSD, USDT, USDC, USD, BTC, ETH, EUR), OKX's
 first dash component, Kraken spot's first slash/dash component, or Kraken futures
 `PF_<BASE><QUOTE>`; XBT normalizes to BTC. Cross rows are emitted per observed
 asset, and their symbol and asset both contain the base. If multiple pairs share
@@ -110,7 +110,7 @@ recoverable symbol use it; wholly corrupt envelopes invalidate the observed feed
 instruments conservatively.
 
 Rows are sorted by `(tick_ns, exchange, market, symbol, engine_version)`. The
-version is the shared `engine_core::ENGINE_VERSION`, currently `0.1.0-features-v6`.
+version is the shared `engine_core::ENGINE_VERSION`, currently `0.1.0-features-v7`.
 Checkpoints from earlier versions are rejected.
 
 - L2 supplies book features. Invalid, empty or crossed books have null book values.
@@ -123,8 +123,10 @@ Checkpoints from earlier versions are rejected.
   by its own start metadata `ctVal`; missing swap metadata is never replaced with
   one. Spot uses one. Trade/liquidation totals accumulate exact i128 units of
   1e-16 before conversion to f64. Top-ten native level sums use i128.
-- Only `trades` contributes trade flow; `trades_agg` and l1 are read but contribute
-  no duplicated features. Trade connections switch at their first trade frame,
+- Only `trades` contributes trade flow; `trades_agg` does not duplicate it.
+  Binance l1 quotes supply fast midpoints for cross-venue lead features, described
+  in the [engine guide](../README.md#fast-cross-venue-lead-features-features-v7).
+  Trade connections switch at their first trade frame,
   including a trade snapshot. Retired connections stay ignored. A 50,000-ID FIFO
   set deduplicates across replacements. A startup `drop(collector_crash)` ends
   the previous active source, not its new carrying connection; the same carrying
@@ -178,8 +180,8 @@ Checkpoints from earlier versions are rejected.
   Markets without L3 keep these null; existing `l3_*_1s` fields remain.
   `microprice_dev_bps` is `(microprice-mid)/mid*10000`, null if unavailable.
 - Checkpoints/start states serialize the ring, sums, extrema, return history,
-  pending bucket OFI/L3 counts and sync eligibility. The version is bumped to
-  `features-v4`; older-version checkpoints are rejected. Numeric columns are
+  pending bucket OFI/L3 counts and sync eligibility. Checkpoints must match the
+  current engine version; older-version checkpoints are rejected. Numeric columns are
   automatically selected by `research/dataset.py`; inference explicitly includes
   them. Dashboard SQL stays unchanged: ClickHouse's Kafka engine defaults to
   skipping unknown JSON fields, so dashboard ingestion tolerates new features
@@ -193,7 +195,7 @@ Checkpoints from earlier versions are rejected.
   exceeds 60 seconds. Liquidation flow counts
   pushed sampled forceOrder messages and uses `z`, cumulative filled quantity,
   rather than the original order quantity `q`.
-- Features v4 adds **35 columns**, all null on `cross` rows:
+- Liquidation and positioning fields comprise **35 columns**, all null on `cross` rows:
   `liq_{sell,buy}_{base,count}_{W}s` (24), `funding_min_to_next`,
   `mark_index_bps`, `oi_chg_pct_{300,900,3600}s`, and
   `depth_{bid,ask}_{10,25,50}bps`. Liquidation base quantities/counts use the
@@ -253,7 +255,8 @@ with 8,192-row groups. Arrow is disabled. Metadata includes `mode=ideal`,
 file, close/fsync, then atomic rename and directory fsync. A failed write leaves
 its temporary file for diagnosis and does not publish a partial final file.
 
-## Field semantics checked on 2026-10-17
+<a id="field-semantics-checked-on-2026-10-17"></a>
+## Exchange field references
 
 - [Binance individual trade stream](https://developers.binance.com/docs/binance-spot-api-docs/web-socket-streams#trade-streams):
   `m` identifies a buyer who is the maker; true therefore means a taker sell.
@@ -284,6 +287,8 @@ $HOME/.cargo/bin/cargo clippy --locked --all-targets -- -D warnings
 $HOME/.cargo/bin/cargo fmt --check
 # Validate Parquet ordering and reservoir-sample five observed Kraken BTC mids:
 $HOME/.cargo/bin/cargo run --release --locked -p engine-replay --example audit -- /path/to/replay-report.json
+# Audit Kraken spot L2/L3 books, checksums and coverage for one archive day:
+$HOME/.cargo/bin/cargo run --release --locked -p engine-replay --example validate_kraken_books -- ARCHIVE YYYY-MM-DD
 ```
 
 Tests cover heap ties/clock steps, exact cutoff, A/B trade dedup, bounded IDs,
@@ -291,14 +296,15 @@ ctVal book/trade scaling, exact volume totals, warm-up/returns/volatility,
 invalid-book nulls, cross math, native extras/trade snapshots, sequential L3 ranks,
 gzip/open partial lines, atomic nullable Parquet output and a synthetic day CLI.
 
-The measured archive replay and independent Python results are in [VALIDATION.md](VALIDATION.md).
+Dated archive measurements, independent Python comparisons and earlier check
+results are preserved in the [engine validation log](../../docs/archive/engine-validation-log.md).
 
 ## V3 fixture checks and throughput
 
 `cargo test --workspace` includes CLI replay with `--root ../tests/fixtures/archive`
 for 2026-09-15 and 2026-10-08, checking every pair, book validity, Kraken L2/L3
-CRCs, sequence breaks, per-asset rows and the appended Parquet column. Original
-`tests/fixtures/v2` files remain on disk, unused; `fixtures/v3` replaces them.
+CRCs, sequence breaks, per-asset rows and the appended Parquet column.
+The native archive tests use `fixtures/v3`.
 Set `ENGINE_TEST_SCRATCH` to a repository-local target directory to keep generated
 test reports and Parquet files in the repository.
 
@@ -311,41 +317,17 @@ rows, so the CLI's end-to-end `records_per_s` measures a different workload.
 The CLI report includes per-stream `books` counters and `row_counts` in addition
 to the existing coverage and timing fields.
 
-P16 fixture measurement (release, local machine, three warm samples): spot/L3
-33,511 records at 279,346 / 286,586 / 288,175 records/s (median 286,586);
-Kraken futures 75,235 records at 670,425 / 656,071 / 639,964 records/s
-(median 656,071). Both ingestion medians exceed the ~255k records/s reference.
-This is a fixture ingestion comparison, not a paired full-day benchmark. Full-day
-CLI output on these sparse excerpts produced 691,160 rows in 0.674 s for spot
-(49,730 records/s) and 172,794 rows in 0.251 s for futures (300,133 records/s).
-Most spot output rows follow the excerpt's end and contain stale/null values.
+Historical numbers and their workload caveats are in the
+[fixture benchmark log](../../docs/archive/engine-validation-log.md#v3-fixture-benchmark-p16).
 
-## Features v4 fixture validation (P21)
-
-Required checks: `cargo test --release --locked` (109 passed, one pre-existing
-ignored timing test), `cargo clippy --locked --all-targets -- -D warnings`,
-`cargo fmt --check`, and root `PYTHON_DOTENV_DISABLED=1 uv run pytest -q`
-(336 passed). Tests include archive replay, live/as_live/from_state parity,
-a full hour of liquidation and OI history, and a pending liquidation at restart.
-
-The benchmark command above ran before edits and after all checks. Warm samples
-are records/s (run 0 excluded). Three unchanged post-change batches were retained
-because individual batches varied; the reported after median includes **all nine**
-warm samples, rather than selecting one batch. This measures ingestion only,
-not the new once-per-second band calculations or Parquet output.
-
-| Fixture | Before warm samples | After warm samples, in three batches | Before median | After median | Regression |
-| --- | --- | --- | ---: | ---: | ---: |
-| Spot, 33,511 records | 330409, 342982, 340212 | 322473, 321620, 322394; 322130, 329200, 329955; 305944, 305476, 311901 | 340212 | 322130 | 5.3% |
-| Futures, 75,235 records | 641786, 646099, 644572 | 551758, 538423, 540489; 607191, 615092, 609306; 607110, 598264, 604099 | 644572 | 604099 | 6.3% |
-
-All benchmark runs reported no data anomalies. Individual batch regressions
-reached 10.1% (spot) and 16.1% (futures); aggregate medians meet the 10% threshold.
+<a id="features-v4-fixture-validation-p21"></a>
+The earlier features-v4 acceptance and benchmark results are in the
+[historical log](../../docs/archive/engine-validation-log.md#features-v4-fixture-validation-p21).
 
 ## Deribit DVOL (features v5)
 
-Features v5 introduced five nullable DOUBLE columns. They are appended after
-existing Parquet columns and also appear in JSON/live output and inference's raw schema.
+DVOL contributes five nullable DOUBLE columns, also present in JSON/live output
+and inference's raw schema.
 They populate only the `cross/cross/BTC` and `cross/cross/ETH` rows. DVOL never
 creates an index market row, and existing market features retain their values.
 If several Binance spot pairs have the same asset, the first native symbol with
@@ -377,24 +359,8 @@ accepts numeric and exact-string OHLC values; the reader retains the inner row's
 text without decimal reserialization. See [server backfill](../../README.md#deribit-dvol-p22-features-v5)
 for receive-day files and operational instructions.
 
-P22 validation: `cargo test --release --locked` passed 114 tests (one existing
-ignored timing test); Clippy with `--locked --all-targets -- -D warnings` and
-`cargo fmt --check` passed. Root `PYTHON_DOTENV_DISABLED=1 uv run pytest -q`
-passed 383 tests. New offline fixtures cover exact response number tokens,
-recorder/reader round trips, poll retries/dedupe/closed candles, Kafka recovery,
-server backfill pagination/receive days/no-clobber behavior, all DVOL windows,
-RV units, Parquet and checkpoint/from-state parity with a pending candle.
-
-`benchmark_archive` before/after warm records/s (run 0 excluded):
-
-| Fixture | Before samples | After samples | Before median | After median | Regression |
-| --- | --- | --- | ---: | ---: | ---: |
-| Spot, 33,511 records | 288323, 274507, 276290 | 321458, 322784, 325630 | 276290 | 322784 | none (−16.8%) |
-| Futures, 75,235 records | 491008, 460519, 454109 | 586371, 586325, 612476 | 460519 | 586371 | none (−27.3%) |
-
-Both measured regressions are below 5%, with zero data anomalies. These short
-fixture ingestion runs vary with local load; the increases are not evidence of
-an algorithmic speedup. They exclude ticks and Parquet, as described above.
+Earlier DVOL validation and before/after fixture measurements are in the
+[historical log](../../docs/archive/engine-validation-log.md#deribit-dvol-validation-p22).
 
 ## Older Kraken spot archives (v2)
 

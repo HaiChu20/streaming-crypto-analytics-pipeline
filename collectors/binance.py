@@ -1,4 +1,4 @@
-"""Binance spot + USDⓈ-M perp collector (plan.md §4, §5.2).
+"""Binance spot + USDⓈ-M perp collector.
 
 Connections use combined-stream URLs (no subscribe messages). Depth books are synced to a
 REST snapshot with Binance's documented update-ID rules; the snapshot itself is recorded too.

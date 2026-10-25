@@ -28,7 +28,7 @@ class KafkaSink:
                 "enable.idempotence": True,
                 "linger.ms": 10,
                 "compression.type": "zstd",
-                # Wait forever for Kafka; the buffer cap bounds memory (plan.md §5.3).
+                # Wait forever for Kafka; the buffer cap bounds memory.
                 "message.timeout.ms": 0,
                 "queue.buffering.max.kbytes": buffer_kbytes,
                 "queue.buffering.max.messages": 50_000_000,

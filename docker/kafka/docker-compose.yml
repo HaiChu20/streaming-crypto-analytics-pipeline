@@ -1,4 +1,4 @@
-# Single local KRaft broker (plan.md §6).
+# Single local KRaft broker.
 # Host programs use localhost:9092; containers on the crypto-net network use kafka:29092.
 services:
   kafka:

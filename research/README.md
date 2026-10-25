@@ -8,9 +8,9 @@ PYTHON_DOTENV_DISABLED=1 uv run pytest -q
 ```
 
 Input is `ROOT/features/date=D/features.parquet`. Use only complete archived days
-for production research (plan §7); the command also accepts one Parquet file for
-tests. `--output-root` defaults to ROOT. Models go to
-`ROOT/models/<BTC_spot|BTC_perp|ETH_spot|ETH_perp>/<300|900|1800>/<version>/`:
+for production research, excluding files still being recorded; the command also
+accepts one Parquet file for tests. `--output-root` defaults to ROOT. Models go to
+`ROOT/models/<BTC_spot|BTC_perp|ETH_spot|ETH_perp>/<60|120|300|900|1800>/<version>/`:
 native LightGBM regressor/classifier text, `metadata.json`, and
 `training_rows.parquet` recording each training row's replay mode, availability,
 engine version and label endpoints. An aggregate JSON report goes at output ROOT.
@@ -57,10 +57,13 @@ constitute a trading backtest with fees, spread, funding and execution latency.
 
 ## Five-minute forecasts and stop distances
 
-The supported horizons are 300, 900 and 1800 seconds (5, 15 and 30 minutes).
+The supported horizons are 60, 120, 300, 900 and 1800 seconds
+(1, 2, 5, 15 and 30 minutes). Use a short-horizon label spec for 60/120 seconds;
+see [short horizons and selective evaluation](#short-horizons-and-selective-evaluation).
 Both trailing `momentum_return_300s` and `momentum_return_900s` are predictors.
 The five-minute momentum baseline uses the 300-second return directly; the other
-baselines keep using the 900-second return multiplied by h/900. Both momentum
+longer-horizon baselines use the 900-second return multiplied by h/900.
+The 60/120-second baselines use the trailing same-horizon return. Both momentum
 features require exact historical endpoints whose emissions are already known.
 
 A stop distance describes how far the reference mid price moved against a long
@@ -141,10 +144,24 @@ Its frozen model is `ridge.npz`.
 Repeat `--exclude-group NAME` or `--exclude-features REGEX` to remove predictors.
 `--list-feature-groups` counts a one-day sample without fitting. Groups:
 `calendar`, `liquidations`, `l3`, `flow`, `returns`, `volatility`, `book`,
-`positioning`, `cross`, `quality`, `venue_kraken`, `venue_binance`, `context`.
+`positioning`, `cross`, `lead`, `quality`, `venue_kraken`, `venue_binance`, `context`.
 Groups overlap; read ablations separately, not additively. Momentum is in returns;
-DVOL is in volatility. Unmatched/all-removing exclusions fail. Metadata saves
+DVOL is in volatility; `lead` selects the cross-venue lead columns, which also
+belong to `cross`. Unmatched/all-removing exclusions fail. Metadata saves
 excluded names and the retained count and ordered feature SHA256.
+
+By default, training drops columns constant on the development matrix rows,
+including all-null and all-NaN columns, after explicit feature exclusions.
+`--keep-constant-features` disables this removal. Metadata records the dropped
+names in `exclusions.constant`, their count in `exclusions.constant_count`, and
+the retained feature order. Lockbox rows do not choose which columns are dropped.
+
+`--stride-s` controls training-row spacing (default 10 seconds). `--eval-stride-s`
+controls OOF and lockbox spacing and defaults to the training stride. It must be
+a positive integer multiple of `--stride-s`. For example, `--stride-s 5
+--eval-stride-s 10` trains on five-second rows but evaluates on ten-second rows,
+allowing paired comparisons with a ten-second-stride run. Saved metadata freezes
+the evaluation stride for lockbox use.
 
 `--entry-delay-s D` accepts a non-negative integer (default 0). Features and
 momentum/reversal stay at t; returns and excursions span t+D to t+D+h.

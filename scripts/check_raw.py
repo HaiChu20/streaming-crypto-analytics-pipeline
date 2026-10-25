@@ -1,4 +1,4 @@
-"""Data-quality report for recorded raw files (plan.md §11, phase 1).
+"""Data-quality report for recorded raw files.
 
     uv run python scripts/check_raw.py                    # all recorded dates
     uv run python scripts/check_raw.py --date 2026-10-17

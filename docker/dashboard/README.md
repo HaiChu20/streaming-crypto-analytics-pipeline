@@ -34,15 +34,17 @@ This is a loopback-only development stack; the internal default ClickHouse user 
 available to local administration through `docker compose ... exec clickhouse clickhouse-client`.
 
 The live engine publishes `features.1s.v1`; ClickHouse consumes via `kafka:29092`
-(group `clickhouse-features`) into `crypto.features`. Phase 6 similarly supplies
-`predictions.v1` (group `clickhouse-predictions`). Missing topics produce metadata
-warnings and are retried automatically once created by the normal topic setup;
+(group `clickhouse-features`) into `crypto.features`. The implemented
+`inference/service.py` consumes features, loads saved models and publishes
+`predictions.v1`, which ClickHouse ingests with group `clickhouse-predictions`.
+Missing topics produce metadata warnings and are retried automatically once created by the normal topic setup;
 this stack never creates topics. New groups begin at the earliest retained offset.
 At most one malformed message per block is skipped (`kafka_skip_broken_messages=1`);
 larger failures halt the block and are logged. Data lives in named volumes with a
 30-day TTL. ReplacingMergeTree uses the engine row identity, and every dashboard
 query reads `FINAL` to collapse redeliveries immediately. The asset selector covers
-BTC (including Kraken XBT) and ETH; predictions remain empty until phase 6.
+BTC (including Kraken XBT) and ETH. Prediction panels populate when inference
+is running with compatible saved models and receives usable feature ticks.
 Book validity/invalid tick counts expose drop/resync periods. ClickHouse is capped
 at 3 GiB (2.5 GiB tracked server memory), and Grafana at 768 MiB.
 Init SQL runs only on a fresh ClickHouse data volume; configuration/provisioning

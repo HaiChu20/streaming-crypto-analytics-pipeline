@@ -1,4 +1,4 @@
-"""Archive closed UTC days to S3 (plan.md §7).
+"""Archive closed UTC days to S3.
 
     uv run python -m archiver.archive_daily [--date YYYY-MM-DD | --verify YYYY-MM-DD]
 """
@@ -144,7 +144,7 @@ class DailyArchive:
                     self.errors += 1
                     log.error("%s: archive failed: %r", key, e)
                     manifest["pending"].append({"key": key, "reason": "upload failed"})
-        # TODO: archive data/engine files when the engine exists.
+        # Known limitation: engine journals/checkpoints under data/engine are not archived.
         manifest["files"].sort(key=lambda f: f["key"])
         manifest["pending"].sort(key=lambda f: f["key"])
         manifest["has_offset_gaps"] = any(f["offset_gaps"] for f in manifest["files"])
