@@ -302,7 +302,7 @@ volatility-scaled barriers; we don't loosen the criteria.
 | Phase | Work | Done when |
 | --- | --- | --- |
 | **0. Separate** | Create `strategy2/`. Move the barrier-label code and its tests from `research/` into it. Restore `research/` to its `main` version on this branch | `git diff main -- engine research inference docs/strategy-1.md` is empty; all tests pass |
-| **1. Data** | `strategy2/download.py` for section 4's tier-1 sources, five coins, 2023-01 → 2026-10-20. Runs on Roihu into a separate work root | Checksums pass; per-day coverage report; reruns download nothing new |
+| **1. Data** | `strategy2/download.py` for section 4's tier-1 sources, five coins, 2023-01 → 2026-10-20, into `data/strategy2/raw` (git-ignored) on the development Mac | Checksums pass; per-day coverage report; reruns download nothing new |
 | **2. Bars + labels** | 1-minute bars, labels A/B, the four baselines | Section 5 rates reproduced; minute labels match the 1-second labels on archive days (except documented ties); no lookahead (tests with shifted data) |
 | **3. Features + model** | `s2-features-v1`, walk-forward LightGBM, simulator, HTML/JSON report | Report covers every section 10 metric for both targets and five coins |
 | **4. Ablations + tier 2** | Group-by-group removal; Coinbase premium, Polymarket, option flow, liquidations | Each group kept only if its bootstrap gain CI excludes 0 |
@@ -310,6 +310,12 @@ volatility-scaled barriers; we don't loosen the criteria.
 | **6. Live (paper)** | 5-minute REST pollers (OI, long/short ratios), live 1-minute bars, Polymarket and Deribit pollers, signal publisher, dashboard panel | Live features equal replayed features on the same hours; signals logged with outcomes |
 
 ### Stage details
+
+**Where things run.** Download, bars, labels and features are built on the
+development Mac: about 5 GB of raw input, minutes of CPU. The finished feature
+and label Parquet files (`data/strategy2/features/`) are uploaded to Allas.
+Roihu only runs training and evaluation from those files. The minute-level
+features need no Rust engine: Polars handles them in seconds.
 
 **Data layout.** The downloader mirrors each source's own paths under one
 root, so every file can be traced back to its URL:
