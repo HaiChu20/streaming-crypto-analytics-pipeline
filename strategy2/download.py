@@ -1,8 +1,9 @@
 """Download checksummed, resumable public history, with inclusive UTC dates.
 
 Dataset names: perp_klines, spot_klines, premium_index, funding_rate, metrics,
-book_depth, dvol. Monthly archives can contain dates before --from. A partial
-final month uses daily klines/premium archives and REST funding snapshots.
+book_depth, dvol, coinbase_klines. Monthly archives can contain dates before
+--from. A partial final month uses daily klines/premium archives and REST funding
+snapshots. Coinbase uses five requests per fully past UTC day.
 REST CSVs have local checksums plus range metadata. Partial DVOL snapshots can
 only be replaced by strict supersets with unchanged overlapping values. Expanding
 an existing DVOL CSV's range is a conflict; use another root for a new range.
@@ -15,8 +16,10 @@ from contextlib import contextmanager
 import csv
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
+from decimal import Decimal, InvalidOperation
 import fcntl
 import hashlib
+import json
 from io import StringIO
 import os
 from pathlib import Path
@@ -24,16 +27,18 @@ import re
 import sys
 import tempfile
 import time
+from threading import Lock
 
 import httpx
 
 BINANCE = "https://data.binance.vision/data/"
 FUNDING = "https://fapi.binance.com/fapi/v1/fundingRate"
+COINBASE = "https://api.exchange.coinbase.com/products/{coin}-USD/candles"
 DERIBIT = "https://www.deribit.com/api/v2/public/get_volatility_index_data"
 USER_AGENT = "strategy2-public-history/1.0"
 COINS = ("BTC", "ETH", "SOL", "XRP", "DOGE")
 DATASETS = ("perp_klines", "spot_klines", "premium_index", "funding_rate",
-            "metrics", "book_depth", "dvol")
+            "metrics", "book_depth", "dvol", "coinbase_klines")
 HOUR_MS = 3_600_000
 COVERAGE_FIELDS = ("dataset", "coin", "period", "url", "status", "bytes", "error", "missing_hours")
 
@@ -67,6 +72,27 @@ def _funding_url(coin: str, start: int, end: int) -> str:
                                         "endTime": end, "limit": 1000}))
 
 
+def _coinbase_url(coin: str, start: int, end: int) -> str:
+    iso = lambda stamp: datetime.fromtimestamp(stamp / 1000, timezone.utc).isoformat()
+    return str(httpx.URL(COINBASE.format(coin=coin), params={
+        "granularity": 60, "start": iso(start), "end": iso(end)}))
+
+
+# One limiter shared by all downloader threads, including retries. Serialize
+# request starts at 125ms intervals, rather than allowing bursts of eight.
+_COINBASE_LOCK = Lock()
+_coinbase_last_request = float("-inf")
+
+
+def _coinbase_throttle():
+    global _coinbase_last_request
+    with _COINBASE_LOCK:
+        delay = .125 - (time.monotonic() - _coinbase_last_request)
+        if delay > 0:
+            time.sleep(delay)
+        _coinbase_last_request = time.monotonic()
+
+
 def plan_downloads(start: date, end: date, coins=COINS, datasets=DATASETS) -> list[Download]:
     """Plan one coverage row per source archive/month, without network or disk I/O."""
     if end < start:
@@ -79,6 +105,16 @@ def plan_downloads(start: date, end: date, coins=COINS, datasets=DATASETS) -> li
     for dataset in dict.fromkeys(datasets):
         for coin in dict.fromkeys(coins):
             if dataset == "dvol" and coin not in ("BTC", "ETH"):
+                continue
+            if dataset == "coinbase_klines":
+                day = start
+                today = datetime.now(timezone.utc).date()
+                while day <= end and day < today:
+                    lower, upper = _ms(day), _ms(day + timedelta(days=1))
+                    result.append(Download(dataset, coin, day.isoformat(),
+                        _coinbase_url(coin, lower, min(lower + 300 * 60_000, upper) - 1),
+                        f"coinbase/candles_1m/{coin}-USD/{day.isoformat()}.csv", lower, upper))
+                    day += timedelta(days=1)
                 continue
             month = start.replace(day=1)
             while month <= end:
@@ -126,6 +162,8 @@ def _get(client: httpx.Client, url: str, attempts: int = 4) -> httpx.Response:
     """Retry transient failures only; 404 is an ordinary coverage result."""
     for attempt in range(attempts):
         try:
+            if httpx.URL(url).host == "api.exchange.coinbase.com":
+                _coinbase_throttle()
             response = client.get(url, headers={"User-Agent": USER_AGENT})
             if response.status_code == 404:
                 return response
@@ -380,10 +418,66 @@ def _funding(item: Download, root: Path, client: httpx.Client) -> dict:
     return _save_snapshot(item, path, content, item.start_ms, item.end_ms)
 
 
+def _coinbase(item: Download, root: Path, client: httpx.Client) -> dict:
+    path = root / item.path
+    previous = None
+    if path.exists():
+        try:
+            previous, lower, upper = _read_snapshot(path, item)
+            if (lower, upper) != (item.start_ms, item.end_ms):
+                raise ValueError("Coinbase range differs")
+        except (OSError, ValueError, IndexError):
+            return _row(item, "conflict", path.stat().st_size)
+    points = {}
+    # Fixed time windows cover empty minutes too: pagination must not stop at
+    # a short/empty page. Half-open filtering removes API boundary overlap.
+    for lower in range(item.start_ms, item.end_ms, 300 * 60_000):
+        upper = min(lower + 300 * 60_000, item.end_ms)
+        response = _get(client, _coinbase_url(item.coin, lower, upper - 1))
+        if response.status_code == 404:
+            return _row(item, "missing")
+        # Preserve the exact JSON numeric lexemes (including trailing zeros).
+        page = json.loads(response.content, parse_float=str)
+        if not isinstance(page, list):
+            raise ValueError(f"Coinbase API error: {str(page)[:160]}")
+        if len(page) > 300:
+            raise ValueError("Coinbase page exceeds 300 rows")
+        for point in page:
+            if (not isinstance(point, list) or len(point) != 6
+                    or type(point[0]) is not int):
+                raise ValueError("invalid Coinbase candle")
+            stamp = point[0] * 1000
+            if not lower <= stamp < upper:
+                continue
+            if stamp % 60_000:
+                raise ValueError("off-grid Coinbase candle")
+            try:
+                values = [Decimal(str(value)) for value in point[1:]]
+            except InvalidOperation as exc:
+                raise ValueError("invalid Coinbase decimal") from exc
+            if any(not value.is_finite() for value in values):
+                raise ValueError("non-finite Coinbase decimal")
+            _, low, high, opening, close, volume = point
+            row = [stamp, opening, high, low, close, volume]
+            if stamp in points and points[stamp] != row:
+                raise ValueError("inconsistent duplicate Coinbase candle")
+            points[stamp] = row
+    content = _csv_bytes(("ts_ms", "open", "high", "low", "close", "volume"),
+                         (points[stamp] for stamp in sorted(points)))
+    if previous is not None:
+        row = _row(item, "present" if content == previous else "conflict", len(previous))
+    else:
+        row = _save_snapshot(item, path, content, item.start_ms, item.end_ms)
+    if not points and row["status"] in ("present", "downloaded"):
+        row["error"] = "empty"
+    return row
+
+
 def download(item: Download, root: Path, client: httpx.Client) -> dict:
     if item.path.endswith(".csv"):
         with _snapshot_lock(root / item.path):
-            return (_dvol if item.dataset == "dvol" else _funding)(item, root, client)
+            handler = {"dvol": _dvol, "funding_rate": _funding, "coinbase_klines": _coinbase}[item.dataset]
+            return handler(item, root, client)
     return _binance(item, root, client)
 
 

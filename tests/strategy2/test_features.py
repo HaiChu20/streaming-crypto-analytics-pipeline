@@ -10,9 +10,11 @@ import pytest
 
 from strategy2.bars import MINUTE_MS, load_bars
 from strategy2.baselines import join_baselines
-from strategy2.dataset import TARGETS, build_dataset
-from strategy2.features import FEATURE_GROUPS, build_features
-from strategy2.sources import BANDS, HOUR_MS, METRICS, load_depth, load_funding, load_metrics, load_sources
+from strategy2.dataset import TARGETS, build_coin, build_dataset
+from strategy2.features import (COINS, FEATURE_GROUPS, FEATURE_GROUPS_V1, FEATURE_GROUPS_V2,
+                                add_touch_history, build_features, feature_groups)
+from strategy2.labels import first_touch_labels
+from strategy2.sources import BANDS, HOUR_MS, METRICS, load_depth, load_funding, load_metrics, load_sources, load_coinbase, load_perp_closes
 
 START = 1767225600000  # 2026-01-01 UTC
 END = START + 2 * 1440 * MINUTE_MS
@@ -143,7 +145,8 @@ def test_partial_and_empty_depth(tmp_path):
     assert load_depth(tmp_path, 'BTC', START, END).height == 0
 
 
-def test_generic_no_lookahead_all_sources(tmp_path):
+@pytest.mark.parametrize('version', ['v1', 'v2'])
+def test_generic_no_lookahead_all_sources(tmp_path, version):
     # More than 30 days exercises long-window features as well as short ones.
     mirror(tmp_path, n=47_000)
     cutoff = START + 45_000 * MINUTE_MS
@@ -151,18 +154,33 @@ def test_generic_no_lookahead_all_sources(tmp_path):
     sources = load_sources(tmp_path, 'ETH', START, end)
     btc = load_bars(tmp_path, 'perp', 'BTC', START, end)
     eth = load_bars(tmp_path, 'perp', 'ETH', START, end)
-    def build(s, b, e):
-        return build_features('ETH', s, start=START, end=end, btc_bars=b, eth_bars=e).filter(
-            pl.col('ts_ms') <= cutoff).select('ts_ms', *FEATURE_GROUPS)
-    original = build(sources, btc, eth)
+    sources['coinbase'] = eth.select('ts_ms', 'close', 'volume').with_columns(
+        (pl.col('ts_ms') + MINUTE_MS).alias('available_ms'))
+    market = {coin: synthetic_bars(47_000, .0001 * (i + 1)).select('ts_ms', 'close')
+              for i, coin in enumerate(COINS)}
+    labels = None
+    for target, (barrier, horizon) in TARGETS.items():
+        part = first_touch_labels(eth, barrier, horizon).select('ts_ms',
+            pl.col('label').alias(f'label_{target}'), pl.col('label_end_ms').alias(f'label_end_ms_{target}'))
+        labels = part if labels is None else labels.join(part, on='ts_ms')
+    def build(s, b, e, m, l):
+        return build_features('ETH', s, start=START, end=end, btc_bars=b, eth_bars=e,
+            version=version, market_bars=m, labels=l).filter(
+            pl.col('ts_ms') <= cutoff).select('ts_ms', *feature_groups(version))
+    original = build(sources, btc, eth, market, labels)
     def perturb(frame, availability):
         return frame.with_columns(*[pl.when(availability > cutoff).then(pl.col(name) * 1.7 + .003)
             .otherwise(pl.col(name)).cast(dtype).alias(name)
             for name, dtype in frame.schema.items() if name not in
             ('ts_ms', 'available_ms', 'next_funding_ms') and dtype.is_numeric()])
     changed = {name: perturb(frame, pl.col('available_ms')) for name, frame in sources.items()}
+    future_labels = labels.with_columns(*[pl.when(pl.col(f'label_end_ms_{target}') > cutoff)
+        .then(-pl.col(f'label_{target}') + 1).otherwise(pl.col(f'label_{target}'))
+        .cast(pl.Int8).alias(f'label_{target}') for target in TARGETS])
     actual = build(changed, perturb(btc, pl.col('ts_ms') + MINUTE_MS),
-                   perturb(eth, pl.col('ts_ms') + MINUTE_MS))
+                   perturb(eth, pl.col('ts_ms') + MINUTE_MS),
+                   {coin: perturb(bars, pl.col('ts_ms') + MINUTE_MS) for coin, bars in market.items()},
+                   future_labels)
     assert_frame_equal(original, actual)
 
 
@@ -293,3 +311,208 @@ def test_dataset_contract_and_metadata(history, tmp_path):
     saved = json.loads((out / 's2-features-v1/metadata.json').read_text())
     assert len(saved['features']) == len(FEATURE_GROUPS)
     assert set(saved['coins']['BTC']['null_share_by_group']) == set('ABCDEFGH')
+
+
+
+@pytest.mark.parametrize('coin,expected', [
+    ('BTC', 'e72d57bd113473f99ccf71b71d21271318f5a082c8efe75e82f973eac48a690e'),
+    ('ETH', 'e0c57723dc1022418696ae5b631d21e6b6c999b6ce7ab4ab13436108055ea33d'),
+])
+def test_v1_parquet_bytes_match_a0a415d_synthetic_dataset(history, coin, expected):
+    # Captured from the unmodified a0a415d build_coin on this mirror fixture,
+    # before adding v2. Includes all columns, dtypes, order and zstd bytes.
+    import hashlib
+    from io import BytesIO
+    baseline, _ = build_coin(history, coin, '2026-01-01', '2026-01-02')
+    explicit, _ = build_coin(history, coin, '2026-01-01', '2026-01-02', version='v1')
+    assert_frame_equal(baseline, explicit)
+    output = BytesIO()
+    explicit.write_parquet(output, compression='zstd')
+    assert hashlib.sha256(output.getvalue()).hexdigest() == expected
+    assert sum(name.startswith('f_') for name in explicit.columns) == 89
+    assert FEATURE_GROUPS is FEATURE_GROUPS_V1 is feature_groups('v1')
+
+
+def v2_inputs(root, n=12_000):
+    sources = load_sources(root, 'ETH', START, START + n * MINUTE_MS)
+    market = {coin: synthetic_bars(n, .0001 * (i + 1)).select('ts_ms', 'close')
+              for i, coin in enumerate(COINS)}
+    own = synthetic_bars(n, .0002)
+    sources['perp'] = own
+    sources['spot'] = own
+    premium = .001 + np.arange(n) * .0000001 + .0002 * np.sin(np.arange(n) / 31)
+    sources['coinbase'] = own.select('ts_ms', (pl.col('close') * pl.Series(np.exp(premium))).alias('close'),
+        (pl.col('volume') * .2).alias('volume')).with_columns(
+        (pl.col('ts_ms') + MINUTE_MS).alias('available_ms'))
+    sources['premium'] = own.select('ts_ms', (pl.col('ts_ms') + MINUTE_MS).alias('available_ms'),
+                                    pl.Series('premium', np.arange(n) * 1e-7))
+    return sources, market, premium
+
+
+def build_v2(sources, market, *, step=1, labels=None):
+    return build_features('ETH', sources, start=START,
+        end=int(sources['perp']['ts_ms'].max() + MINUTE_MS), step_min=step,
+        btc_bars=market['BTC'], eth_bars=market['ETH'], market_bars=market,
+        version='v2', labels=labels)
+
+
+def test_v2_hand_computed_market_persistence_and_coinbase(history):
+    sources, market, premium = v2_inputs(history)
+    result = build_v2(sources, market)
+    row = result.row(1600, named=True)
+    for h in (15, 60, 240):
+        assert row[f'f_mkt_return_{h}'] == pytest.approx(.0003 * h)
+    for h in (60, 240):
+        assert row[f'f_rel_strength_{h}'] == pytest.approx(-.0001 * h)
+    for h in (60, 240, 1440):
+        assert row[f'f_return_z_{h}'] == pytest.approx(np.sqrt(h))
+    assert row['f_premium_change_60'] == pytest.approx(60e-7)
+    assert row['f_funding_x_oi_240'] == pytest.approx(.0001 * .0005 * 240)
+    assert row['f_breakout_up_1440'] == 1
+    assert row['f_breakout_down_1440'] == 0
+    assert row['f_cb_premium'] == pytest.approx(premium[1599])
+    for h in (60, 240):
+        assert row[f'f_cb_premium_change_{h}'] == pytest.approx(premium[1599] - premium[1599-h])
+    cb = sources['coinbase'].slice(1540, 60)
+    spot = sources['spot'].slice(1540, 60)
+    cbq = (cb['close'] * cb['volume']).sum()
+    assert row['f_cb_volume_share_60'] == pytest.approx(cbq / (cbq + spot['quote_volume'].sum()))
+    i = 11_000
+    window = premium[i - 10080:i]
+    assert result['f_cb_premium_z'][i] == pytest.approx((premium[i-1]-window.mean())/window.std(ddof=1))
+    sampled = build_v2(sources, market, step=5)
+    assert_frame_equal(sampled, result.filter(pl.col('ts_ms') % (5 * MINUTE_MS) == 0))
+    assert len(FEATURE_GROUPS_V2) == 111
+    assert_frame_equal(result.select('ts_ms', *FEATURE_GROUPS_V1),
+        build_features('ETH', sources, start=START, end=START + 12_000 * MINUTE_MS,
+            step_min=1, btc_bars=synthetic_bars(12_000, .0001),
+            eth_bars=sources['perp']).select('ts_ms', *FEATURE_GROUPS_V1))
+
+
+@pytest.mark.parametrize('missing,valid', [(1, True), (2, False)])
+def test_market_requires_four_coins(history, missing, valid):
+    sources, market, _ = v2_inputs(history, 1000)
+    for coin in ('SOL', 'XRP')[:missing]:
+        market[coin] = market[coin].head(0)
+    row = build_v2(sources, market).row(900, named=True)
+    assert (row['f_mkt_return_60'] is not None) == valid
+    if valid:
+        assert row['f_mkt_return_60'] == pytest.approx(.0003 * 60)  # SOL is the .0003 coin.
+
+
+def test_coinbase_carry_matches_original_spot_minute_and_never_carries_volume(history):
+    sources, market, premium = v2_inputs(history, 1000)
+    sources['coinbase'] = sources['coinbase'].filter(~pl.col('ts_ms').is_between(
+        START + 900 * MINUTE_MS, START + 909 * MINUTE_MS))
+    result = build_v2(sources, market)
+    assert result['f_cb_premium'][900] == pytest.approx(premium[899])
+    assert result['f_cb_premium'][905] == pytest.approx(premium[899])
+    assert result['f_cb_premium'][906] is None
+    assert result['f_cb_premium'][911] == pytest.approx(premium[910])
+    cb = sources['coinbase'].filter(pl.col('ts_ms').is_between(
+        START + 845 * MINUTE_MS, START + 904 * MINUTE_MS))
+    cbq = (cb['close'] * cb['volume']).sum()
+    spotq = sources['spot'].slice(845,60)['quote_volume'].sum()
+    assert result['f_cb_volume_share_60'][905] == pytest.approx(cbq / (cbq + spotq))
+
+
+@pytest.mark.parametrize('missing,valid', [(1008, True), (1009, False)])
+def test_coinbase_z_coverage_on_minute_grid(history, missing, valid):
+    sources, market, _ = v2_inputs(history)
+    # A gap longer than the permitted carry: precisely `missing` invalid values.
+    sources['coinbase'] = sources['coinbase'].filter(~pl.col('ts_ms').is_between(
+        START + 1500 * MINUTE_MS, START + (1504 + missing) * MINUTE_MS))
+    result = build_v2(sources, market)
+    assert (result['f_cb_premium_z'][11_000] is not None) == valid
+
+
+def test_imbalance_z_is_distribution_of_hourly_imbalance_on_minute_grid(history):
+    sources, market, _ = v2_inputs(history)
+    sources['perp'] = sources['perp'].with_columns(
+        (pl.col('quote_volume') * pl.Series(.5 + .1 * np.sin(np.arange(12_000)/100))).alias('taker_buy_quote'))
+    result = build_v2(sources, market)
+    values = result['f_imbalance_60'].slice(11_000-10080+1, 10080).to_numpy()
+    expected = (values[-1]-values.mean())/values.std(ddof=1)
+    assert result['f_imbalance_z_60'][11_000] == pytest.approx(expected)
+
+
+def test_touch_history_uses_only_completed_labels_at_T():
+    t = START + 2 * 1440 * MINUTE_MS
+    decisions = pl.DataFrame({'ts_ms': [t-1, t, t+1]})
+    labels = pl.DataFrame({'ts_ms': [t - i * 5 * MINUTE_MS for i in range(6)],
+        **{f'label_{target}': [1, -1, 0, 1, None, -1] for target in TARGETS},
+        **{f'label_end_ms_{target}': [t-1, t, t-60_000, t+1, t-1, t-1440*MINUTE_MS]
+           for target in TARGETS}})
+    result = add_touch_history(decisions, labels)
+    for target in TARGETS:
+        assert result[f'f_touch_up_share_24h_{target}'][1] == .5
+        assert result[f'f_touch_rate_24h_{target}'][1] == pytest.approx(2/3)
+        changed = labels.with_columns(pl.when(pl.col(f'label_end_ms_{target}') > t)
+            .then(-1).otherwise(pl.col(f'label_{target}')).alias(f'label_{target}'))
+        assert_frame_equal(result.head(2), add_touch_history(decisions, changed).head(2))
+    # The label ending exactly at T becomes visible at T, never at T-1.
+    assert result['f_touch_up_share_24h_a'][0] == .5
+    assert result['f_touch_rate_24h_a'][0] == pytest.approx(2/3)
+
+
+def test_coinbase_loader_empty_days_and_compact_market_context(history):
+    path = history / 'coinbase/candles_1m/ETH-USD/2026-01-01.csv'
+    path.parent.mkdir(parents=True)
+    synthetic_bars(10).select('ts_ms', 'open', 'high', 'low', 'close', 'volume').reverse().write_csv(path)
+    empty = path.with_name('2026-01-02.csv')
+    empty.write_text('ts_ms,open,high,low,close,volume\n')
+    result = load_coinbase(history, 'ETH', START, END)
+    assert result.height == 10 and result['ts_ms'].is_sorted()
+    assert (result['available_ms'] == result['ts_ms'] + MINUTE_MS).all()
+    assert load_coinbase(history, 'XRP', START, END).height == 0
+    assert_frame_equal(load_perp_closes(history, 'ETH', START, END),
+                       load_bars(history, 'perp', 'ETH', START, END).select('ts_ms', 'close'))
+
+
+def test_v2_dataset_metadata_labels_warmup_and_v1_columns(history, tmp_path):
+    out = tmp_path / 'v2-out'
+    metadata = build_dataset(history, out, '2026-01-01', '2026-01-02', ['ETH'], version='v2')
+    frame = pl.read_parquet(out / 's2-features-v2/ETH.parquet')
+    v1, _ = build_coin(history, 'ETH', '2026-01-01', '2026-01-02')
+    assert frame.columns[:v1.width] == v1.columns
+    assert_frame_equal(frame.select(v1.columns), v1)
+    assert metadata['version'] == 's2-features-v2'
+    assert metadata['feature_columns'] == list(FEATURE_GROUPS_V2)
+    assert metadata['features'] == [{'name': name, 'group': group} for name, group in FEATURE_GROUPS_V2.items()]
+    assert set(metadata['coins']['ETH']['null_share_by_group']) == set('ABCDEFGHIJ')
+    # The first available history is after the full label horizon has matured.
+    assert frame['f_touch_rate_24h_a'][12] is None
+    assert frame['f_touch_rate_24h_a'][13] == 1
+    assert frame['f_cb_premium'].null_count() == frame.height
+    second, _ = build_coin(history, 'ETH', START + 1440*MINUTE_MS,
+        START + 2000*MINUTE_MS, version='v2')
+    assert second['f_touch_rate_24h_a'][0] == 1  # Includes labels from the preceding day.
+    with pytest.raises(ValueError, match='version'):
+        build_features('ETH', {}, version='v3')
+
+
+def test_touch_history_same_coin_and_exact_availability_boundary():
+    decisions = pl.DataFrame({'ts_ms': [START-1, START], 'coin': ['ETH', 'ETH']})
+    labels = pl.DataFrame({'coin': ['ETH', 'BTC'], 'label_a': [1, -1],
+                           'label_end_ms_a': [START, START]})
+    result = add_touch_history(decisions, labels)
+    assert result['f_touch_up_share_24h_a'].to_list() == [None, 1.]
+    assert result['f_touch_rate_24h_a'].to_list() == [None, 1.]
+    assert result['f_touch_rate_24h_b'].to_list() == [None, None]
+
+
+@pytest.mark.parametrize('direction', ['up', 'down'])
+def test_breakout_compares_last_fifteen_minutes_with_prior_day(history, direction):
+    sources, market, _ = v2_inputs(history, 2000)
+    field, extreme, ordinary = ('high', 1000., 101.) if direction == 'up' else ('low', 1., 99.)
+    # Flat market, an old extreme, then an equal extreme in the last 15 minutes.
+    sources['perp'] = sources['perp'].with_columns(
+        pl.lit(100.).alias('close'), pl.lit(101.).alias('high'), pl.lit(99.).alias('low'))
+    sources['perp'] = sources['perp'].with_columns(
+        pl.when(pl.col('ts_ms').is_in([START + 100 * MINUTE_MS, START + 1500 * MINUTE_MS]))
+        .then(extreme).otherwise(ordinary).alias(field))
+    result = build_v2(sources, market)
+    name = f'f_breakout_{direction}_1440'
+    assert result[name][1490] == 0.
+    assert result[name][1501] == 1.
+    assert result[name][1516] == 0.

@@ -1,9 +1,10 @@
-"""s2-features-v1: causal minute-grid calculations, sampled at decision time.
+"""Versioned causal minute-grid features, sampled at decision time.
 
 Bars/premium become available after 60s, metrics after 5m, depth after 30s,
 and DVOL after 1h. All joins use availability <= decision time. Missing bar
 minutes stay null. Rolling statistics require at least 90% valid samples.
-Returns and changes are logarithmic; volatility is in fractional price units.
+Returns and positive-level changes are logarithmic; premium differences are
+arithmetic. Volatility is in fractional price units. V2 adds groups I and J.
 """
 
 from math import ceil
@@ -38,8 +39,27 @@ GROUP_FEATURES = {
     'H': ['btc_return_15', 'btc_return_60', 'btc_return_240', 'residual_60', 'residual_240',
           'btc_rv_60', 'eth_btc_trend_240'],
 }
-FEATURE_GROUPS = {f'f_{name}': group for group, names in GROUP_FEATURES.items() for name in names}
-FEATURE_GROUPS['f_coin_id'] = 'H'
+FEATURE_GROUPS_V1 = {f'f_{name}': group for group, names in GROUP_FEATURES.items() for name in names}
+FEATURE_GROUPS_V1['f_coin_id'] = 'H'
+GROUP_FEATURES.update({
+    'I': ['mkt_return_15', 'mkt_return_60', 'mkt_return_240',
+          'rel_strength_60', 'rel_strength_240', 'return_z_60', 'return_z_240',
+          'return_z_1440', 'imbalance_z_60', 'premium_change_60', 'funding_x_oi_240',
+          'breakout_up_1440', 'breakout_down_1440',
+          *[f'{name}_24h_{target}' for target in ('a', 'b')
+            for name in ('touch_up_share', 'touch_rate')]],
+    'J': ['cb_premium', 'cb_premium_change_60', 'cb_premium_change_240',
+          'cb_premium_z', 'cb_volume_share_60'],
+})
+FEATURE_GROUPS_V2 = {**FEATURE_GROUPS_V1,
+                     **{f'f_{name}': group for group in ('I', 'J') for name in GROUP_FEATURES[group]}}
+FEATURE_GROUPS = FEATURE_GROUPS_V1
+
+
+def feature_groups(version):
+    if version not in ('v1', 'v2'):
+        raise ValueError('version must be v1 or v2')
+    return FEATURE_GROUPS_V1 if version == 'v1' else FEATURE_GROUPS_V2
 
 
 def _div(a, b):
@@ -72,7 +92,8 @@ def _bar_grid(grid, bars, prefix=''):
 
 
 def build_features(coin, sources, *, start=None, end=None, step_min=5,
-                   btc_bars=None, eth_bars=None, events=None):
+                   btc_bars=None, eth_bars=None, events=None, version='v1',
+                   market_bars=None, labels=None):
     """Build one coin using only information available at each decision ts_ms.
 
     Source frames come from sources.load_sources. start/end accept the same
@@ -82,6 +103,7 @@ def build_features(coin, sources, *, start=None, end=None, step_min=5,
     Funding z is time-weighted over the last 30 days of settled-rate context;
     trade-count z uses completed hourly observations from the previous 30 days.
     """
+    groups = feature_groups(version)
     if coin not in COINS or not isinstance(step_min, int) or step_min < 1:
         raise ValueError('unsupported coin or invalid step_min')
     bars = sources['perp']
@@ -238,8 +260,12 @@ def build_features(coin, sources, *, start=None, end=None, step_min=5,
 
     btc_bars = bars if coin == 'BTC' else (btc_bars if btc_bars is not None else bars.head(0))
     eth_bars = bars if coin == 'ETH' else (eth_bars if eth_bars is not None else bars.head(0))
-    frame = _bar_grid(frame, btc_bars, 'btc_')
-    frame = _bar_grid(frame, eth_bars, 'eth_')
+    if version == 'v1':
+        frame = _bar_grid(frame, btc_bars, 'btc_')
+        frame = _bar_grid(frame, eth_bars, 'eth_')
+    else:
+        frame = _close_grid(frame, btc_bars, 'btc_close')
+        frame = _close_grid(frame, eth_bars, 'eth_close')
     frame = frame.with_columns(pl.col('btc_close').log().diff().alias('_btc_r'))
     btc_r = pl.col('_btc_r')
     paired_btc = pl.when(r.is_not_null()).then(btc_r)
@@ -252,8 +278,123 @@ def build_features(coin, sources, *, start=None, end=None, step_min=5,
             _change(close, window) - beta * _change(pl.col('btc_close'), window))
     add('btc_rv_60', _roll(btc_r.pow(2), 60).sqrt())
     add('eth_btc_trend_240', _change(pl.col('eth_close'), 240) - _change(pl.col('btc_close'), 240))
+    if version == 'v2':
+        frame = _v2_frame(frame, coin, sources, market_bars or {}, btc_bars, eth_bars)
+        for group in ('I', 'J'):
+            for name in GROUP_FEATURES[group]:
+                if not name.startswith(('touch_up_share_', 'touch_rate_')):
+                    add(name, pl.col('_' + name))
     for name in ('last_funding_rate', 'next_funding_ms', 'funding_interval_ms'):
         result[name] = frame[name].filter(sample)
     output = pl.DataFrame(result)
+    if version == 'v2':
+        output = add_touch_history(output, labels)
+        output = _v2_columns(output)
     return output.with_columns(*[pl.when(pl.col(name).is_finite()).then(pl.col(name)).otherwise(None).alias(name)
-                                 for name in FEATURE_GROUPS if name != 'f_coin_id'])
+                                 for name in groups if name != 'f_coin_id'])
+
+
+def _v2_columns(frame):
+    """Keep the original column order, then append I and J in contract order."""
+    extra = [name for name in FEATURE_GROUPS_V2 if name not in FEATURE_GROUPS_V1]
+    return frame.select(*[name for name in frame.columns if name not in extra], *extra)
+
+
+def _close_grid(frame, bars, name):
+    return _asof(frame, bars.select((pl.col('ts_ms') + MINUTE_MS).alias('available_ms'),
+                                   pl.col('close').alias(name)), 0)
+
+
+def _v2_frame(frame, coin, sources, market_bars, btc_bars, eth_bars):
+    """Minute-grid market, flow and Coinbase context; no decision-grid rolling."""
+    for other in COINS:
+        bars = sources['perp'] if other == coin else market_bars.get(other)
+        if bars is None:
+            bars = {'BTC': btc_bars, 'ETH': eth_bars}.get(other)
+        if bars is None:
+            bars = sources['perp'].head(0)
+        frame = _close_grid(frame, bars, '_mkt_' + other)
+    for horizon in (15, 60, 240):
+        returns = [_change(pl.col('_mkt_' + other), horizon) for other in COINS]
+        frame = frame.with_columns(pl.when(pl.sum_horizontal(
+            [r.is_not_null().cast(pl.Int8) for r in returns]) >= 4)
+            .then(pl.mean_horizontal(returns)).alias(f'_mkt_return_{horizon}'))
+    close, rv = pl.col('close'), pl.col('_rv60')
+    q, buy = pl.col('quote_volume'), pl.col('taker_buy_quote')
+    frame = frame.with_columns(_div(2 * _roll(buy, 60) - _roll(q, 60), _roll(q, 60)).alias('_imb60'))
+    imbalance = pl.col('_imb60')
+    frame = frame.with_columns(
+        *[(_change(close, h) - pl.col(f'_mkt_return_{h}')).alias(f'_rel_strength_{h}')
+          for h in (60, 240)],
+        *[_div(_change(close, h), rv * np.sqrt(h / 60)).alias(f'_return_z_{h}')
+          for h in (60, 240, 1440)],
+        _div(imbalance - _roll(imbalance, 7 * DAY, 'mean'),
+             _roll(imbalance, 7 * DAY, 'std')).alias('_imbalance_z_60'),
+        (pl.col('premium') - pl.col('premium').shift(60)).alias('_premium_change_60'),
+        (pl.col('last_funding_rate') * _change(pl.col('sum_open_interest'), 240)).alias('_funding_x_oi_240'),
+        (_roll(pl.col('high'), 15, 'max') >= _roll(pl.col('high').shift(15), DAY, 'max'))
+            .cast(pl.Float64).alias('_breakout_up_1440'),
+        (_roll(pl.col('low'), 15, 'min') <= _roll(pl.col('low').shift(15), DAY, 'min'))
+            .cast(pl.Float64).alias('_breakout_down_1440'))
+
+    cb = sources.get('coinbase')
+    if cb is None:
+        cb = pl.DataFrame(schema={'ts_ms': pl.Int64, 'available_ms': pl.Int64,
+                                  'close': pl.Float64, 'volume': pl.Float64})
+    # Match Binance to the Coinbase candle's actual minute before carrying.
+    spot = sources['spot'].select('ts_ms', pl.col('close').alias('_cb_spot_close'))
+    matched = cb.join(spot, on='ts_ms', how='left').select('available_ms',
+        (pl.col('close') / pl.col('_cb_spot_close')).log().alias('_cb_premium'))
+    frame = _asof(frame, matched, 5 * MINUTE_MS)
+    # Do not forward-fill volume: an absent Coinbase minute has zero trades.
+    # Beyond five minutes of price staleness, volume-share coverage is missing.
+    volume = cb.select('available_ms',
+                       (pl.col('volume') * pl.col('close')).alias('_cb_quote'))
+    frame = _asof(frame, volume, 0)
+    premium = pl.col('_cb_premium')
+    cb_quote = pl.when(premium.is_not_null()).then(pl.col('_cb_quote').fill_null(0))
+    cb60, spot60 = _roll(cb_quote, 60), _roll(pl.col('spot_quote_volume'), 60)
+    return frame.with_columns(
+        (premium - premium.shift(60)).alias('_cb_premium_change_60'),
+        (premium - premium.shift(240)).alias('_cb_premium_change_240'),
+        _div(premium - _roll(premium, 7 * DAY, 'mean'),
+             _roll(premium, 7 * DAY, 'std')).alias('_cb_premium_z'),
+        _div(cb60, cb60 + spot60).alias('_cb_volume_share_60'))
+
+
+def add_touch_history(decisions, labels=None):
+    """Trailing (T-24h, T] completed-label history, by full label_end_ms.
+
+    Up share excludes none outcomes; touch rate includes them. Null/tied or
+    incomplete labels contribute to neither denominator. A label is visible
+    only once label_end_ms <= T, even if it touched a barrier earlier.
+    ``labels`` can include warmup decisions outside the requested output range.
+    """
+    labels = decisions if labels is None else labels
+    if 'coin' in decisions.columns and 'coin' in labels.columns:
+        coins = decisions['coin'].unique().to_list()
+        if len(coins) > 1:
+            raise ValueError('touch history decisions must contain one coin')
+        labels = labels.filter(pl.col('coin').is_in(coins))
+    times = decisions['ts_ms'].to_numpy()
+    result = decisions
+    for target in ('a', 'b'):
+        label, end = f'label_{target}', f'label_end_ms_{target}'
+        if label not in labels.columns or end not in labels.columns:
+            result = result.with_columns(*[pl.lit(None, dtype=pl.Float64).alias(
+                f'f_{name}_24h_{target}') for name in ('touch_up_share', 'touch_rate')])
+            continue
+        known = labels.filter(pl.col(label).is_in([-1, 0, 1]) & pl.col(end).is_not_null()).sort(end)
+        ends, values = known[end].to_numpy(), known[label].to_numpy()
+        left = np.searchsorted(ends, times - DAY * MINUTE_MS, side='right')
+        right = np.searchsorted(ends, times, side='right')
+        def count(mask):
+            prefix = np.concatenate(([0], np.cumsum(mask, dtype=np.int64)))
+            return prefix[right] - prefix[left]
+        touched, up = count(values != 0), count(values == 1)
+        for name, numerator, denominator in (
+                ('touch_up_share', up, touched), ('touch_rate', touched, right - left)):
+            array = np.full(len(times), np.nan)
+            np.divide(numerator, denominator, out=array, where=denominator != 0)
+            result = result.with_columns(pl.Series(f'f_{name}_24h_{target}', array, nan_to_null=True))
+    return result

@@ -34,7 +34,7 @@ def archive():
 
 def test_monthly_daily_split_and_exact_urls():
     items = plan()
-    assert len(items) == 23
+    assert len(items) == 28
     expected = {
         "perp_klines": "futures/um/monthly/klines/BTCUSDT/1m/BTCUSDT-1m-2026-09.zip",
         "spot_klines": "spot/monthly/klines/BTCUSDT/1m/BTCUSDT-1m-2026-09.zip",
@@ -308,7 +308,7 @@ def test_dry_run_has_no_network_or_filesystem_writes(tmp_path, monkeypatch, caps
     assert main(["--root", str(root), "--from", "2026-09-28", "--to", "2026-10-02",
                  "--coins", "BTC", "--dry-run"]) == 0
     output = capsys.readouterr().out
-    assert "23 files planned" in output
+    assert "28 files planned" in output
     assert archive().url in output
     assert not root.exists()
 
@@ -568,3 +568,129 @@ def test_dvol_does_not_replace_unverified_file_created_during_fetch(tmp_path):
     with client_for(handler) as client:
         assert download(item, tmp_path, client)["status"] == "conflict"
     assert path.read_bytes() == b"another writer's snapshot"
+
+
+
+def coinbase_day(coin="BTC", day="2026-01-01"):
+    return plan(day, day, ("coinbase_klines",), (coin,))[0]
+
+
+@pytest.fixture
+def no_coinbase_wait(monkeypatch):
+    monkeypatch.setattr(module, "_coinbase_throttle", lambda: None)
+
+
+def test_coinbase_plan_past_utc_days_only():
+    from datetime import datetime, timedelta, timezone
+    today = datetime.now(timezone.utc).date()
+    items = plan_downloads(today - timedelta(days=1), today + timedelta(days=2),
+                           ("XRP",), ("coinbase_klines",))
+    assert len(items) == 1
+    assert items[0].end_ms == module._ms(today)
+    assert items[0].path == f"coinbase/candles_1m/XRP-USD/{items[0].period}.csv"
+    assert not plan_downloads(today, today, ("BTC",), ("coinbase_klines",))
+
+
+def test_coinbase_five_pages_sorted_decimal_lexemes_sidecar_and_resume(tmp_path, no_coinbase_wait):
+    from datetime import datetime
+    item = coinbase_day()
+    windows = []
+    def handler(request):
+        assert request.url.path == '/products/BTC-USD/candles'
+        assert request.url.params['granularity'] == '60'
+        lo = int(datetime.fromisoformat(request.url.params['start']).timestamp() * 1000)
+        hi = int(datetime.fromisoformat(request.url.params['end']).timestamp() * 1000) + 1
+        windows.append((lo, hi))
+        # Numeric JSON values, not strings: retain trailing zeros and exponent.
+        rows = [f'[{stamp//1000},90.000,110.0000,100.0100,101.02000,1.2300e-3]'
+                for stamp in range(lo, hi, 60_000)][::-1]
+        return httpx.Response(200, content=('[' + ','.join(rows) + ']').encode())
+    with client_for(handler) as client:
+        assert download(item, tmp_path, client)['status'] == 'downloaded'
+        path = tmp_path / item.path
+        before = path.stat().st_mtime_ns
+        assert download(item, tmp_path, client)['status'] == 'present'
+    expected = [(lo, min(lo + 300 * 60_000, item.end_ms))
+                for lo in range(item.start_ms, item.end_ms, 300 * 60_000)]
+    assert len(expected) == 5 and windows == expected * 2
+    rows = list(csv.DictReader(StringIO(path.read_text())))
+    assert len(rows) == 1440
+    assert [int(row['ts_ms']) for row in rows] == list(range(item.start_ms, item.end_ms, 60_000))
+    assert list(rows[0]) == ['ts_ms', 'open', 'high', 'low', 'close', 'volume']
+    assert rows[0] == dict(ts_ms=str(item.start_ms), open='100.0100', high='110.0000',
+                           low='90.000', close='101.02000', volume='1.2300e-3')
+    assert path.stat().st_mtime_ns == before
+    lines = Path(str(path) + '.CHECKSUM').read_text().splitlines()
+    assert lines[0].split()[0] == hashlib.sha256(path.read_bytes()).hexdigest()
+    assert lines[1] == f'{item.start_ms} {item.end_ms}'
+
+
+@pytest.mark.parametrize('coin,day', [('BTC', '2026-01-01'), ('XRP', '2023-07-12')])
+def test_coinbase_empty_days_are_present_files_and_coverage(tmp_path, no_coinbase_wait, coin, day):
+    item = coinbase_day(coin, day)
+    calls = []
+    def handler(request):
+        calls.append(request.url)
+        return httpx.Response(200, json=[])
+    with client_for(handler) as client:
+        first = run_downloads([item], tmp_path, client=client)[0]
+        second = run_downloads([item], tmp_path, client=client)[0]
+    assert first['status'] == 'downloaded' and second['status'] == 'present'
+    assert first['error'] == second['error'] == 'empty'
+    assert len(calls) == 10
+    assert (tmp_path / item.path).read_bytes() == b'ts_ms,open,high,low,close,volume\r\n'
+    assert next(csv.DictReader((tmp_path / 'coverage.csv').open()))['error'] == 'empty'
+
+
+@pytest.mark.parametrize('kind', ['changed', 'removed', 'added', 'corrupt', 'range'])
+def test_coinbase_conflict_preserves_snapshot(tmp_path, no_coinbase_wait, kind):
+    from datetime import datetime
+    item = coinbase_day()
+    points = [[item.start_ms // 1000, '90.00', '110.00', '100.00', '101.00', '2.0']]
+    def handler(request):
+        lo = int(datetime.fromisoformat(request.url.params['start']).timestamp())
+        hi = int(datetime.fromisoformat(request.url.params['end']).timestamp()) + 1
+        return httpx.Response(200, json=[p for p in points if lo <= p[0] < hi])
+    with client_for(handler) as client:
+        assert download(item, tmp_path, client)['status'] == 'downloaded'
+        path = tmp_path / item.path
+        sidecar = Path(str(path) + '.CHECKSUM')
+        if kind == 'corrupt':
+            path.write_bytes(b'bad')
+        elif kind == 'range':
+            sidecar.write_text(sidecar.read_text().replace(str(item.end_ms), str(item.end_ms + 60_000)))
+        elif kind == 'changed':
+            points[0][4] = '102.00'
+        elif kind == 'removed':
+            points.clear()
+        elif kind == 'added':
+            points.append([item.start_ms // 1000 + 60, '90', '110', '100', '101', '2'])
+        before, check = path.read_bytes(), sidecar.read_bytes()
+        assert download(item, tmp_path, client)['status'] == 'conflict'
+    assert path.read_bytes() == before and sidecar.read_bytes() == check
+
+
+def test_coinbase_429_backoff_then_empty_page_does_not_stop_paging(tmp_path, no_coinbase_wait, monkeypatch):
+    calls, pauses = [], []
+    monkeypatch.setattr(module.time, 'sleep', pauses.append)
+    def handler(request):
+        calls.append(request.url)
+        return httpx.Response(429 if len(calls) == 1 else 200, json=[])
+    with client_for(handler) as client:
+        assert download(coinbase_day(), tmp_path, client)['status'] == 'downloaded'
+    assert len(calls) == 6 and calls[0] == calls[1]
+    assert pauses == [.5]
+
+
+def test_coinbase_rate_limiter_shared_across_requests_and_retries(monkeypatch):
+    now, starts = [0.], []
+    monkeypatch.setattr(module, '_coinbase_last_request', float('-inf'))
+    monkeypatch.setattr(module.time, 'monotonic', lambda: now[0])
+    monkeypatch.setattr(module.time, 'sleep', lambda delay: now.__setitem__(0, now[0] + delay))
+    def handler(request):
+        starts.append(now[0])
+        return httpx.Response(200, json=[])
+    with client_for(handler) as client:
+        for _ in range(12):
+            module._get(client, coinbase_day().url)
+    assert starts == [i * .125 for i in range(12)]
