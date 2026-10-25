@@ -435,6 +435,39 @@ If it fails, we report it and move to the remaining tier-2 data: liquidations, l
 - **The v2 features help a little.** The side AUC gain over v1 features is about +0.001–0.002 in 7 of 8 pairs.
 - **Verdict:** v2 fails the trading criterion. The lockbox stays closed.
 - **Why:** direction is now honest, but the edge is about 1–3 pp above 50%. That is too small to pay 0.13% round-trip taker costs often enough.
+- **Manual limit-order costs (re-scored without retraining, 2026-10-25).** The `manual_limit` scenario has a limit entry and a resting take-profit (0.02% each) and a market stop or timeout (0.05% + 0.02% slippage). Under it, on the confirmation folds:
+  - B: 5 of 8 runs have a bootstrap lower bound above 0. The pre-chosen `v2-c4-f2` has 141 trades at +0.17%, with a lower bound of −0.06%.
+  - A: none of the 8 runs have a lower bound above 0.
+
+  It is a sensitivity, not the headline, because limit fills are not guaranteed.
+
+**v3 plan (registered before any v3 result):**
+- **Research summary (2026-10-25):**
+  - Order-book signals predict seconds to about a minute ahead, so they are too short for these horizons.
+  - Quarter-hour opening imbalance predicts 4–12 h ahead (already in group C).
+  - Toxicity and large-trade flow predict jumps.
+  - USDT exchange inflows predict 1–6 h returns, but free history is limited to 30 days, so they are dropped.
+  - Option skew, ETF flows and CME lead-lag carry no usable direction signal.
+- **Target C:** ±2% within 480 min. Break-even falls to 53.3% taker and about 52% with manual limit orders.
+- **More training data:** BNB, ADA, LINK, AVAX, LTC, TRX, DOT, BCH, ETC and NEAR are added. The market features still use only the core five coins.
+- **`s2-features-v3` = v2 + K + L (149 features):**
+  - K, multi-day trend (17 features): 3/7/14/30-day returns, raw and volatility-scaled; 20-day high/low distance; 7/30-day moving-average deviation; 14-day positive-day share; 7/30-day relative strength against the core five; BTC 7/30-day returns.
+  - L, trade flow from aggTrades (21 features): large (≥100k USDT), mid and small taker-notional imbalance over 15/60/240/1440 min; large-minus-small divergence; large-trade share; mean trade-size z-score; maximum single trade against its 7-day median, and its side; toxicity (mean per-minute |buy−sell|/total).
+- **Runs (one Slurm array):**
+  - targets B and C: {v2 groups A–J, v3 groups A–L} × {5, 15 training coins} × side settings {c2, c4};
+  - target A: v3 × {5, 15 coins} × {c2, c4};
+  - 20 runs in total.
+- **Scoring:** always on the core five coins, which is where the earlier results come from. 15-coin trading is reported separately.
+- **Selection** uses the tuning folds only:
+  - per target, the run with the best side log loss;
+  - per cost scenario, the EV threshold with ≥100 tuning trades.
+- **Acceptance** is unchanged and judged on the confirmation folds:
+  - calibration within 2 pp per decile;
+  - side log loss beats v1 and the prior, with the bootstrap CI excluding 0;
+  - net expectancy has a lower bound above 0 with ≥100 trades.
+
+  The headline verdict uses taker costs. The `manual_limit` verdict is reported next to it as a sensitivity.
+- **Lockbox:** opened only if the confirmation folds pass and the user agrees.
 
 ## 12. Risks and open questions
 
