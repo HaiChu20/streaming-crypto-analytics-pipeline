@@ -162,6 +162,32 @@ def load_coinbase(root, coin, start, end):
     return result
 
 
+def load_aggflow(root, coin, start_ms, end_ms):
+    """Load minute trade flow in [start_ms, end_ms), available at minute close."""
+    from .aggflow import SCHEMA
+
+    coin = _symbol(coin).removesuffix('USDT')
+    lower, upper = _boundary_ms(start_ms), _boundary_ms(end_ms, end=True)
+    if upper <= lower:
+        raise ValueError('end must be after start')
+    first = pl.Series([lower]).cast(pl.Datetime('ms', 'UTC')).dt.strftime('%Y-%m-%d')[0]
+    last = pl.Series([upper - 1]).cast(pl.Datetime('ms', 'UTC')).dt.strftime('%Y-%m-%d')[0]
+    frames = []
+    for path in sorted((Path(root) / 'binance/aggflow' / coin).glob('*.parquet')):
+        left, right = (first[:7], last[:7]) if len(path.stem) == 7 else (first, last)
+        if left <= path.stem <= right:
+            frames.append(pl.read_parquet(path).select([
+                pl.col(name).cast(dtype) for name, dtype in SCHEMA.items()]).filter(
+                    pl.col('minute_ms').is_between(lower, upper, closed='left')))
+    frame = pl.concat(frames).unique() if frames else pl.DataFrame(schema=SCHEMA)
+    if frame['minute_ms'].is_duplicated().any():
+        raise ValueError('conflicting duplicate aggflow minute')
+    if (frame['minute_ms'] % MINUTE_MS != 0).any():
+        raise ValueError('off-grid aggflow minute')
+    return frame.sort('minute_ms').with_columns(
+        (pl.col('minute_ms') + MINUTE_MS).alias('available_ms'))
+
+
 def load_perp_closes(root, coin, start, end):
     """Compact market context: discard unused kline columns per archive."""
     lower, upper = _boundary_ms(start), _boundary_ms(end, end=True)

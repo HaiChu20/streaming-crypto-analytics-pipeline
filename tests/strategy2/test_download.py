@@ -86,7 +86,7 @@ def test_duplicate_selections_do_not_schedule_duplicate_files():
 
 @pytest.mark.parametrize("kwargs", [
     {"start": "2026-10-02", "end": "2026-10-01"},
-    {"coins": ("BNB",)}, {"datasets": ("bad",)}, {"coins": ()}, {"datasets": ()},
+    {"coins": ("UNKNOWN",)}, {"datasets": ("bad",)}, {"coins": ()}, {"datasets": ()},
 ])
 def test_invalid_plan_rejected(kwargs):
     with pytest.raises(ValueError):
