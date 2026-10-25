@@ -416,6 +416,26 @@ These cases are reported in the coverage file, never filled in silently.
 
 If it fails, we report it and move to the remaining tier-2 data: liquidations, large-trade flow and option flow.
 
+**v2 result (16 runs on Roihu, 2026-10-25):**
+- **Chosen on the tuning folds** by side log loss:
+  - A: very small side model, v1 features (`v2-c4-f1`);
+  - B: very small side model, v2 features (`v2-c4-f2`).
+- **Calibration passes.** On the confirmation folds the largest per-decile gap is 0.8 pp (A) and 1.7 pp (B). v1 was off by up to 12 pp.
+- **Side log loss improves on v1.** The gain is 0.0031 for A and 0.0077 for B, and both bootstrap CIs exclude 0.
+  - Against the prior, only B's gain is significant (CI excludes 0); A's gain over the prior is not.
+  - Side accuracy on the confirmation folds:
+    - A: 52.3% overall, 57.6% in the top 5%;
+    - B: 53.5% overall, 61.6% in the top 5%, compared with v1's 60.8% on the same rows.
+- **Trading fails.** At the threshold chosen on the tuning folds, under headline costs:
+  - A: 59 trades, −0.15% per trade;
+  - B: 53 trades, +0.21% per trade, CI [−0.11%, +0.52%].
+
+  Neither reaches 100 trades or a lower bound above 0.
+  - Of the 16 runs, only `v2-c2-f2` (B) has a lower bound above 0: 169 trades, +0.17%. It was not chosen on the tuning folds, and one in 16 is about what chance alone gives, so it does not count.
+- **The v2 features help a little.** The side AUC gain over v1 features is about +0.001–0.002 in 7 of 8 pairs.
+- **Verdict:** v2 fails the trading criterion. The lockbox stays closed.
+- **Why:** direction is now honest, but the edge is about 1–3 pp above 50%. That is too small to pay 0.13% round-trip taker costs often enough.
+
 ## 12. Risks and open questions
 
 - **Live parity for `bookDepth`.** Binance's ±5% depth may need more book
