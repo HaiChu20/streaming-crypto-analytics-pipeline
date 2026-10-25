@@ -5,7 +5,7 @@ and DVOL after 1h. All joins use availability <= decision time. Missing bar
 minutes stay null. Rolling statistics require at least 90% valid samples.
 Returns and positive-level changes are logarithmic; premium differences are
 arithmetic. Volatility is in fractional price units. V2 adds groups I and J;
-v3 adds group K (multi-day trend).
+v3 adds groups K (multi-day trend) and L (aggTrades flow).
 """
 
 from math import ceil
@@ -15,6 +15,7 @@ import numpy as np
 import polars as pl
 
 from .bars import MINUTE_MS, _boundary_ms
+from .aggflow import SCHEMA as AGGFLOW_SCHEMA
 from .sources import BANDS, HOUR_MS, METRICS
 
 DAY = 1440
@@ -64,8 +65,15 @@ GROUP_FEATURES['K'] = [
     'sma_deviation_10080', 'sma_deviation_43200', 'positive_day_share_14',
     'rel_strength_10080', 'rel_strength_43200', 'btc_return_10080', 'btc_return_43200',
 ]
+GROUP_FEATURES['L'] = [
+    *[f'flow_{size}_imbalance_{window}' for size in ('large', 'mid', 'small')
+      for window in (15, 60, 240, 1440)],
+    'flow_large_small_divergence_60', 'flow_large_small_divergence_240',
+    'flow_large_share_60', 'flow_large_share_1440', 'flow_mean_size_z_60',
+    'flow_max_trade_ratio_60', 'flow_max_trade_side_60', 'flow_toxicity_60', 'flow_toxicity_240',
+]
 FEATURE_GROUPS_V3 = {**FEATURE_GROUPS_V2,
-                     **{f'f_{name}': 'K' for name in GROUP_FEATURES['K']}}
+                     **{f'f_{name}': group for group in ('K', 'L') for name in GROUP_FEATURES[group]}}
 FEATURE_GROUPS = FEATURE_GROUPS_V1
 
 
@@ -107,7 +115,7 @@ def _bar_grid(grid, bars, prefix=''):
 
 def build_features(coin, sources, *, start=None, end=None, step_min=5,
                    btc_bars=None, eth_bars=None, events=None, version='v1',
-                   market_bars=None, labels=None):
+                   market_bars=None, labels=None, aggflow_coverage=None):
     """Build one coin using only information available at each decision ts_ms.
 
     Source frames come from sources.load_sources. start/end accept the same
@@ -116,6 +124,8 @@ def build_features(coin, sources, *, start=None, end=None, step_min=5,
     Every feature has the same schema for every coin. BTC residuals are null.
     Funding z is time-weighted over the last 30 days of settled-rate context;
     trade-count z uses completed hourly observations from the previous 30 days.
+    V3 flow requires file-presence intervals (start_ms/end_ms minute opens) in
+    aggflow_coverage; absent coverage yields nulls, never inferred zero flow.
     """
     groups = feature_groups(version)
     if coin not in ALL_COINS or not isinstance(step_min, int) or step_min < 1:
@@ -304,6 +314,11 @@ def build_features(coin, sources, *, start=None, end=None, step_min=5,
             add(name, pl.col('_' + name))
     for name in ('last_funding_rate', 'next_funding_ms', 'funding_interval_ms'):
         result[name] = frame[name].filter(sample)
+    del frame
+    if version == 'v3':
+        flow = _flow_features(grid, sources.get('aggflow'), aggflow_coverage)
+        for name in GROUP_FEATURES['L']:
+            result['f_' + name] = flow['_' + name].filter(sample)
     output = pl.DataFrame(result)
     if version in ('v2', 'v3'):
         output = add_touch_history(output, labels)
@@ -356,6 +371,9 @@ def _v2_frame(frame, coin, sources, market_bars, btc_bars, eth_bars):
         (_roll(pl.col('low'), 15, 'min') <= _roll(pl.col('low').shift(15), DAY, 'min'))
             .cast(pl.Float64).alias('_breakout_down_1440'))
 
+    if coin in ('BNB', 'TRX'):
+        return frame.with_columns(*[pl.lit(None, dtype=pl.Float64).alias('_' + name)
+                                    for name in GROUP_FEATURES['J']])
     cb = sources.get('coinbase')
     if cb is None:
         cb = pl.DataFrame(schema={'ts_ms': pl.Int64, 'available_ms': pl.Int64,
@@ -423,6 +441,80 @@ def _v3_frame(frame):
             _change(pl.col('btc_close'), window).alias(f'_btc_return_{window}'),
         ])
     return frame.with_columns(expressions)
+
+
+def _flow_features(grid, source, coverage):
+    """Minute flow with file-based coverage; completed-hour 7d references.
+
+    Covered minutes without trades contribute zeros, including zero toxicity.
+    Missing files contribute nulls. All windows require 90% covered minutes;
+    hourly reference stats additionally require 90% defined hourly samples.
+    The latest completed hour is included in the reference distribution. Max
+    trade side is zero on ties; zero denominators yield null ratios.
+    """
+    if coverage is None or coverage.is_empty():
+        return grid.select('ts_ms', *[pl.lit(None, dtype=pl.Float64).alias('_' + name)
+                                     for name in GROUP_FEATURES['L']])
+    if source is None:
+        source = pl.DataFrame(schema={**AGGFLOW_SCHEMA, 'available_ms': pl.Int64})
+    buy, sell = pl.col('buy_notional'), pl.col('sell_notional')
+    large_buy = pl.col('buy_b3') + pl.col('buy_b4')
+    large_sell = pl.col('sell_b3') + pl.col('sell_b4')
+    compact = source.select('available_ms',
+        pl.col('n').cast(pl.Float64).alias('_n'), (buy + sell).alias('_total'),
+        (large_buy - large_sell).alias('_large'),
+        (pl.col('buy_b2') - pl.col('sell_b2')).alias('_mid'),
+        (pl.col('buy_b0') + pl.col('buy_b1') - pl.col('sell_b0') - pl.col('sell_b1')).alias('_small'),
+        (large_buy + large_sell).alias('_large_total'),
+        pl.col('max_buy_notional').alias('_max_buy'), pl.col('max_sell_notional').alias('_max_sell'),
+        pl.when(buy + sell > 0).then((buy - sell).abs() / (buy + sell)).otherwise(0.).alias('_toxicity'))
+    frame = _asof(grid, compact, 0)
+    frame = _asof(frame, coverage.select((pl.col('start_ms') + MINUTE_MS).alias('available_ms'),
+        (pl.col('end_ms') + MINUTE_MS).alias('_coverage_end')))
+    covered = (pl.col('ts_ms') < pl.col('_coverage_end')).fill_null(False)
+    frame = frame.with_columns(covered.alias('_covered'),
+        *[pl.when(covered).then(pl.col(name).fill_null(0.)).alias(name)
+          for name in compact.columns if name != 'available_ms'])
+    # Rolling floating sums can retain cancellation residue after the last
+    # trade leaves a window. Use its exact zero maximum to keep no-flow
+    # denominators zero, rather than producing arbitrary non-null ratios.
+    frame = frame.with_columns(*[
+        pl.when(_roll(pl.col('_total'), window, 'max') > 0).then(_roll(pl.col('_total'), window))
+        .otherwise(_roll(pl.col('_total'), window, 'max')).alias(f'_total_{window}')
+        for window in (15, 60, 240, 1440)])
+    frame = frame.with_columns(
+        _div(pl.col('_total_60'), _roll(pl.col('_n'), 60)).alias('_mean_size60'),
+        _roll(pl.col('_max_buy'), 60, 'max').alias('_max_buy60'),
+        _roll(pl.col('_max_sell'), 60, 'max').alias('_max_sell60'),
+        (pl.col('_covered').cast(pl.Int32).rolling_sum(7 * DAY, min_samples=1)
+         >= ceil(.9 * 7 * DAY)).alias('_week_covered'))
+    frame = frame.with_columns(pl.max_horizontal('_max_buy60', '_max_sell60').alias('_max60'))
+    hourly = frame.filter(pl.col('ts_ms') % HOUR_MS == 0).select('ts_ms',
+        pl.when(pl.col('_week_covered')).then(_roll(pl.col('_mean_size60'), 7 * 24, 'mean')).alias('_size_mean'),
+        pl.when(pl.col('_week_covered')).then(_roll(pl.col('_mean_size60'), 7 * 24, 'std')).alias('_size_std'),
+        pl.when(pl.col('_week_covered')).then(_roll(pl.col('_max60'), 7 * 24, 'median')).alias('_max_median'))
+    frame = _asof(frame, hourly.rename({'ts_ms': 'available_ms'}), HOUR_MS - 1)
+    expressions = []
+    for size in ('large', 'mid', 'small'):
+        for window in (15, 60, 240, 1440):
+            expressions.append(_div(_roll(pl.col('_' + size), window), pl.col(f'_total_{window}'))
+                               .alias(f'_flow_{size}_imbalance_{window}'))
+    for window in (60, 240):
+        expressions.extend([
+            _div(_roll(pl.col('_large') - pl.col('_small'), window), pl.col(f'_total_{window}'))
+                .alias(f'_flow_large_small_divergence_{window}'),
+            pl.when(pl.col(f'_total_{window}') == 0).then(0.).otherwise(
+                _roll(pl.col('_toxicity'), window, 'mean').clip(0., 1.)).alias(f'_flow_toxicity_{window}'),
+        ])
+    for window in (60, 1440):
+        expressions.append(_div(_roll(pl.col('_large_total'), window), pl.col(f'_total_{window}'))
+                           .alias(f'_flow_large_share_{window}'))
+    expressions.extend([
+        _div(pl.col('_mean_size60') - pl.col('_size_mean'), pl.col('_size_std')).alias('_flow_mean_size_z_60'),
+        _div(pl.col('_max60'), pl.col('_max_median')).alias('_flow_max_trade_ratio_60'),
+        (pl.col('_max_buy60') - pl.col('_max_sell60')).sign().alias('_flow_max_trade_side_60'),
+    ])
+    return frame.select('ts_ms', *expressions)
 
 
 def add_touch_history(decisions, labels=None):

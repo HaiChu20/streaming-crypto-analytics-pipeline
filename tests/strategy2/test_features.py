@@ -10,11 +10,12 @@ import polars as pl
 from polars.testing import assert_frame_equal
 import pytest
 
+from strategy2.aggflow import SCHEMA as AGGFLOW_SCHEMA
 from strategy2.bars import MINUTE_MS, load_bars
 from strategy2.baselines import join_baselines
-from strategy2.dataset import TARGETS, build_coin, build_dataset
+from strategy2.dataset import TARGETS, _aggflow_coverage, build_coin, build_dataset
 from strategy2.features import (ALL_COINS, COINS, EXTRA_COINS, ROUND, FEATURE_GROUPS, FEATURE_GROUPS_V1, FEATURE_GROUPS_V2, FEATURE_GROUPS_V3,
-                                add_touch_history, build_features, feature_groups)
+                                _flow_features, add_touch_history, build_features, feature_groups)
 from strategy2.labels import first_touch_labels
 from strategy2.sources import BANDS, HOUR_MS, METRICS, load_depth, load_funding, load_metrics, load_sources, load_coinbase, load_perp_closes
 
@@ -35,6 +36,19 @@ def synthetic_bars(n, drift=.001, price=100.):
         'volume': np.full(n, 10.), 'quote_volume': close * 10,
         'trades': np.full(n, 20, dtype=np.int64), 'taker_buy_base': np.full(n, 6.),
         'taker_buy_quote': close * 6})
+
+
+def synthetic_aggflow(n):
+    x = np.arange(n)
+    values = {'minute_ms': START + x * MINUTE_MS, 'n': 20 + x % 17}
+    for side, phase in (('buy', 0.), ('sell', 1.7)):
+        for i, base in enumerate((300., 3000., 30000., 200000., 1200000.)):
+            values[f'{side}_b{i}'] = base * (1.2 + np.sin(x / (43 + i) + phase))
+        values[f'{side}_notional'] = sum(values[f'{side}_b{i}'] for i in range(5))
+        values[f'{side}_qty'] = values[f'{side}_notional'] / 100.
+        values[f'max_{side}_notional'] = values[f'{side}_b4']
+    return pl.DataFrame(values, schema=AGGFLOW_SCHEMA).with_columns(
+        (pl.col('minute_ms') + MINUTE_MS).alias('available_ms'))
 
 
 def klines(frame, microseconds=False):
@@ -156,6 +170,10 @@ def test_generic_no_lookahead_all_sources(tmp_path, version):
     sources = load_sources(tmp_path, 'ETH', START, end)
     btc = load_bars(tmp_path, 'perp', 'BTC', START, end)
     eth = load_bars(tmp_path, 'perp', 'ETH', START, end)
+    flow_coverage = None
+    if version == 'v3':
+        sources['aggflow'] = synthetic_aggflow(47_000).rename({'minute_ms': 'ts_ms'})
+        flow_coverage = pl.DataFrame({'start_ms': [START], 'end_ms': [end]})
     sources['coinbase'] = eth.select('ts_ms', 'close', 'volume').with_columns(
         (pl.col('ts_ms') + MINUTE_MS).alias('available_ms'))
     market = {coin: synthetic_bars(47_000, .0001 * (i + 1)).select('ts_ms', 'close')
@@ -167,7 +185,7 @@ def test_generic_no_lookahead_all_sources(tmp_path, version):
         labels = part if labels is None else labels.join(part, on='ts_ms')
     def build(s, b, e, m, l):
         return build_features('ETH', s, start=START, end=end, btc_bars=b, eth_bars=e,
-            version=version, market_bars=m, labels=l).filter(
+            version=version, market_bars=m, labels=l, aggflow_coverage=flow_coverage).filter(
             pl.col('ts_ms') <= cutoff).select('ts_ms', *feature_groups(version))
     original = build(sources, btc, eth, market, labels)
     def perturb(frame, availability):
@@ -589,6 +607,10 @@ def test_extra_coins_same_schema_btc_context_and_missing_sources(history, coin, 
     sources = load_sources(history, coin, START, END)
     assert sources['dvol']['dvol'][0] == 40  # All extras use BTC DVOL.
     sources['perp'] = synthetic_bars(1000, .0001, 1.234 * level)
+    if coin in ('BNB', 'TRX'):
+        # Unsupported products stay null even if a caller supplies stray bars.
+        sources['coinbase'] = sources['perp'].select('ts_ms', 'close', 'volume').with_columns(
+            (pl.col('ts_ms') + MINUTE_MS).alias('available_ms'))
     result = build_features(coin, sources, start=START, end=START + 1000 * MINUTE_MS,
         step_min=1, btc_bars=synthetic_bars(1000, .0002), version='v3')
     assert ROUND[coin] == level
@@ -656,7 +678,7 @@ def test_v3_dataset_contract_preserves_v2(history, tmp_path):
     assert metadata['features'] == [{'name': n, 'group': g} for n, g in FEATURE_GROUPS_V3.items()]
     assert set(metadata['targets']) == {'a', 'b', 'c'}
     assert metadata['parameters']['warmup_days'] == 31
-    assert set(metadata['coins']['ETH']['null_share_by_group']) == set('ABCDEFGHIJK')
+    assert set(metadata['coins']['ETH']['null_share_by_group']) == set('ABCDEFGHIJKL')
 
 
 @pytest.mark.parametrize('version,option,expected', [
@@ -686,3 +708,168 @@ def test_build_dataset_default_universe(history, tmp_path, monkeypatch, version,
     metadata = build_dataset(history, tmp_path / 'out', '2026-01-01', '2026-01-02', version=version)
     assert tuple(metadata['coins']) == expected
     assert metadata['parameters']['coins'] == list(expected)
+
+
+def flow_features(source, n, coverage=None):
+    grid = pl.DataFrame({'ts_ms': START + np.arange(n) * MINUTE_MS})
+    if coverage is None:
+        coverage = pl.DataFrame({'start_ms': [START], 'end_ms': [START + n * MINUTE_MS]})
+    return _flow_features(grid, source, coverage)
+
+
+def test_flow_hand_computed_all_features_and_completed_hour_references():
+    n = 12_001
+    source = synthetic_aggflow(n)
+    result = flow_features(source, n)
+    i = 11_371
+    row = result.row(i, named=True)
+    for window in (15, 60, 240, 1440):
+        part = source.slice(i - window, window)
+        total = (part['buy_notional'] + part['sell_notional']).sum()
+        large = sum((part[f'buy_b{b}'] - part[f'sell_b{b}']).sum() for b in (3, 4)) / total
+        mid = (part['buy_b2'] - part['sell_b2']).sum() / total
+        small = sum((part[f'buy_b{b}'] - part[f'sell_b{b}']).sum() for b in (0, 1)) / total
+        for size, expected in (('large', large), ('mid', mid), ('small', small)):
+            assert row[f'_flow_{size}_imbalance_{window}'] == pytest.approx(expected)
+        if window in (60, 240):
+            assert row[f'_flow_large_small_divergence_{window}'] == pytest.approx(large - small)
+            toxicity = ((part['buy_notional'] - part['sell_notional']).abs()
+                        / (part['buy_notional'] + part['sell_notional'])).mean()
+            assert row[f'_flow_toxicity_{window}'] == pytest.approx(toxicity)
+        if window in (60, 1440):
+            large_total = sum((part[f'buy_b{b}'] + part[f'sell_b{b}']).sum() for b in (3, 4))
+            assert row[f'_flow_large_share_{window}'] == pytest.approx(large_total / total)
+    last_hour = i // 60 * 60
+    hourly_sizes, hourly_maxima = [], []
+    for end in range(last_hour - 167 * 60, last_hour + 1, 60):
+        part = source.slice(end - 60, 60)
+        hourly_sizes.append((part['buy_notional'] + part['sell_notional']).sum() / part['n'].sum())
+        hourly_maxima.append(max(part['max_buy_notional'].max(), part['max_sell_notional'].max()))
+    part = source.slice(i - 60, 60)
+    mean_size = (part['buy_notional'] + part['sell_notional']).sum() / part['n'].sum()
+    assert row['_flow_mean_size_z_60'] == pytest.approx(
+        (mean_size - np.mean(hourly_sizes)) / np.std(hourly_sizes, ddof=1))
+    maximum = max(part['max_buy_notional'].max(), part['max_sell_notional'].max())
+    assert row['_flow_max_trade_ratio_60'] == pytest.approx(maximum / np.median(hourly_maxima))
+    assert row['_flow_max_trade_side_60'] == np.sign(part['max_buy_notional'].max() - part['max_sell_notional'].max())
+    assert len([g for g in FEATURE_GROUPS_V3.values() if g == 'L']) == 21
+
+
+@pytest.mark.parametrize('missing,valid', [(6, True), (7, False)])
+def test_flow_coverage_uses_files_and_no_trade_minutes_are_zero(missing, valid):
+    n = 1000
+    source = synthetic_aggflow(n)
+    # Six missing source minutes are allowed in a 60m window; seven are not.
+    coverage = pl.DataFrame({'start_ms': [START, START + (840 + missing) * MINUTE_MS],
+        'end_ms': [START + 840 * MINUTE_MS, START + n * MINUTE_MS]})
+    row = flow_features(source, n, coverage).row(900, named=True)
+    for name in ('_flow_large_imbalance_60', '_flow_max_trade_side_60', '_flow_toxicity_60'):
+        assert (row[name] is not None) == valid
+    # The same absent trade rows inside a present file are known zeros. Even
+    # >10% no-trade minutes must not count as missing file coverage.
+    source = source.filter(~pl.col('minute_ms').is_between(START + 840 * MINUTE_MS, START + 859 * MINUTE_MS))
+    row = flow_features(source, n).row(900, named=True)
+    assert row['_flow_large_imbalance_60'] is not None
+    observed = source.filter(pl.col('minute_ms').is_between(START + 840 * MINUTE_MS, START + 899 * MINUTE_MS))
+    tox = ((observed['buy_notional'] - observed['sell_notional']).abs()
+           / (observed['buy_notional'] + observed['sell_notional'])).sum() / 60
+    assert row['_flow_toxicity_60'] == pytest.approx(tox)
+
+
+def test_flow_zero_denominators_missing_sources_and_max_side_ties():
+    empty = pl.DataFrame(schema={**AGGFLOW_SCHEMA, 'available_ms': pl.Int64})
+    covered = flow_features(empty, 1000).row(900, named=True)
+    for name, value in covered.items():
+        if name.startswith('_flow_'):
+            assert value == (0. if name in ('_flow_toxicity_60', '_flow_toxicity_240', '_flow_max_trade_side_60') else None)
+    absent = _flow_features(pl.DataFrame({'ts_ms': START + np.arange(1000) * MINUTE_MS}), empty, None)
+    assert all(absent[name].null_count() == absent.height for name in absent.columns if name != 'ts_ms')
+    source = synthetic_aggflow(1000).with_columns(pl.col('max_buy_notional').alias('max_sell_notional'))
+    assert flow_features(source, 1000)['_flow_max_trade_side_60'][900] == 0.
+
+
+def test_flow_weekly_references_require_minute_file_coverage():
+    n = 12_001
+    source = synthetic_aggflow(n)
+    # Each hour retains 54/60 covered minutes, so all hourly mean sizes and
+    # maxima are individually valid. The weekly minute rule is also required.
+    covered = []
+    for hour in range(n // 60):
+        start = START + hour * 60 * MINUTE_MS
+        covered.append((start, start + 54 * MINUTE_MS))
+    intervals = pl.DataFrame(covered, schema={'start_ms': pl.Int64, 'end_ms': pl.Int64}, orient='row')
+    valid = flow_features(source, n, intervals)
+    assert valid['_flow_max_trade_ratio_60'][11_400] is not None
+    # 152 valid hourly values meet the hourly 90% rule, but 16 absent hours
+    # plus the six-minute gaps in the remaining hours miss the minute rule.
+    sparse = intervals.with_row_index('hour').filter(~pl.col('hour').is_between(30, 45)).drop('hour')
+    invalid = flow_features(source, n, sparse)
+    hourly = invalid.filter((pl.col('ts_ms') % HOUR_MS == 0) & pl.col('ts_ms').is_between(
+        START + (11_400 - 167 * 60) * MINUTE_MS, START + 11_400 * MINUTE_MS))
+    assert hourly['_flow_large_imbalance_60'].is_not_null().sum() == 152
+    assert invalid['_flow_max_trade_ratio_60'][11_400] is None
+    assert invalid['_flow_mean_size_z_60'][11_400] is None
+
+
+@pytest.mark.parametrize('window', [15, 60, 240, 1440])
+@pytest.mark.parametrize('one_extra_missing', [False, True])
+def test_flow_minimum_coverage_all_windows(window, one_extra_missing):
+    n = 2000
+    i = 1800
+    missing = window - int(np.ceil(.9 * window)) + int(one_extra_missing)
+    start = i - window
+    coverage = pl.DataFrame({'start_ms': [START, START + (start + missing) * MINUTE_MS],
+        'end_ms': [START + start * MINUTE_MS, START + n * MINUTE_MS]})
+    result = flow_features(synthetic_aggflow(n), n, coverage)
+    for size in ('large', 'mid', 'small'):
+        assert (result[f'_flow_{size}_imbalance_{window}'][i] is None) == one_extra_missing
+
+
+def test_flow_coverage_never_inferred_from_trade_rows():
+    n = 12_000
+    source = synthetic_aggflow(n)
+    result = _flow_features(pl.DataFrame({'ts_ms': START + np.arange(n) * MINUTE_MS}), source, None)
+    assert all(result[name].null_count() == result.height for name in result.columns if name != 'ts_ms')
+
+
+def test_flow_file_presence_union_empty_files_and_missing_month(tmp_path):
+    folder = tmp_path / 'binance/aggflow/ETH'
+    folder.mkdir(parents=True)
+    source = synthetic_aggflow(1000).drop('available_ms')
+    source.write_parquet(folder / '2026-01.parquet')
+    source.write_parquet(folder / '2026-01-01.parquet')  # Overlapping day.
+    empty = pl.DataFrame(schema=AGGFLOW_SCHEMA)
+    empty.write_parquet(folder / '2026-03-01.parquet')
+    end = START + 61 * 1440 * MINUTE_MS  # Through Mar 2 (exclusive).
+    intervals = _aggflow_coverage(tmp_path, 'ETH', START, end)
+    assert intervals.rows() == [(START, START + 31 * 1440 * MINUTE_MS),
+        (START + 59 * 1440 * MINUTE_MS, START + 60 * 1440 * MINUTE_MS)]
+    result = flow_features(source.with_columns((pl.col('minute_ms') + MINUTE_MS).alias('available_ms')),
+                           61 * 1440, intervals)
+    # No-trade Jan minutes and a present empty Mar file are covered zero flow.
+    assert result['_flow_toxicity_60'][2 * 1440] == 0.
+    for name in result.columns:
+        if 'imbalance' in name or 'divergence' in name or 'share' in name:
+            assert result[name][2 * 1440] is None
+    assert result['_flow_toxicity_60'][59 * 1440 + 60] == 0.
+    # Missing February must never be filled from adjacent months.
+    assert result['_flow_toxicity_60'][40 * 1440] is None
+    assert result['_flow_max_trade_side_60'][40 * 1440] is None
+    # Availability at Mar 1 00:00 still excludes the 00:00 minute itself.
+    assert result['_flow_toxicity_60'][59 * 1440] is None
+
+
+def test_v3_dataset_loads_flow_and_records_coverage(history, tmp_path):
+    folder = history / 'binance/aggflow/ETH'
+    folder.mkdir(parents=True)
+    synthetic_aggflow(2000).drop('available_ms').write_parquet(folder / '2026-01.parquet')
+    metadata = build_dataset(history, tmp_path / 'out', '2026-01-01', '2026-01-02', ['ETH'], version='v3')
+    frame = pl.read_parquet(tmp_path / 'out/s2-features-v3/ETH.parquet')
+    assert metadata['coins']['ETH']['sources']['aggflow']['rows'] == 2000
+    row = frame.filter(pl.col('ts_ms') == START + 900 * MINUTE_MS).row(0, named=True)
+    expected = flow_features(synthetic_aggflow(2000), 2000).row(900, named=True)
+    for name, group in FEATURE_GROUPS_V3.items():
+        if group == 'L':
+            assert row[name] == expected['_' + name.removeprefix('f_')]
+    # The file covers the full month even beyond its last trading minute.
+    assert frame['f_flow_toxicity_60'][-1] == 0.

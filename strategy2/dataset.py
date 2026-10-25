@@ -1,7 +1,7 @@
 """Build versioned causal Parquet datasets, processing one coin at a time."""
 
 import argparse
-from datetime import datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 import json
 from pathlib import Path
 import resource
@@ -15,7 +15,7 @@ from .bars import MINUTE_MS, _boundary_ms, load_bars
 from .baselines import join_baselines
 from .features import ALL_COINS, COINS, _v2_columns, add_touch_history, build_features, feature_groups
 from .labels import first_touch_labels
-from .sources import coverage, load_coinbase, load_perp_closes, load_sources
+from .sources import coverage, load_aggflow, load_coinbase, load_perp_closes, load_sources
 
 VERSION = 's2-features-v1'
 TARGETS = {'a': (.005, 60), 'b': (.01, 240), 'c': (.02, 480)}
@@ -23,6 +23,35 @@ TARGETS = {'a': (.005, 60), 'b': (.01, 240), 'c': (.02, 480)}
 
 def _peak_mb():
     return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / (1024 ** 2 if sys.platform == 'darwin' else 1024)
+
+
+def _aggflow_coverage(root, coin, start_ms, end_ms):
+    """Union file-presence intervals without reading trade rows.
+
+    Trade minutes alone cannot distinguish no trades from a missing archive.
+    Intervals describe minute opens in [start_ms, end_ms); features apply the
+    same +60s availability delay as the sparse trade aggregates.
+    """
+    intervals = []
+    for path in (Path(root) / 'binance/aggflow' / coin).glob('*.parquet'):
+        stamp = path.stem
+        try:
+            first = date.fromisoformat(stamp + '-01' if len(stamp) == 7 else stamp)
+        except ValueError:
+            continue
+        after = ((first.replace(day=28) + timedelta(days=4)).replace(day=1)
+                 if len(stamp) == 7 else first + timedelta(days=1))
+        lo = max(start_ms, _boundary_ms(first.isoformat()))
+        hi = min(end_ms, _boundary_ms(after.isoformat()))
+        if lo < hi:
+            intervals.append((lo, hi))
+    merged = []
+    for lo, hi in sorted(intervals):
+        if merged and lo <= merged[-1][1]:
+            merged[-1] = (merged[-1][0], max(hi, merged[-1][1]))
+        else:
+            merged.append((lo, hi))
+    return pl.DataFrame(merged, schema={'start_ms': pl.Int64, 'end_ms': pl.Int64}, orient='row')
 
 
 def build_coin(root, coin, start, end, *, step_min=5, latency_min=1,
@@ -37,6 +66,10 @@ def build_coin(root, coin, start, end, *, step_min=5, latency_min=1,
     start_ms, end_ms = _boundary_ms(start), _boundary_ms(end, end=True)
     warmup_ms = start_ms - 31 * 1440 * MINUTE_MS
     sources = load_sources(root, coin, warmup_ms, end_ms)
+    flow_coverage = None
+    if version == 'v3':
+        sources['aggflow'] = load_aggflow(root, coin, warmup_ms, end_ms).rename({'minute_ms': 'ts_ms'})
+        flow_coverage = _aggflow_coverage(root, coin, warmup_ms, end_ms)
     if version in ('v2', 'v3'):
         sources['coinbase'] = load_coinbase(root, coin, warmup_ms, end_ms)
         if market_bars is None:
@@ -51,7 +84,7 @@ def build_coin(root, coin, start, end, *, step_min=5, latency_min=1,
         eth_bars = load_bars(root, 'perp', 'ETH', warmup_ms, end_ms)
     frame = build_features(coin, sources, start=warmup_ms, end=end_ms,
                            step_min=step_min, btc_bars=btc_bars, eth_bars=eth_bars,
-                           version=version, market_bars=market_bars)
+                           version=version, market_bars=market_bars, aggflow_coverage=flow_coverage)
     if version == 'v1':
         frame = frame.filter(pl.col('ts_ms').is_between(start_ms, end_ms, closed='left'))
     frame = frame.with_columns((pl.col('ts_ms') + latency_min * MINUTE_MS).alias('entry_ms'))
