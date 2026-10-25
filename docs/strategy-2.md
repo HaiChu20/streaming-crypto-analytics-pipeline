@@ -88,7 +88,7 @@ the authors.
 **Takeaway:** the best-supported inputs for hour-scale moves are **volatility
 state, flow over minutes to hours, leverage and positioning, clock and events,
 and implied volatility**. The full limit order book matters much less at this
-horizon, so we mainly use depth summaries (±0.2–5% bands) instead.
+horizon, so we mainly use depth summaries (±1–5% bands) instead.
 
 ## 4. Data
 
@@ -201,7 +201,7 @@ far fewer than Strategy 1.
 | **B. Trend and location** | Returns over 15m, 1h, 4h, 24h. Same-day abnormal-move flag. Distance to the 24h and 7d high/low in σ units. Deviation from 1h/4h/24h VWAP. Distance to the nearest round number (BTC $1,000) | 1m klines |
 | **C. Flow** | Taker-buy imbalance over 15m, 1h, 4h. **Quarter-hour opening imbalance**: taker imbalance in the first minute of each 15 min, averaged over 1h/4h ([Kim & Hansen](https://arxiv.org/abs/2607.09426)). Relative volume (1h vs 7d same-hour mean). Trade-count z. Spot-minus-perp taker imbalance | Perp and spot 1m klines (taker-buy volume) |
 | **D. Leverage and positioning** | Open interest change over 1h, 4h, 24h. OI change × price change sign (new longs, new shorts, short cover, long liquidation). OI / 24h volume. Funding rate, its z, and predicted funding from the 1m premium index. Minutes to next funding. Top-trader account and position long/short ratios and their 4h change. Global long/short ratio. Taker long/short volume ratio | `metrics`, `fundingRate`, `premiumIndexKlines` / live REST polls every 5 min + collected markPrice stream |
-| **E. Book liquidity** | Bid and ask depth within ±0.2%, ±1%, ±2%, ±5%. Bid/ask asymmetry per band. Depth change over 1h. Depth z versus 7d (thin book, bigger moves) | `bookDepth` from 2023 / live from the collected depth stream (parity check needed, see risks) |
+| **E. Book liquidity** | Bid and ask depth within ±1%, ±2%, ±5% (Binance publishes ±0.2% only from 2026, so v1 leaves it out). Bid/ask asymmetry per band. Depth change over 1h. Depth z versus 7d (thin book, bigger moves) | `bookDepth` from 2023 / live from the collected depth stream (parity check needed, see risks) |
 | **F. Implied volatility** | DVOL level, 1h and 24h change, DVOL / realized-vol ratio (variance risk premium). BTC/ETH only, used as market context for alts | Deribit DVOL history / collected DVOL |
 | **G. Clock and events** | Hour-of-day and day-of-week (cyclic). Minute within the hour. US cash-equity open window. Minutes to and since CPI/NFP/FOMC. Deribit expiry (Fri 08:00 UTC; month and quarter ends) | Calendar (copy of `config/events.csv`) |
 | **H. Cross-asset** (alts) | BTC returns over 15m/1h/4h. Coin return minus β×BTC return over 1h/4h. BTC RV(1h). ETH/BTC 4h trend | Klines |

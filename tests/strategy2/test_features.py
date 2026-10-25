@@ -63,10 +63,10 @@ def mirror(root, n=2000):
             'sum_open_interest_value': 100000 * np.exp(.0005 * idx),
             **{name: 1 + idx / 10000 for name in METRICS[2:]}}).reverse()
         zip_csv(root / f'binance/futures/um/daily/metrics/{sym}/{sym}-metrics-2026-01-01.zip', metrics)
-        depth = pl.DataFrame({'timestamp': pl.Series(START + np.repeat(np.arange(n), 8) * MINUTE_MS)
+        depth = pl.DataFrame({'timestamp': pl.Series(START + np.repeat(np.arange(n), 2 * len(BANDS)) * MINUTE_MS)
             .cast(pl.Datetime('ms', 'UTC')).dt.strftime('%Y-%m-%d %H:%M:%S'),
             'percentage': np.tile([sign * band for band in BANDS for sign in (-1, 1)], n),
-            'depth': np.ones(n * 8),
+            'depth': np.ones(n * 2 * len(BANDS)),
             'notional': np.tile([value * band for band in BANDS for value in (1000, 500)], n)})
         zip_csv(root / f'binance/futures/um/daily/bookDepth/{sym}/{sym}-bookDepth-2026-01-01.zip', depth)
         path = root / f'deribit/dvol/{coin}/1h/2026-01.csv'

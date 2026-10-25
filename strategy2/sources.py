@@ -11,7 +11,8 @@ HOUR_MS = 60 * MINUTE_MS
 METRICS = ('sum_open_interest', 'sum_open_interest_value',
            'count_toptrader_long_short_ratio', 'sum_toptrader_long_short_ratio',
            'count_long_short_ratio', 'sum_taker_long_short_vol_ratio')
-BANDS = (.2, 1, 2, 5)
+# Binance publishes ±0.2% only from 2026, so it is absent from development history.
+BANDS = (1, 2, 5)
 DEPTH_COLUMNS = tuple(f'{side}_{str(band).replace(".", "_")}'
                       for band in BANDS for side in ('bid', 'ask'))
 
