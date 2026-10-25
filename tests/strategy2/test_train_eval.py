@@ -45,7 +45,7 @@ def synthetic_dataset(root, planted=True, step_minutes=720, coins=("BTC", "ETH")
                  "last_funding_rate": np.zeros(len(times)),
                  "next_funding_ms": (times // 28_800_000 + 1) * 28_800_000,
                  "funding_interval_ms": np.full(len(times), 28_800_000)}
-        for target, barrier, horizon in (("a", 0.005, 60), ("b", 0.01, 240)):
+        for target, barrier, horizon in (("a", 0.005, 60), ("b", 0.01, 240), ("c", 0.02, 480)):
             frame.update({f"label_{target}": pl.Series(labels, dtype=pl.Int8),
                           f"exit_return_{target}": labels * barrier,
                           f"minutes_to_touch_{target}": [10 if label else None for label in labels],
@@ -56,8 +56,8 @@ def synthetic_dataset(root, planted=True, step_minutes=720, coins=("BTC", "ETH")
                           f"vol_p_up_{target}": np.full(len(times), 1 / 3),
                           f"vol_p_down_{target}": np.full(len(times), 1 / 3),
                           f"vol_p_none_{target}": np.full(len(times), 1 / 3),
-                          f"mom_dir_{target}": rng.choice([-1, 1], len(times)),
-                          f"rev_dir_{target}": rng.choice([-1, 1], len(times))})
+                          f"mom_dir_{target}": frame["mom_dir_b"] if target == "c" else rng.choice([-1, 1], len(times)),
+                          f"rev_dir_{target}": frame["rev_dir_b"] if target == "c" else rng.choice([-1, 1], len(times))})
         pl.DataFrame(frame).write_parquet(root / f"{coin}.parquet")
     (root / "metadata.json").write_text(json.dumps({"features": ["f_signal", "f_coin_id"]}))
     return root
@@ -102,16 +102,17 @@ def test_cannot_open_lockbox(change):
         validate_config(config)
 
 
-def test_purge_embargo_equality():
+@pytest.mark.parametrize("target", ["a", "b", "c"])
+def test_purge_embargo_equality(target):
     config = config_small()
     start, end = timestamp_ms("2026-03-01"), timestamp_ms("2026-04-01")
     inner = timestamp_ms("2026-01-01")
     cutoff, inner_cutoff = start - 86_400_000, inner - 86_400_000
     frame = pl.DataFrame({"id": range(7),
                           "ts_ms": [inner - 2 * 86_400_000] * 3 + [inner, inner, start, end],
-                          "label_end_ms_a": [inner_cutoff - 1, inner_cutoff, inner_cutoff + 1,
+                          f"label_end_ms_{target}": [inner_cutoff - 1, inner_cutoff, inner_cutoff + 1,
                                              cutoff, cutoff + 1, start + 1000, end + 1000]})
-    fit, valid, test = fold_split(frame, start, end, "a", config)
+    fit, valid, test = fold_split(frame, start, end, target, config)
     assert fit["id"].to_list() == [0, 1]
     assert valid["id"].to_list() == [3]
     assert test["id"].to_list() == [5]
@@ -328,34 +329,36 @@ def test_cli_smoke(tmp_path):
 
 
 
-def test_target_b_end_to_end(trained):
+@pytest.mark.parametrize("target,break_even", [("b", 0.565), ("c", 0.5325)])
+def test_larger_targets_end_to_end(trained, target, break_even):
     root, data, config, _ = trained
     config = deepcopy(config)
     config["test_months"] = 1
-    output = train(data, root, "target-b", target="b", config=config, threads=1)
+    output = train(data, root, f"target-{target}", target=target, config=config, threads=1)
     report = evaluate(output)
-    assert report["target"] == "b"
-    assert report["simulation"]["break_even_p"] == pytest.approx(0.565)
+    assert report["target"] == target
+    assert report["simulation"]["break_even_p"] == pytest.approx(break_even)
     assert report["metrics"]["model"]["log_loss"] < 0.2
 
 
-def test_cross_boundary_outcomes_and_null_labels_are_excluded(trained):
+@pytest.mark.parametrize("target", ["a", "c"])
+def test_cross_boundary_outcomes_and_null_labels_are_excluded(trained, target):
     root, data, config, _ = trained
-    altered = root / "boundary"
+    altered = root / f"boundary-{target}"
     altered.mkdir()
     for path in data.glob("*.parquet"):
         frame = pl.read_parquet(path)
         crossing = frame.tail(1).with_columns(
             pl.lit(LOCKBOX_MS - 5 * 60_000).alias("ts_ms"),
             pl.lit(LOCKBOX_MS - 4 * 60_000).alias("entry_ms"),
-            pl.lit(LOCKBOX_MS + 6 * 60_000).alias("label_end_ms_a"))
+            pl.lit(LOCKBOX_MS + 6 * 60_000).alias(f"label_end_ms_{target}"))
         incomplete = frame.tail(1).with_columns(
             pl.lit(LOCKBOX_MS - 10 * 60_000).alias("ts_ms"),
-            pl.lit(None, dtype=pl.Int8).alias("label_a"))
+            pl.lit(None, dtype=pl.Int8).alias(f"label_{target}"))
         pl.concat([frame, crossing, incomplete]).write_parquet(altered / path.name)
     config = deepcopy(config)
     config["test_months"] = 1
-    output = train(altered, root, "boundary", config=config, threads=1)
+    output = train(altered, root, f"boundary-{target}", target=target, config=config, threads=1)
     oof = pl.read_parquet(output / "oof.parquet")
     assert oof["ts_ms"].max() < LOCKBOX_MS - 10 * 60_000
     assert oof["label"].null_count() == 0

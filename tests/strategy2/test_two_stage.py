@@ -16,7 +16,7 @@ from strategy2.evaluate import (align_reference, binary_log_loss_rows, evaluate,
                                 side_metrics, summarize)
 from strategy2.signal import make_signal, round_trip_cost
 from strategy2.simulate import (choose_ev_threshold, period_frames, simulate,
-                                simulation_report)
+                                simulation_report, trade_metrics)
 from strategy2.train import (LOCKBOX_MS, apply_binary_calibration, fit_binary_calibration,
                              fold_split, load_config, month_shift, timestamp_ms, train)
 
@@ -183,6 +183,138 @@ def test_cost_scenarios_hand_computed(scenario, cost):
     assert signal["ev"] == pytest.approx(0.8 * 0.005 - cost)
 
 
+@pytest.mark.parametrize("direction", [1, -1])
+@pytest.mark.parametrize("outcome", [1, -1, 0])
+@pytest.mark.parametrize("tp_slippage", [0.0, 0.0001])
+def test_manual_limit_realised_costs(direction, outcome, tp_slippage):
+    config = config_v2()
+    config["costs"] = dict(config["cost_scenarios"]["manual_limit"])
+    if tp_slippage:
+        config["costs"]["tp_slippage_exit"] = tp_slippage
+    row = trade_row(label=outcome * direction, direction=direction)
+    trade = simulate([row], config)[0]
+    cost = 0.0004 + tp_slippage if outcome == 1 else 0.0009
+    assert round_trip_cost(config, outcome) == pytest.approx(cost)
+    assert trade["outcome"] == outcome
+    assert trade["cost"] == pytest.approx(cost)
+    assert trade["net_return"] == pytest.approx(direction * row["exit_return"] - cost)
+    assert trade_metrics([trade], config)["break_even_p"] == pytest.approx(
+        0.0059 / (0.0105 - tp_slippage))
+
+
+@pytest.mark.parametrize("two_stage", [False, True])
+@pytest.mark.parametrize("direction", [1, -1])
+@pytest.mark.parametrize("move,win", [(0.8, 0.6), (0.1, 0.95)])
+def test_manual_limit_expected_cost_gating(two_stage, direction, move, win):
+    config = config_v2()
+    config["costs"] = config["cost_scenarios"]["manual_limit"]
+    side = win if direction == 1 else 1 - win
+    up, down, none = move * side, move * (1 - side), 1 - move
+    expected = move * win * 0.0004 + (move * (1 - win) + 1 - move) * 0.0009
+    ev = move * (2 * win - 1) * 0.005 - expected
+    row = trade_row(direction=direction) | {"p_up": up, "p_down": down, "p_none": none}
+    kwargs = {}
+    if two_stage:
+        # Calibrated two-stage probabilities take precedence over the raw distribution.
+        row.update(p_up=0.85, p_down=0.05, p_none=0.1, p_move=move, p_side=side)
+        up, down, none = 0.85, 0.05, 0.1
+        kwargs = {"p_move": move, "p_side": side}
+    signal = make_signal(0, "BTC", "a", up, down, none, 100, config, **kwargs)
+    assert signal["ev"] == pytest.approx(ev)
+    assert signal["trade"] == (ev > 0)
+    assert bool(simulate([row], config)) == (ev > 0)
+    trade = simulate([row], config, ev_threshold=ev - 1e-10)[0]
+    assert trade["ev"] == pytest.approx(ev)
+    assert not simulate([row], config, ev_threshold=ev + 1e-10)
+    # Gating depends on predicted probabilities, never on the realised outcome.
+    changed = row | {"label": -row["label"], "exit_return": -row["exit_return"]}
+    assert simulate([changed], config, ev_threshold=ev - 1e-10)[0]["ev"] == trade["ev"]
+
+
+def test_missing_tp_fee_preserves_flat_cost_results():
+    config = config_v2()
+    config["costs"] = config["cost_scenarios"]["headline"]
+    rows = [trade_row(ts=i * 86_400_000, label=label, direction=direction)
+            for i, (label, direction) in enumerate([(1, 1), (-1, 1), (0, 1), (-1, -1), (1, -1), (0, -1)])]
+    trades = simulate(rows, config)
+    flat = 0.0005 + 0.0005 + 0.0001 + 0.0002
+    for trade in trades:
+        assert trade["cost"] == flat
+        assert trade["ev"] == abs(0.85 - 0.05) * 0.005 - flat
+        assert trade["net_return"] == trade["gross_return"] - flat
+    # TP slippage alone is ignored, as are unrelated scenario definitions.
+    ignored = deepcopy(config)
+    ignored["costs"]["tp_slippage_exit"] = 0.5
+    ignored["cost_scenarios"] = {"headline": ignored["costs"]}
+    assert simulate(rows, ignored) == trades
+    headline_only = dict(config, cost_scenarios={"headline": config["costs"]})
+    assert simulation_report(rows, ignored) == simulation_report(rows, headline_only)
+
+
+@pytest.mark.parametrize("key", ["tp_exit_fee", "tp_slippage_exit"])
+@pytest.mark.parametrize("value", [-0.0001, float("nan"), float("inf")])
+def test_invalid_tp_costs_rejected(key, value):
+    config = config_v2()
+    config["costs"] = dict(config["cost_scenarios"]["manual_limit"], **{key: value})
+    with pytest.raises(ValueError, match="finite and nonnegative"):
+        simulate([trade_row()], config)
+    with pytest.raises(ValueError, match="finite and nonnegative"):
+        make_signal(0, "BTC", "a", 0.85, 0.05, 0.1, 100, config)
+
+
+def test_evaluate_cli_costs_override(two_stage, tmp_path):
+    _, _, config, output = two_stage
+    metadata = (output / "metadata.json").read_bytes()
+    oof = (output / "oof.parquet").read_bytes()
+    before = evaluate(output)
+    path = tmp_path / "costs.yaml"
+    path.write_text("cost_scenarios:\n"
+                    "  headline: {entry_fee: 0.0005, exit_fee: 0.0005, slippage_entry: 0.0001, slippage_exit: 0.0002}\n"
+                    "  manual_limit: {entry_fee: 0.0002, slippage_entry: 0.0, tp_exit_fee: 0.0002, exit_fee: 0.0005, slippage_exit: 0.0002}\n")
+    result = subprocess.run([sys.executable, "-m", "strategy2.evaluate", str(output), "--costs", str(path)],
+                            capture_output=True, text=True, timeout=180)
+    assert result.returncode == 0, result.stderr
+    report = json.loads((output / "report.json").read_text())
+    scenarios = report["simulation"]["scenarios"]
+    assert list(scenarios) == ["headline", "manual_limit"]  # Replacement removes maker_entry.
+    assert report["metrics"] == before["metrics"]
+    assert scenarios["headline"] == before["simulation"]["scenarios"]["headline"]
+    manual = scenarios["manual_limit"]
+    assert manual["round_trip_cost"] == pytest.approx(0.0009)
+    assert manual["tp_round_trip_cost"] == pytest.approx(0.0004)
+    assert "Sensitivity" in manual["label"] and "maker fills are not guaranteed" in manual["label"]
+    assert (output / "metadata.json").read_bytes() == metadata
+    assert (output / "oof.parquet").read_bytes() == oof
+
+
+@pytest.mark.parametrize("contents", ["", "{}", "cost_scenarios: {}", "cost_scenarios: {manual_limit: {}}"])
+def test_costs_override_requires_headline(two_stage, tmp_path, contents):
+    path = tmp_path / "costs.yaml"
+    path.write_text(contents)
+    with pytest.raises(ValueError, match="requires a headline"):
+        evaluate(two_stage[3], costs=path)
+
+
+def test_target_c_two_stage_cli(two_stage, tmp_path):
+    _, data, config, _ = two_stage
+    config = dict(config, test_months=1)
+    config_path = tmp_path / "train.yaml"
+    config_path.write_text(json.dumps(config))
+    result = subprocess.run([sys.executable, "-m", "strategy2.train", "--data", str(data),
+                             "--work", str(tmp_path), "--version", "target-c", "--target", "c",
+                             "--config", str(config_path), "--threads", "1"],
+                            capture_output=True, text=True, timeout=180)
+    assert result.returncode == 0, result.stderr
+    output = tmp_path / "models" / "s2" / "c" / "target-c"
+    metadata = json.loads((output / "metadata.json").read_text())
+    assert metadata["config"]["targets"]["c"] == {"barrier": 0.02, "horizon_minutes": 480}
+    for fold in metadata["folds"]:
+        assert fold["fit_max_label_end_ms"] <= fold["inner_start_ms"] - 86_400_000
+        assert fold["inner_max_label_end_ms"] <= fold["start_ms"] - 86_400_000
+    assert pl.read_parquet(output / "oof.parquet")["ts_ms"].max() < LOCKBOX_MS
+    assert evaluate(output)["target"] == "c"
+
+
 def test_calibrated_side_drives_signal_and_simulator():
     config = config_v2()
     signal = make_signal(0, "BTC", "a", 0.85, 0.05, 0.1, 100, config, p_move=0.9, p_side=0.6)
@@ -230,7 +362,7 @@ def test_summary_table_selects_tuning_only(two_stage, monkeypatch):
     import strategy2.evaluate as module
     root, _, _, output = two_stage
     template = evaluate(output)
-    def report_for(path):
+    def report_for(path, costs=None):
         report = deepcopy(template)
         # Opposite optima: run-b wins tuning; run-a wins confirmation.
         for period, score in (("all", 0.5), ("tuning", 0.6 if path == "run-a" else 0.5),
@@ -240,7 +372,7 @@ def test_summary_table_selects_tuning_only(two_stage, monkeypatch):
     monkeypatch.setattr(module, "evaluate", report_for)
     summary = summarize(["run-a", "run-b"], root / "summary")
     assert summary["best_by_target"]["a"]["run"] == "run-b"
-    assert len(summary["rows"]) == 12
+    assert len(summary["rows"]) == 18
     assert (root / "summary" / "summary.csv").is_file()
     assert json.loads((root / "summary" / "summary.json").read_text())["selection_period"] == "tuning"
 
@@ -272,14 +404,14 @@ def test_simulator_million_rows_speed():
     elapsed = time.perf_counter() - start
     assert len(trades) == 10_000
     assert elapsed < 10
-    # Full six-threshold/two-scenario/three-period report, same million rows.
+    # Full six-threshold/three-scenario/three-period report, same million rows.
     config["bootstrap_draws"] = 20
     start = time.perf_counter()
     report = simulation_report(frame, config)
     full_elapsed = time.perf_counter() - start
-    assert len(report["scenarios"]) == 2
+    assert len(report["scenarios"]) == 3
     assert full_elapsed < 30
-    print(f"\nV2 simulator 1M: single={elapsed:.3f}s full 6x2x3={full_elapsed:.3f}s")
+    print(f"\nV2 simulator 1M: single={elapsed:.3f}s full 6x3x3={full_elapsed:.3f}s")
 
 
 def test_v2_c1_c2_cli_smoke(tmp_path):
@@ -307,7 +439,7 @@ def test_v2_c1_c2_cli_smoke(tmp_path):
         "--out", str(summary_dir)], capture_output=True, text=True, timeout=180)
     assert result.returncode == 0, result.stderr
     summary = json.loads((summary_dir / "summary.json").read_text())
-    assert len(summary["rows"]) == 12
+    assert len(summary["rows"]) == 18
     metrics = []
     for run in runs:
         report = json.loads((run / "report.json").read_text())

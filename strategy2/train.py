@@ -393,7 +393,7 @@ def main():
     parser.add_argument("--data", required=True)
     parser.add_argument("--work", required=True)
     parser.add_argument("--version", required=True)
-    parser.add_argument("--target", required=True, choices=("a", "b"))
+    parser.add_argument("--target", required=True, choices=("a", "b", "c"))
     parser.add_argument("--coins", nargs="+")
     parser.add_argument("--config", default=str(DEFAULT_CONFIG))
     parser.add_argument("--threads", type=int)

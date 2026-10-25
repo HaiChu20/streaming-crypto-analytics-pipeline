@@ -30,4 +30,6 @@ cost_scenarios:
     exit_fee: 0.0005
     slippage_entry: 0.0
     slippage_exit: 0.0002
+  # Sensitivity, never headline: maker fills are not guaranteed.
+  manual_limit: {entry_fee: 0.0002, slippage_entry: 0.0, tp_exit_fee: 0.0002, exit_fee: 0.0005, slippage_exit: 0.0002}
 ev_threshold_sweep: [0, 0.0005, 0.001, 0.0015, 0.002, 0.003]

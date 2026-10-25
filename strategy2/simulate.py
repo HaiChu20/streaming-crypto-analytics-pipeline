@@ -5,7 +5,7 @@ from datetime import datetime, timezone
 import numpy as np
 import polars as pl
 
-from strategy2.signal import round_trip_cost
+from strategy2.signal import expected_cost, round_trip_cost
 from strategy2.train import timestamp_ms
 
 DAY_MS = 86_400_000
@@ -72,10 +72,12 @@ def simulate(rows, config, target="a", ev_threshold=None):
         return frame[key].fill_null(default).to_numpy() if key in frame.columns else default
     timeout = np.where(direction > 0, setting("timeout_mean_long"), setting("timeout_mean_short"))
     cost = round_trip_cost(config)
+    tp_cost = round_trip_cost(config, outcome=1)
     two_stage = "p_move" in frame.columns or "p_side" in frame.columns
     edge = move * np.abs(2 * side - 1) if two_stage else np.abs(p[:, 0] - p[:, 1])
     none = 1 - move if two_stage else p[:, 2]
-    ev = edge * config["targets"][target]["barrier"] + none * timeout - cost
+    p_tp = move * np.maximum(side, 1 - side) if two_stage else np.maximum(p[:, 0], p[:, 1])
+    ev = edge * config["targets"][target]["barrier"] + none * timeout - expected_cost(config, p_tp)
     threshold = setting("ev_threshold") if ev_threshold is None else ev_threshold
     gate = (direction != 0) & (ev > threshold)
     gated = frame.with_columns(pl.Series("_direction", direction), pl.Series("_ev", ev)).filter(pl.Series(gate))
@@ -113,10 +115,11 @@ def simulate(rows, config, target="a", ev_threshold=None):
                 raise ValueError("Funding crossing has no finite last_funding_rate")
             funding = direction * rate * crossings if crossings else 0.0
             gross = direction * row["exit_return"]
+            realised_cost = tp_cost if label * direction == 1 else cost
             trades.append({"ts_ms": row["ts_ms"], "coin": row["coin"], "entry_ms": entry,
                            "exit_ms": exit_ms, "direction": direction, "outcome": label * direction,
-                           "gross_return": gross, "cost": cost, "funding": funding,
-                           "funding_crossings": crossings, "net_return": gross - cost - funding,
+                           "gross_return": gross, "cost": realised_cost, "funding": funding,
+                           "funding_crossings": crossings, "net_return": gross - realised_cost - funding,
                            "ev": row["_ev"]})
     return sorted(trades, key=lambda trade: (trade["ts_ms"], trade["coin"]))
 
@@ -125,6 +128,9 @@ def simulate(rows, config, target="a", ev_threshold=None):
 def trade_metrics(trades, config, target="a", start_ms=None, end_ms=None):
     barrier = config["targets"][target]["barrier"]
     result = {"trades": len(trades), "break_even_p": 0.5 + round_trip_cost(config) / (2 * barrier)}
+    if "tp_exit_fee" in config.get("costs", {}):
+        market, tp = round_trip_cost(config), round_trip_cost(config, outcome=1)
+        result["break_even_p"] = (barrier + market) / (2 * barrier + market - tp)
     if not trades:
         return dict(result, trades_per_month=0.0, win_rate=None, loss_rate=None,
                     timeout_rate=None, touched_win_rate=None, mean_net_return=None,
@@ -223,6 +229,8 @@ def simulation_report(rows, config, target="a"):
         scenario = {"label": "Headline: taker entry / taker exit" if name == "headline" else
                     f"Sensitivity: {name} (maker fills are not guaranteed)",
                     "round_trip_cost": round_trip_cost(cfg), "periods": by_period, "ev_selection": selection}
+        if "tp_exit_fee" in cfg["costs"]:
+            scenario["tp_round_trip_cost"] = round_trip_cost(cfg, outcome=1)
         result["scenarios"][name] = scenario
     # Preserve v1's public report fields, including the per-fold EV mechanism.
     headline = result["scenarios"]["headline"]

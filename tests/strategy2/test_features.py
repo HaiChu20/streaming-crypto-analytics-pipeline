@@ -1,6 +1,8 @@
 """Causal features tested with synthetic history in the public mirror layout."""
 
+import hashlib
 import json
+from io import BytesIO
 from zipfile import ZipFile
 
 import numpy as np
@@ -309,6 +311,11 @@ def test_dataset_contract_and_metadata(history, tmp_path):
         assert all(frame.schema[name] == (pl.Int8 if name == 'f_coin_id' else pl.Float64) for name in FEATURE_GROUPS)
         assert metadata['coins'][coin]['sources']['perp']['rows'] == 2000
     saved = json.loads((out / 's2-features-v1/metadata.json').read_text())
+    assert saved['targets'] == {
+        'a': {'barrier': .005, 'horizon_minutes': 60},
+        'b': {'barrier': .01, 'horizon_minutes': 240},
+        'c': {'barrier': .02, 'horizon_minutes': 480}}
+    assert (frame['label_end_ms_c'] == frame['entry_ms'] + 480 * MINUTE_MS).all()
     assert len(saved['features']) == len(FEATURE_GROUPS)
     assert set(saved['coins']['BTC']['null_share_by_group']) == set('ABCDEFGH')
 
@@ -321,16 +328,40 @@ def test_dataset_contract_and_metadata(history, tmp_path):
 def test_v1_parquet_bytes_match_a0a415d_synthetic_dataset(history, coin, expected):
     # Captured from the unmodified a0a415d build_coin on this mirror fixture,
     # before adding v2. Includes all columns, dtypes, order and zstd bytes.
-    import hashlib
-    from io import BytesIO
     baseline, _ = build_coin(history, coin, '2026-01-01', '2026-01-02')
     explicit, _ = build_coin(history, coin, '2026-01-01', '2026-01-02', version='v1')
     assert_frame_equal(baseline, explicit)
     output = BytesIO()
-    explicit.write_parquet(output, compression='zstd')
+    # The historical hash covers a/b only; C adds label/baseline columns.
+    explicit.select(name for name in explicit.columns if not name.endswith('_c')).write_parquet(output, compression='zstd')
     assert hashlib.sha256(output.getvalue()).hexdigest() == expected
     assert sum(name.startswith('f_') for name in explicit.columns) == 89
     assert FEATURE_GROUPS is FEATURE_GROUPS_V1 is feature_groups('v1')
+
+
+@pytest.mark.parametrize('version,count,columns_hash', [
+    ('v1', 89, '6b7c2ca8e404e649241862cc141a47fcbab549f3fc79745185e60cd44237e61d'),
+    ('v2', 111, '1a9f310b20a8c146db2ae86cb1773c311740a08be9d721989abd3ada5dab2da1'),
+])
+def test_target_c_preserves_feature_columns_and_bytes(history, monkeypatch, version, count, columns_hash):
+    columns = list(feature_groups(version))
+    assert len(columns) == count
+    # Frozen before adding C: column order and names are part of the contract.
+    assert hashlib.sha256(json.dumps(columns).encode()).hexdigest() == columns_hash
+    assert not any(name.endswith('_c') for name in columns)
+    with_c, _ = build_coin(history, 'ETH', '2026-01-01', '2026-01-02', version=version)
+    monkeypatch.setattr('strategy2.dataset.TARGETS', {'a': (.005, 60), 'b': (.01, 240)})
+    without_c, _ = build_coin(history, 'ETH', '2026-01-01', '2026-01-02', version=version)
+    physical_columns = [name for name in with_c.columns if name.startswith('f_')]
+    assert set(physical_columns) == set(columns)
+    assert physical_columns == [name for name in without_c.columns if name.startswith('f_')]
+    assert_frame_equal(with_c.select(columns), without_c.select(columns), check_exact=True)
+    encoded = []
+    for frame in (with_c, without_c):
+        buffer = BytesIO()
+        frame.select(columns).write_parquet(buffer, compression='zstd')
+        encoded.append(buffer.getvalue())
+    assert encoded[0] == encoded[1]
 
 
 def v2_inputs(root, n=12_000):
@@ -444,7 +475,8 @@ def test_touch_history_uses_only_completed_labels_at_T():
         **{f'label_end_ms_{target}': [t-1, t, t-60_000, t+1, t-1, t-1440*MINUTE_MS]
            for target in TARGETS}})
     result = add_touch_history(decisions, labels)
-    for target in TARGETS:
+    assert not any(name.startswith('f_') and name.endswith('_c') for name in result.columns)
+    for target in ('a', 'b'):
         assert result[f'f_touch_up_share_24h_{target}'][1] == .5
         assert result[f'f_touch_rate_24h_{target}'][1] == pytest.approx(2/3)
         changed = labels.with_columns(pl.when(pl.col(f'label_end_ms_{target}') > t)
@@ -477,6 +509,7 @@ def test_v2_dataset_metadata_labels_warmup_and_v1_columns(history, tmp_path):
     assert frame.columns[:v1.width] == v1.columns
     assert_frame_equal(frame.select(v1.columns), v1)
     assert metadata['version'] == 's2-features-v2'
+    assert metadata['targets']['c'] == {'barrier': .02, 'horizon_minutes': 480}
     assert metadata['feature_columns'] == list(FEATURE_GROUPS_V2)
     assert metadata['features'] == [{'name': name, 'group': group} for name, group in FEATURE_GROUPS_V2.items()]
     assert set(metadata['coins']['ETH']['null_share_by_group']) == set('ABCDEFGHIJ')

@@ -9,6 +9,7 @@ from pathlib import Path
 
 import numpy as np
 import polars as pl
+import yaml
 
 from strategy2.simulate import period_frames, simulation_report, weekly_bootstrap
 from strategy2.train import (baseline_probabilities, class_indices, confidence,
@@ -234,7 +235,7 @@ def align_reference(frame, reference, intersection=False):
     return left, right
 
 
-def evaluate(directory, compare=None, compare_intersection=False):
+def evaluate(directory, compare=None, compare_intersection=False, costs=None):
     directory = Path(directory)
     metadata = json.loads((directory / "metadata.json").read_text())
     frame = pl.read_parquet(directory / "oof.parquet")
@@ -255,6 +256,12 @@ def evaluate(directory, compare=None, compare_intersection=False):
             raise ValueError("Reference OOF contains sealed lockbox rows")
         frame, reference = align_reference(frame, reference, compare_intersection)
     config = metadata["config"]
+    if costs is not None:
+        override = yaml.safe_load(Path(costs).read_text())
+        scenarios = override.get("cost_scenarios") if isinstance(override, dict) else None
+        if not isinstance(scenarios, dict) or "headline" not in scenarios:
+            raise ValueError("cost_scenarios requires a headline scenario")
+        config = dict(config, cost_scenarios=scenarios)
     report = evaluate_frame(frame, config, reference)
     simulation = simulation_report(frame, config, metadata["target"])
     for period in report["periods"]:
@@ -272,10 +279,10 @@ def evaluate(directory, compare=None, compare_intersection=False):
     return report
 
 
-def summarize(directories, out):
+def summarize(directories, out, costs=None):
     rows = []
     for directory in directories:
-        report = evaluate(directory)
+        report = evaluate(directory, costs=costs)
         for period, diagnostics in report["periods"].items():
             model = diagnostics["metrics"]["model"]
             side = model["side"]
@@ -319,19 +326,20 @@ def main():
     parser.add_argument("directory", nargs="?")
     parser.add_argument("--compare", help="Reference run directory or OOF parquet")
     parser.add_argument("--compare-intersection", action="store_true", help="Explicitly restrict BOTH runs to common keys")
+    parser.add_argument("--costs", type=Path, help="YAML cost_scenarios replacing the run's simulation scenarios")
     parser.add_argument("--summary", nargs="+", metavar="RUN")
     parser.add_argument("--out", type=Path, default=Path("."))
     args = parser.parse_args()
     if args.summary:
         if args.compare or args.directory:
             parser.error("--summary cannot be combined with directory/--compare")
-        summarize(args.summary, args.out)
+        summarize(args.summary, args.out, costs=args.costs)
     else:
         if args.directory is None:
             parser.error("directory or --summary is required")
         if args.compare_intersection and args.compare is None:
             parser.error("--compare-intersection requires --compare")
-        report = evaluate(args.directory, args.compare, args.compare_intersection)
+        report = evaluate(args.directory, args.compare, args.compare_intersection, costs=args.costs)
         print(json.dumps({"model": report["metrics"]["model"], "trades": report["simulation"]["trades"],
                           "ev_selection": report["simulation"]["ev_selection"]}))
 

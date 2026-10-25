@@ -3,7 +3,8 @@
 import math
 
 
-def round_trip_cost(config):
+def round_trip_cost(config, outcome=0):
+    """Market-exit cost by default; outcome +1 may use a resting TP limit."""
     costs = config.get("costs", {})
     values = [costs.get("taker_fee", 0.0005), costs.get("slippage_entry", 0.0001),
               costs.get("slippage_exit", 0.0002)]
@@ -12,7 +13,21 @@ def round_trip_cost(config):
     entry_fee, exit_fee = costs.get("entry_fee", values[0]), costs.get("exit_fee", values[0])
     if any(not math.isfinite(v) or v < 0 for v in (entry_fee, exit_fee)):
         raise ValueError("Costs must be finite and nonnegative")
+    if "tp_exit_fee" in costs:
+        tp_fee, tp_slippage = costs["tp_exit_fee"], costs.get("tp_slippage_exit", 0.0)
+        if any(not math.isfinite(v) or v < 0 for v in (tp_fee, tp_slippage)):
+            raise ValueError("Costs must be finite and nonnegative")
+        if outcome == 1:
+            return entry_fee + values[1] + tp_fee + tp_slippage
     return entry_fee + exit_fee + values[1] + values[2]
+
+
+def expected_cost(config, p_tp):
+    """Probability-weighted exit costs; accepts scalar or vector TP probability."""
+    market = round_trip_cost(config)
+    if "tp_exit_fee" not in config.get("costs", {}):
+        return market
+    return market + p_tp * (round_trip_cost(config, outcome=1) - market)
 
 
 def make_signal(ts_ms, coin, target, p_up, p_down, p_none, entry_price, config, p_move=None, p_side=None):
@@ -40,7 +55,7 @@ def make_signal(ts_ms, coin, target, p_up, p_down, p_none, entry_price, config, 
     direction = int(side_probability > 0.5) - int(side_probability < 0.5)
     side = "long" if direction > 0 else "short"
     timeout_mean = config.get(f"timeout_mean_{side}", 0.0)
-    ev = abs(p_up - p_down) * barrier + p_none * timeout_mean - round_trip_cost(config)
+    ev = abs(p_up - p_down) * barrier + p_none * timeout_mean - expected_cost(config, max(p_up, p_down))
     entry_ms = int(config.get("entry_ms", ts_ms + 60_000))
     return {
         "ts_ms": int(ts_ms), "coin": coin, "target": target,

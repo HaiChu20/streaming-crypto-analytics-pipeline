@@ -18,7 +18,7 @@ from .labels import first_touch_labels
 from .sources import coverage, load_coinbase, load_perp_closes, load_sources
 
 VERSION = 's2-features-v1'
-TARGETS = {'a': (.005, 60), 'b': (.01, 240)}
+TARGETS = {'a': (.005, 60), 'b': (.01, 240), 'c': (.02, 480)}
 
 
 def _peak_mb():
@@ -91,6 +91,8 @@ def build_dataset(root, out, start, end, coins=COINS, *, step_min=5, latency_min
                                'step_min': step_min, 'latency_min': latency_min, 'warmup_days': 31,
                                'minimum_window_coverage': .9,
                                'staleness_clock': 'availability', 'returns': 'log; label returns are simple fractions'},
+                'targets': {target: {'barrier': barrier, 'horizon_minutes': horizon}
+                            for target, (barrier, horizon) in TARGETS.items()},
                 'coins': {}}
     warmup_ms = _boundary_ms(start) - 31 * 1440 * MINUTE_MS
     end_ms = _boundary_ms(end, end=True)

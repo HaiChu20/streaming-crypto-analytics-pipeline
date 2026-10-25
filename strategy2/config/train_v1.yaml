@@ -18,6 +18,7 @@ lightgbm:
 targets:
   a: {barrier: 0.005, horizon_minutes: 60}
   b: {barrier: 0.01, horizon_minutes: 240}
+  c: {barrier: 0.02, horizon_minutes: 480}
 costs:
   taker_fee: 0.0005
   slippage_entry: 0.0001
